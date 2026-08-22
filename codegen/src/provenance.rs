@@ -91,6 +91,19 @@ pub(crate) fn collect(manifests: &[&ManifestSpec]) -> Vec<Row> {
                     target: "subject.id".to_owned(),
                 });
             }
+            // Provenance fields are compiler-filled, not declared; the table
+            // still answers where the value came from.
+            if let Some(provenance) =
+                crate::projection::lint::target_profile(&projection.target_type)
+                    .and_then(|profile| profile.provenance)
+            {
+                rows.push(Row {
+                    manifest: relative.clone(),
+                    projection: projection.name.clone(),
+                    source: "requested location (canonical)".to_owned(),
+                    target: format!("{}.{provenance}", projection.target_type),
+                });
+            }
             for instance in projection.instances() {
                 for field in &instance.fields {
                     rows.push(Row {

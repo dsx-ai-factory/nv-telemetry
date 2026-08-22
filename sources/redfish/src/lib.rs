@@ -3,12 +3,13 @@
 
 //! Redfish acquisition.
 //!
-//! The first provider is [`SensorRead`]: one sensor `OData` GET projected
+//! Two providers ship: [`SensorRead`] — one sensor `OData` GET projected
 //! into a readings batch and a states batch, per `docs/DATA-MODEL.md`'s
-//! worked example. Transport rides nv-redfish's `Bmc` trait, so the provider
-//! is generic over HTTP and the mock the fixture corpus replays through;
-//! reqwest and tokio enter the workspace only here, behind the `bmc-http`
-//! feature.
+//! worked example — and [`ChassisRead`] — one chassis GET projected into an
+//! inventory batch and a states batch. Transport rides nv-redfish's `Bmc`
+//! trait, so the providers are generic over HTTP and the mock the fixture
+//! corpus replays through; reqwest and tokio enter the workspace only here,
+//! behind the `bmc-http` feature.
 //!
 //! Projection is *declared* in `manifests/` and compiled into
 //! `src/generated/` by `make codegen`: deterministic, I/O-free functions
@@ -27,4 +28,5 @@ mod provider;
 mod uri;
 
 pub use failure::ClassifyError;
+pub use provider::ChassisRead;
 pub use provider::SensorRead;

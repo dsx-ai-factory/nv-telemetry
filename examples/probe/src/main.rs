@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Demo embedder: polls one Redfish endpoint's sensors on a cadence and
+//! Demo embedder: polls one Redfish endpoint's sensors and chassis on a
+//! cadence and
 //! prints the three output streams — batches, statuses, and issues — one
 //! tagged line each.
 //!
@@ -37,16 +38,18 @@ use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
+use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::SystemClock;
+use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::SensorRead;
 use url::Url;
 
 const USAGE: &str = "\
 usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
-           --sensor <odata-id> [--sensor <odata-id> ...]
+           [--sensor <odata-id> ...] [--chassis <odata-id> ...]
            [--cadence-ms <ms>] [--count <n>] [--base-url <url>] [--insecure]
 
-  mock    poll the in-process BMC mock, replaying fixtures/sensor.json
+  mock    poll the in-process BMC mock, replaying fixtures/
   http    poll a live Redfish service at --base-url; credentials come
           from PROBE_USERNAME and PROBE_PASSWORD; --insecure accepts
           self-signed BMC certificates
@@ -58,6 +61,7 @@ struct Args {
     mode: Mode,
     endpoint_id: String,
     sensors: Vec<String>,
+    chassis: Vec<String>,
     cadence: Duration,
     count: usize,
     base_url: Option<String>,
@@ -96,6 +100,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut mode = None;
     let mut endpoint_id = None;
     let mut sensors = Vec::new();
+    let mut chassis = Vec::new();
     let mut cadence = Duration::from_secs(5);
     let mut count = 10;
     let mut base_url = None;
@@ -113,6 +118,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--endpoint-id" => endpoint_id = Some(value("--endpoint-id")?),
             "--sensor" => sensors.push(value("--sensor")?),
+            "--chassis" => chassis.push(value("--chassis")?),
             "--cadence-ms" => {
                 let ms = value("--cadence-ms")?
                     .parse()
@@ -134,13 +140,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if mode == Mode::Http && base_url.is_none() {
         return Err("http mode needs `--base-url`".to_owned());
     }
-    if sensors.is_empty() {
-        return Err("at least one `--sensor` is required".to_owned());
+    if sensors.is_empty() && chassis.is_empty() {
+        return Err("at least one `--sensor` or `--chassis` is required".to_owned());
     }
     Ok(Args {
         mode,
         endpoint_id: endpoint_id.ok_or("`--endpoint-id` is required")?,
         sensors,
+        chassis,
         cadence,
         count,
         base_url,
@@ -157,28 +164,55 @@ async fn run(args: &Args) -> Result<(), String> {
         .build()
         .map_err(|error| format!("endpoint id: {error}"))?;
 
+    let clock = SystemClock::default();
     let needs = args
         .sensors
         .iter()
-        .map(|sensor| PollNeed::new(endpoint.clone(), sensor.clone(), args.cadence))
+        .map(|sensor| {
+            PollNeed::new(
+                endpoint.clone(),
+                SensorRead::<()>::REQUEST_CLASS,
+                sensor.clone(),
+                args.cadence,
+            )
+        })
+        .chain(args.chassis.iter().map(|chassis| {
+            PollNeed::new(
+                endpoint.clone(),
+                ChassisRead::<()>::REQUEST_CLASS,
+                chassis.clone(),
+                args.cadence,
+            )
+        }))
         .collect();
-    let plan = plan(needs, &[SensorRead::<()>::declaration()])
-        .map_err(|error| format!("plan: {error}"))?;
+    let plan = plan(
+        needs,
+        &[
+            SensorRead::<()>::declaration(),
+            ChassisRead::<()>::declaration(),
+        ],
+    )
+    .map_err(|error| format!("plan: {error}"))?;
 
     match args.mode {
         Mode::Mock => {
             let bmc = Arc::new(nv_redfish_bmc_mock::Bmc::<nv_redfish_bmc_mock::Error>::default());
-            let fixture = include_str!("../fixtures/sensor.json");
-            // Mock expectations are one-shot; no sensor is polled more
-            // than `count` times, so priming that many up front outlasts
-            // the run.
-            for sensor in &args.sensors {
-                for _ in 0..args.count {
-                    bmc.expect(Expect::get(sensor, fixture));
+            let sensor_fixture = include_str!("../fixtures/sensor.json");
+            let chassis_fixture = include_str!("../fixtures/chassis.json");
+            // Mock expectations are one-shot AND strict-FIFO, so priming
+            // follows dispatch order: the ring visits targets in needs
+            // order each round. Target-major priming would mismatch the
+            // moment there are two targets.
+            for _ in 0..args.count {
+                for sensor in &args.sensors {
+                    bmc.expect(Expect::get(sensor, sensor_fixture));
+                }
+                for chassis in &args.chassis {
+                    bmc.expect(Expect::get(chassis, chassis_fixture));
                 }
             }
-            let units = units(&plan, &bmc);
-            drive(&endpoint, units, args).await
+            let units = units(&plan, &bmc, clock);
+            drive(&endpoint, units, clock, args).await
         }
         Mode::Http => {
             let base = args.base_url.as_deref().expect("checked at parse time");
@@ -196,8 +230,8 @@ async fn run(args: &Args) -> Result<(), String> {
                 credentials,
                 CacheSettings::default(),
             ));
-            let units = units(&plan, &bmc);
-            drive(&endpoint, units, args).await
+            let units = units(&plan, &bmc, clock);
+            drive(&endpoint, units, clock, args).await
         }
     }
 }
@@ -209,33 +243,43 @@ fn credentials_from_env() -> Result<BmcCredentials, String> {
     Ok(BmcCredentials::username_password(username, password))
 }
 
+/// The class-dispatch point: static wiring from each planned poll's
+/// request class to the provider that declared it — the embedder's role
+/// until provider registries exist.
 fn units<B>(
     plan: &nv_telemetry_orchestration::Plan,
     bmc: &Arc<B>,
-) -> Vec<(nv_telemetry_orchestration::PlannedPoll, Arc<SensorRead<B>>)> {
-    plan.polls()
-        .iter()
-        .map(|planned| {
-            let unit = SensorRead::new(
-                planned.endpoint().clone(),
-                planned.target().to_owned().into(),
-                Arc::clone(bmc),
-            );
-            (planned.clone(), Arc::new(unit))
-        })
-        .collect()
-}
-
-async fn drive<B>(
-    endpoint: &EndpointContext,
-    units: Vec<(nv_telemetry_orchestration::PlannedPoll, Arc<SensorRead<B>>)>,
-    args: &Args,
-) -> Result<(), String>
+    clock: SystemClock,
+) -> Vec<PollUnit>
 where
     B: nv_redfish::Bmc + Send + Sync + 'static,
     B::Error: nv_telemetry_redfish::ClassifyError,
 {
-    let subtree = endpoint_subtree(&EndpointPolicy::default(), &SystemClock::default(), units)
+    plan.polls()
+        .iter()
+        .map(|planned| {
+            let endpoint = planned.endpoint().clone();
+            let target = planned.target().to_owned().into();
+            if planned.origin().request_class() == SensorRead::<B>::REQUEST_CLASS {
+                let unit = SensorRead::new(endpoint, target, Arc::clone(bmc));
+                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+            } else if planned.origin().request_class() == ChassisRead::<B>::REQUEST_CLASS {
+                let unit = ChassisRead::new(endpoint, target, Arc::clone(bmc));
+                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+            } else {
+                unreachable!("the plan selects only declared providers")
+            }
+        })
+        .collect()
+}
+
+async fn drive(
+    endpoint: &EndpointContext,
+    units: Vec<PollUnit>,
+    clock: SystemClock,
+    args: &Args,
+) -> Result<(), String> {
+    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, units)
         .map_err(|error| format!("recipe: {error}"))?;
 
     let mut runtime: Runtime<AcquisitionReport, EndpointFault, PollMeta> = Runtime::new(
@@ -248,8 +292,8 @@ where
     let handle = runtime.handle();
 
     println!(
-        "polling {} sensor(s) on `{}` every {:?}, {} report(s)",
-        args.sensors.len(),
+        "polling {} target(s) on `{}` every {:?}, {} report(s)",
+        args.sensors.len() + args.chassis.len(),
         endpoint.endpoint_id(),
         args.cadence,
         args.count

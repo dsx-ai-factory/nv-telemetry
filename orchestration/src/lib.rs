@@ -13,7 +13,8 @@
 //! unrepresentable.
 //!
 //! The planner ([`plan`]) is static and deterministic: needs in, planned
-//! polls out, the first polled declaration serving every need. The recipe
+//! polls out, exactly one polled declaration serving each need's request
+//! class. The recipe
 //! ([`endpoint_subtree`]) turns a plan into the standard admission stack —
 //! endpoint admission over the endpoint breaker over the rate bucket over
 //! the unit leaves. Breaker scope rides the work's channel: only
@@ -42,6 +43,7 @@ pub use recipe::BreakerPolicy;
 pub use recipe::EndpointPolicy;
 pub use recipe::EndpointSubtree;
 pub use recipe::PollMeta;
+pub use recipe::PollUnit;
 pub use recipe::RatePolicy;
 pub use recipe::RecipeError;
 pub use report::assemble;

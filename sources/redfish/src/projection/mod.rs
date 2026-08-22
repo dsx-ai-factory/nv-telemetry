@@ -14,6 +14,8 @@
 //!   because the device answered and the answer cannot be represented, which
 //!   is a different fact from silence.
 
+pub(crate) use crate::generated::chassis::project_chassis;
+pub(crate) use crate::generated::chassis::ChassisParts;
 pub(crate) use crate::generated::sensor::project_sensor;
 pub(crate) use crate::generated::sensor::SensorParts;
 

@@ -64,6 +64,9 @@ pub(crate) struct TargetProfile {
     pub(crate) target: &'static str,
     pub(crate) identity_field: &'static str,
     pub(crate) identity: IdentityKind,
+    /// A string field the compiler fills with the canonical request
+    /// location — the target type's provenance. Reserved from manifests.
+    pub(crate) provenance: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,16 +80,25 @@ const TARGET_PROFILES: &[TargetProfile] = &[
         target: "nv.telemetry.v1.SignalDescriptor",
         identity_field: "key",
         identity: IdentityKind::SignalKey,
+        provenance: None,
     },
     TargetProfile {
         target: "nv.telemetry.v1.Reading",
         identity_field: "key",
         identity: IdentityKind::SignalKey,
+        provenance: None,
     },
     TargetProfile {
         target: "nv.telemetry.v1.StateObservation",
         identity_field: "subject",
         identity: IdentityKind::Subject,
+        provenance: None,
+    },
+    TargetProfile {
+        target: "nv.telemetry.v1.InventoryItem",
+        identity_field: "subject",
+        identity: IdentityKind::Subject,
+        provenance: Some("source_key"),
     },
 ];
 
@@ -223,6 +235,9 @@ pub enum Reason {
     MembersWithoutVariation,
     ExpansionWithoutMembers,
     ReadingsPairing(String),
+    ReservedProvenance(String),
+    InventoryPairing(String),
+    NestedAssemblyTarget(String),
 }
 
 impl fmt::Display for Reason {
@@ -286,8 +301,9 @@ impl fmt::Display for Reason {
             ),
             Self::UnsupportedTargetProfile(name) => write!(
                 f,
-                "target `{name}` has no projection profile; PR 2 supports only \
-                 SignalDescriptor, Reading, and StateObservation"
+                "target `{name}` has no projection profile; the compiler \
+                 supports SignalDescriptor, Reading, StateObservation, and \
+                 InventoryItem"
             ),
             Self::TargetProfileDrift { target, detail } => write!(
                 f,
@@ -431,7 +447,19 @@ impl fmt::Display for Reason {
             Self::ExpansionWithoutMembers => {
                 f.write_str("an expansion without members expands nothing")
             }
-            Self::ReadingsPairing(detail) => f.write_str(detail),
+            Self::ReadingsPairing(detail) | Self::InventoryPairing(detail) => {
+                f.write_str(detail)
+            }
+            Self::ReservedProvenance(path) => write!(
+                f,
+                "`{path}` writes the target's provenance, which the compiler \
+                 populates from the requested location"
+            ),
+            Self::NestedAssemblyTarget(path) => write!(
+                f,
+                "assembly `{path}` lands inside a sub-message; an assembly \
+                 builds a top-level map field"
+            ),
         }
     }
 }
@@ -539,15 +567,17 @@ fn check_manifest(
         );
     }
 
-    check_readings_pairing(manifest, index, contract, vocabulary, &report, violations);
+    check_payload_pairing(manifest, index, contract, vocabulary, &report, violations);
 }
 
 /// The invariants the provider relies on when it combines the generated
-/// collections into one `Readings` payload: all instances over a source
-/// share one signal key, so more than one descriptor duplicates that key,
-/// and every possible sample needs its descriptor to exist — a gated
+/// collections into payloads. Readings: all instances over a source share
+/// one signal key, so more than one descriptor duplicates that key, and
+/// every possible sample needs its descriptor to exist — a gated
 /// descriptor beside an emitting reading would lose samples at runtime.
-fn check_readings_pairing(
+/// Inventory: items key by subject, and all instances over a source share
+/// one subject, so a second item duplicates it.
+fn check_payload_pairing(
     manifest: &ManifestSpec,
     index: &RedfishIndex<'_>,
     contract: &DescriptorPool,
@@ -583,7 +613,22 @@ fn check_readings_pairing(
             .filter(|projection| projection.target_type == "nv.telemetry.v1.Reading")
             .map(|projection| projection.instances().len())
             .sum();
+        let inventory_instances: usize = group
+            .iter()
+            .filter(|projection| projection.target_type == "nv.telemetry.v1.InventoryItem")
+            .map(|projection| projection.instances().len())
+            .sum();
 
+        if inventory_instances > 1 {
+            report(
+                violations,
+                Reason::InventoryPairing(format!(
+                    "source `{source_type}` expands to {inventory_instances} inventory \
+                     items sharing one subject; an Inventory payload keys items by \
+                     subject"
+                )),
+            );
+        }
         if descriptor_instances > 1 {
             report(
                 violations,
@@ -853,6 +898,25 @@ impl<'a, 'b> Checker<'a, 'b> {
                     profile.identity_field
                 ),
             });
+        }
+
+        if let Some(provenance) = profile.provenance {
+            match target
+                .get_field_by_name(provenance)
+                .map(|field| field.kind())
+            {
+                Some(Kind::String) => {}
+                Some(other) => self.push(Reason::TargetProfileDrift {
+                    target: target_name.to_owned(),
+                    detail: format!(
+                        "provenance field `{provenance}` is {other:?}, expected string"
+                    ),
+                }),
+                None => self.push(Reason::TargetProfileDrift {
+                    target: target_name.to_owned(),
+                    detail: format!("provenance field `{provenance}` is absent"),
+                }),
+            }
         }
     }
 
@@ -1179,12 +1243,17 @@ impl<'a, 'b> Checker<'a, 'b> {
     }
 
     fn check_assembly(&mut self, assembly: &AssemblySpec) {
-        if let Some(leaf) = self.check_target(&assembly.target_field) {
+        // Emission sets an assembly through one top-level setter; a dotted
+        // target resolves (`value.map_value` is a `Value.Map` leaf) but has
+        // no such setter, so it must fail here, named, not inside emission.
+        if assembly.target_field.contains('.') {
+            self.push(Reason::NestedAssemblyTarget(assembly.target_field.clone()));
+        } else if let Some(leaf) = self.check_target(&assembly.target_field) {
             let actual = match leaf.kind() {
                 Kind::Message(message) => message.full_name().to_owned(),
                 other => format!("{other:?}"),
             };
-            if actual != VALUE {
+            if actual != VALUE && actual != VALUE_MAP {
                 self.push(Reason::AssemblyTargetNotValue {
                     field: assembly.target_field.clone(),
                     actual,
@@ -1335,6 +1404,8 @@ impl<'a, 'b> Checker<'a, 'b> {
             .collect();
 
         let identity_target = self.target.clone();
+        let provenance =
+            target_profile(&instance.target_type).and_then(|profile| profile.provenance);
         let mut seen = BTreeSet::new();
         for path in &declared {
             if !seen.insert(*path) {
@@ -1349,6 +1420,10 @@ impl<'a, 'b> Checker<'a, 'b> {
                     .is_some_and(|target| writes_identity(target, path))
             {
                 self.push(Reason::ReservedTarget((*path).to_owned()));
+            }
+            if provenance.is_some_and(|provenance| *path == provenance || within(provenance, path))
+            {
+                self.push(Reason::ReservedProvenance((*path).to_owned()));
             }
         }
         for (index, first) in declared.iter().enumerate() {
@@ -1376,7 +1451,13 @@ impl<'a, 'b> Checker<'a, 'b> {
                 let required = vocabulary
                     .field_invariant(&field)
                     .is_some_and(|invariant| invariant.required);
-                if !required || field.name() == profile.identity_field {
+                // Compiler-filled fields — identity and provenance — are
+                // covered by construction, and provenance is also reserved,
+                // so demanding manifest coverage would be a contradiction.
+                if !required
+                    || field.name() == profile.identity_field
+                    || profile.provenance == Some(field.name())
+                {
                     continue;
                 }
                 let covered = declared.iter().any(|path| {

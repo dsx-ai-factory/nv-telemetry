@@ -29,6 +29,96 @@ pub(crate) struct Extraction {
 /// Every extraction, in manifest order.
 pub(crate) const PROVENANCE: &[Extraction] = &[
     Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.Id",
+        target: "subject.id",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "requested location (canonical)",
+        target: "nv.telemetry.v1.InventoryItem.source_key",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.ChassisType",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"chassis-type\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.Manufacturer",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"manufacturer\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.Model",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"model\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.SKU",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"sku\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.SerialNumber",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"serial-number\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.PartNumber",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"part-number\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.AssetTag",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"asset-tag\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.SparePartNumber",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"spare-part-number\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-inventory",
+        source: "Chassis.Version",
+        target: "nv.telemetry.v1.InventoryItem.attributes[\"version\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-state",
+        source: "Chassis.Id",
+        target: "subject.id",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-state",
+        source: "Chassis.Status.State",
+        target: "nv.telemetry.v1.StateObservation.value.string_value",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-health",
+        source: "Chassis.Id",
+        target: "subject.id",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/chassis.textpb",
+        projection: "chassis-health",
+        source: "Chassis.Status.Health",
+        target: "nv.telemetry.v1.StateObservation.value.string_value",
+    },
+    Extraction {
         manifest: "sources/redfish/manifests/sensor.textpb",
         projection: "sensor-descriptor",
         source: "location `/redfish/v1/Chassis/{chassis}/Sensors/{id}` capture `chassis`",

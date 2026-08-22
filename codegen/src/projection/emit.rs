@@ -49,6 +49,7 @@ use crate::options::Vocabulary;
 use crate::projection::lint::resolve_target;
 use crate::projection::lint::target_profile;
 use crate::projection::lint::IdentityKind;
+use crate::projection::lint::TargetProfile;
 use crate::projection::location::LocationPattern;
 use crate::projection::location::LocationSegment;
 use crate::projection::spec::AssemblySpec;
@@ -75,6 +76,7 @@ const NULL_INVALID: i32 = 2;
 /// list.
 const NUMERIC_VALUE: &str = "nv.telemetry.v1.NumericValue";
 const VALUE: &str = "nv.telemetry.v1.Value";
+const VALUE_MAP: &str = "nv.telemetry.v1.Value.Map";
 const SUBJECT: &str = "nv.telemetry.v1.Subject";
 
 const HEADER: &str = "\
@@ -404,6 +406,7 @@ impl Emitter<'_> {
         let mut evaluations = TokenStream::new();
         let mut assemblies = TokenStream::new();
         let mut needs_key = false;
+        let mut needs_provenance = false;
 
         for projection in group {
             let members: Vec<Option<&str>> = match &projection.expansion {
@@ -479,11 +482,11 @@ impl Emitter<'_> {
                     .map(|(_, field_name)| ident(field_name))
                     .expect("the instance's target collection is planned");
                 needs_key |= profile.identity == IdentityKind::SignalKey;
+                needs_provenance |= profile.provenance.is_some();
                 assemblies.extend(Self::instance_assembly(
                     &instance,
                     &target,
-                    profile.identity_field,
-                    profile.identity,
+                    profile,
                     &outputs,
                     &assembly_locals,
                     &collection,
@@ -494,10 +497,11 @@ impl Emitter<'_> {
 
         let (subject_tokens, helpers) =
             self.subject_derivation(source_type, &source_param, subject_spec, &mut locals)?;
-        let needs_location = subject_spec
-            .scope
-            .iter()
-            .any(|contributor| matches!(contributor, ScopeSpec::LocationTemplate { .. }));
+        let needs_location = needs_provenance
+            || subject_spec
+                .scope
+                .iter()
+                .any(|contributor| matches!(contributor, ScopeSpec::LocationTemplate { .. }));
 
         let key_binding = needs_key.then(|| {
             quote! {
@@ -845,21 +849,24 @@ impl Emitter<'_> {
     fn instance_assembly(
         instance: &ProjectionSpec,
         target: &MessageDescriptor,
-        identity_field: &str,
-        identity: IdentityKind,
+        profile: TargetProfile,
         outputs: &[Output],
         assemblies: &[(Ident, &AssemblySpec)],
         collection: &Ident,
         context: &str,
     ) -> Result<TokenStream, String> {
         let target_model = ident(&short_name(target.full_name()));
-        let identity_setter = ident(identity_field);
-        let identity = match identity {
+        let identity_setter = ident(profile.identity_field);
+        let identity = match profile.identity {
             IdentityKind::SignalKey => quote! { builder = builder.#identity_setter(key.clone()); },
             IdentityKind::Subject => {
                 quote! { builder = builder.#identity_setter(subject.clone()); }
             }
         };
+        let provenance = profile.provenance.map(|field| {
+            let setter = ident(field);
+            quote! { builder = builder.#setter(crate::uri::canonical(location)); }
+        });
         let output_setters = outputs.iter().map(|output| {
             let local = &output.local;
             let setter = ident(&output.setter);
@@ -901,14 +908,22 @@ impl Emitter<'_> {
             .collect::<Result<Vec<_>, String>>()?;
         let assembly_setters = assemblies.iter().map(|(local, assembly)| {
             let setter = ident(&assembly.target_field);
-            quote! {
-                builder = builder.#setter(::nv_telemetry_model::Value::map(#local)?);
+            let lands_on_map = target.get_field_by_name(&assembly.target_field).is_some_and(
+                |field| matches!(field.kind(), Kind::Message(message) if message.full_name() == VALUE_MAP),
+            );
+            if lands_on_map {
+                quote! { builder = builder.#setter(#local.into_iter().collect()); }
+            } else {
+                quote! {
+                    builder = builder.#setter(::nv_telemetry_model::Value::map(#local)?);
+                }
             }
         });
 
         let body = quote! {
             let mut builder = ::nv_telemetry_model::#target_model::builder();
             #identity
+            #provenance
             #(#output_setters)*
             #(#constants)*
             #(#assembly_setters)*
@@ -1069,7 +1084,21 @@ impl Emitter<'_> {
         }
 
         let kind = &subject.kind;
-        let scope_blame = blame_chain(&blames, &id_blame);
+        // Without scope contributors every builder fault blames the id;
+        // an `if` with identical arms would not survive the generated
+        // tree's own lints.
+        let blame = if blames.is_empty() {
+            quote! { let path = #id_blame; }
+        } else {
+            let scope_blame = blame_chain(&blames, &id_blame);
+            quote! {
+                let path = if error.path().starts_with("id") {
+                    #id_blame
+                } else {
+                    #scope_blame
+                };
+            }
+        };
         let derivation = quote! {
             match (#id_local, #(#scope_locals,)*) {
                 (Some(#id_local), #(Some(#scope_locals),)*) => {
@@ -1081,11 +1110,7 @@ impl Emitter<'_> {
                     {
                         Ok(subject) => Some(subject),
                         Err(error) => {
-                            let path = if error.path().starts_with("id") {
-                                #id_blame
-                            } else {
-                                #scope_blame
-                            };
+                            #blame
                             issues.push(::nv_telemetry_source::ProjectionIssue::invalid(
                                 path,
                                 error.to_string(),
