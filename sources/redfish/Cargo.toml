@@ -34,5 +34,10 @@ name = "sensor_read"
 path = "tests/sensor_read.rs"
 required-features = ["bmc-mock"]
 
+[[test]]
+name = "chassis_read"
+path = "tests/chassis_read.rs"
+required-features = ["bmc-mock"]
+
 [lints]
 workspace = true

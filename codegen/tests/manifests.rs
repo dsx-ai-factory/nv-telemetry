@@ -138,6 +138,32 @@ fn state_projection(name: &str) -> ProjectionSpec {
     state
 }
 
+/// An inventory-shaped projection: a top-level chassis subject (empty
+/// scope) and one attributes assembly; identity and provenance are the
+/// compiler's to fill.
+fn inventory_projection(name: &str) -> ProjectionSpec {
+    ProjectionSpec {
+        source_type: "Chassis".to_owned(),
+        target_type: "nv.telemetry.v1.InventoryItem".to_owned(),
+        subject: Some(SubjectSpec {
+            kind: "chassis".to_owned(),
+            scope: Vec::new(),
+            id_path: "Id".to_owned(),
+        }),
+        fields: Vec::new(),
+        map_assemblies: vec![AssemblySpec {
+            target_field: "attributes".to_owned(),
+            entries: vec![EntrySpec {
+                key: "manufacturer".to_owned(),
+                source_path: "Manufacturer".to_owned(),
+                null_policy: ABSENT,
+                value_map: Vec::new(),
+            }],
+        }],
+        ..projection(name)
+    }
+}
+
 fn manifest(projections: Vec<ProjectionSpec>) -> ManifestSpec {
     ManifestSpec {
         path: manifest_path("sources/redfish/manifests/test.textpb"),
@@ -319,6 +345,24 @@ fn a_capture_must_appear_in_its_template() {
 }
 
 #[test]
+fn a_nested_assembly_target_is_rejected_by_name() {
+    // `value.map_value` resolves to a `Value.Map` leaf, but emission sets
+    // assemblies through one top-level setter; the refusal must be a named
+    // lint, never a panic inside emission.
+    let mut broken = projection("sample");
+    broken.map_assemblies = vec![AssemblySpec {
+        target_field: "value.map_value".to_owned(),
+        entries: vec![EntrySpec {
+            key: "reading".to_owned(),
+            source_path: "Reading".to_owned(),
+            null_policy: ABSENT,
+            value_map: Vec::new(),
+        }],
+    }];
+    rejects(manifest(vec![broken]), "lands inside a sub-message");
+}
+
+#[test]
 fn assemblies_build_value_maps_only() {
     let mut broken = projection("sample");
     broken.map_assemblies = vec![AssemblySpec {
@@ -331,6 +375,73 @@ fn assemblies_build_value_maps_only() {
         }],
     }];
     rejects(manifest(vec![broken]), "assemblies build");
+}
+
+#[test]
+fn an_inventory_projection_is_clean() {
+    passes(manifest(vec![inventory_projection("inventory")]));
+}
+
+#[test]
+fn provenance_is_filled_from_the_canonical_location() {
+    // The subject has no location scope, so the parameter survives only
+    // because provenance needs it — and the fill must go through
+    // `canonical`, which strips query secrets before the wire.
+    let files = emit(&[manifest(vec![inventory_projection("inventory")])])
+        .expect("the profiled InventoryItem projection emits");
+    let rendered = &files
+        .iter()
+        .find(|(path, _)| path.ends_with("test.rs"))
+        .expect("the manifest module is rendered")
+        .1;
+    assert!(
+        rendered.contains("source_key(crate::uri::canonical(location))"),
+        "provenance is not filled from the canonical location:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("_location"),
+        "the location parameter was dropped without a scope capture:\n{rendered}"
+    );
+}
+
+#[test]
+fn an_attributes_assembly_lands_as_a_map() {
+    let files = emit(&[manifest(vec![inventory_projection("inventory")])])
+        .expect("the profiled InventoryItem projection emits");
+    let rendered = &files
+        .iter()
+        .find(|(path, _)| path.ends_with("test.rs"))
+        .expect("the manifest module is rendered")
+        .1;
+    assert!(
+        rendered.contains(".attributes(") && !rendered.contains("Value::map"),
+        "a Value.Map landing goes through the map setter, not Value::map:\n{rendered}"
+    );
+}
+
+#[test]
+fn source_key_is_reserved_provenance() {
+    let mut broken = inventory_projection("inventory");
+    broken.fields = vec![field("Manufacturer", "source_key")];
+    rejects(manifest(vec![broken]), "provenance");
+
+    let mut broken = inventory_projection("inventory");
+    broken.constants = vec![ConstantSpec {
+        target_field: "source_key".to_owned(),
+        value: "/redfish/v1/Chassis/1U".to_owned(),
+    }];
+    rejects(manifest(vec![broken]), "provenance");
+}
+
+#[test]
+fn one_inventory_item_per_source_type() {
+    rejects(
+        manifest(vec![
+            inventory_projection("inventory"),
+            inventory_projection("inventory-again"),
+        ]),
+        "inventory items sharing one subject",
+    );
 }
 
 #[test]

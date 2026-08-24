@@ -9,6 +9,9 @@
 // would reformat and the staleness gate would then report a schema
 // problem that does not exist.
 #[rustfmt::skip]
+pub(crate) mod chassis;
+
+#[rustfmt::skip]
 pub(crate) mod sensor;
 
 #[rustfmt::skip]

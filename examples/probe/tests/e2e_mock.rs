@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end milestone: the real provider, the real recipe, the real
+//! End-to-end milestone: the real providers, the real recipe, the real
 //! dispatcher runtime, a mocked device, and a virtual timeline. An
-//! embedder-shaped test — protocol crate and orchestration meet here, not
-//! in the orchestration crate's own tests.
+//! embedder-shaped test — protocol crates and orchestration meet here, not
+//! in the orchestration crate's own tests. The run is mixed: a sensor and
+//! a chassis interleave under one endpoint's admission stack, so one round
+//! carries all three payload kinds from two providers.
 
 use std::future::Future;
 use std::pin::pin;
@@ -25,6 +27,7 @@ use nv_redfish_dispatcher::RuntimeOutput;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::FailureClass;
 use nv_telemetry_model::Outcome;
+use nv_telemetry_model::Payload;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_orchestration::endpoint_subtree;
 use nv_telemetry_orchestration::plan;
@@ -34,10 +37,14 @@ use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
+use nv_telemetry_orchestration::PollUnit;
+use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::SensorRead;
 
 const SENSOR: &str = "/redfish/v1/Chassis/1U/Sensors/CPU1Temp";
-const FIXTURE: &str = include_str!("../fixtures/sensor.json");
+const CHASSIS: &str = "/redfish/v1/Chassis/1U";
+const SENSOR_FIXTURE: &str = include_str!("../fixtures/sensor.json");
+const CHASSIS_FIXTURE: &str = include_str!("../fixtures/chassis.json");
 const BASE_SECONDS: i64 = 1_785_621_243;
 
 #[derive(Clone)]
@@ -79,8 +86,61 @@ fn drive(runtime: &mut PollRuntime) -> Option<RuntimeOutput<AcquisitionReport, E
     }
 }
 
+fn work(runtime: &mut PollRuntime, context: &str) -> AcquisitionReport {
+    match drive(runtime) {
+        Some(RuntimeOutput::Work {
+            result: Ok(mut reports),
+            ..
+        }) => reports.pop().expect("one acquisition, one report"),
+        other => panic!("{context}: expected work, got {}", describe(other.as_ref())),
+    }
+}
+
+/// One primed round: a sensor report then a chassis report, all three
+/// payload kinds under both providers' identities.
+fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext) {
+    let sensor_report = work(runtime, "sensor turn");
+    assert_eq!(sensor_report.status().outcome(), Outcome::Succeeded);
+    assert!(
+        sensor_report
+            .batches()
+            .iter()
+            .any(|batch| matches!(batch.payload(), Payload::Readings(_))),
+        "the sensor fixture yields readings"
+    );
+    for batch in sensor_report.batches() {
+        assert_eq!(batch.endpoint(), endpoint);
+        assert_eq!(batch.origin().provider(), SensorRead::<()>::PROVIDER);
+        assert_eq!(batch.window().start(), sensor_report.status().started_at());
+    }
+
+    let chassis_report = work(runtime, "chassis turn");
+    assert_eq!(chassis_report.status().outcome(), Outcome::Succeeded);
+    assert!(
+        chassis_report
+            .batches()
+            .iter()
+            .any(|batch| matches!(batch.payload(), Payload::Inventory(_))),
+        "the chassis fixture yields inventory"
+    );
+    assert!(
+        chassis_report
+            .batches()
+            .iter()
+            .any(|batch| matches!(batch.payload(), Payload::States(_))),
+        "the chassis fixture yields states"
+    );
+    for batch in chassis_report.batches() {
+        assert_eq!(batch.origin().provider(), ChassisRead::<()>::PROVIDER);
+    }
+    assert!(
+        sensor_report.issues().is_none() && chassis_report.issues().is_none(),
+        "the nominal fixtures are clean"
+    );
+}
+
 #[test]
-fn a_mocked_endpoint_polls_end_to_end() {
+fn a_mocked_endpoint_polls_both_providers_end_to_end() {
     let manual = ManualClock::new();
     let clock = TestClock {
         manual: manual.clone(),
@@ -92,25 +152,55 @@ fn a_mocked_endpoint_polls_end_to_end() {
         .build()
         .expect("a valid endpoint");
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    // The mock is strict-FIFO, so priming follows dispatch order: the ring
+    // visits targets in needs order each round.
     for _ in 0..3 {
-        bmc.expect(Expect::get(SENSOR, FIXTURE));
+        bmc.expect(Expect::get(SENSOR, SENSOR_FIXTURE));
+        bmc.expect(Expect::get(CHASSIS, CHASSIS_FIXTURE));
     }
 
     let cadence = Duration::from_secs(30);
     let plan = plan(
-        vec![PollNeed::new(endpoint.clone(), SENSOR, cadence)],
-        &[SensorRead::<()>::declaration()],
+        vec![
+            PollNeed::new(
+                endpoint.clone(),
+                SensorRead::<()>::REQUEST_CLASS,
+                SENSOR,
+                cadence,
+            ),
+            PollNeed::new(
+                endpoint.clone(),
+                ChassisRead::<()>::REQUEST_CLASS,
+                CHASSIS,
+                cadence,
+            ),
+        ],
+        &[
+            SensorRead::<()>::declaration(),
+            ChassisRead::<()>::declaration(),
+        ],
     )
-    .expect("the sensor declaration polls");
-    let planned = plan.polls()[0].clone();
-    let unit = Arc::new(SensorRead::new(
+    .expect("both declarations poll");
+    let sensor_unit = Arc::new(SensorRead::new(
         endpoint.clone(),
-        planned.target().to_owned().into(),
+        plan.polls()[0].target().to_owned().into(),
+        Arc::clone(&bmc),
+    ));
+    let chassis_unit = Arc::new(ChassisRead::new(
+        endpoint.clone(),
+        plan.polls()[1].target().to_owned().into(),
         Arc::clone(&bmc),
     ));
 
-    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, vec![(planned, unit)])
-        .expect("one unit forms a subtree");
+    let subtree = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        vec![
+            PollUnit::new(plan.polls()[0].clone(), sensor_unit, &clock),
+            PollUnit::new(plan.polls()[1].clone(), chassis_unit, &clock),
+        ],
+    )
+    .expect("two providers form one subtree");
     let mut runtime: PollRuntime = Runtime::new(
         RuntimeConfig {
             global_max_in_flight: std::num::NonZeroUsize::MIN,
@@ -119,47 +209,22 @@ fn a_mocked_endpoint_polls_end_to_end() {
         subtree,
     );
 
-    // Three primed ticks: each yields one report pairing a readings batch
-    // with a success status under one identity and instant.
-    for tick in 0..3 {
-        let report = match drive(&mut runtime) {
-            Some(RuntimeOutput::Work {
-                result: Ok(mut reports),
-                ..
-            }) => reports.pop().expect("one acquisition, one report"),
-            other => panic!(
-                "tick {tick}: expected work, got {}",
-                describe(other.as_ref())
-            ),
-        };
-        assert_eq!(report.status().outcome(), Outcome::Succeeded);
-        assert!(!report.batches().is_empty(), "the fixture yields readings");
-        for batch in report.batches() {
-            assert_eq!(batch.endpoint(), &endpoint);
-            assert_eq!(batch.origin().provider(), SensorRead::<()>::PROVIDER);
-            assert_eq!(batch.window().start(), report.status().started_at());
-        }
-        assert!(report.issues().is_none(), "the nominal fixture is clean");
-
+    // Three primed rounds; after each, one cadence hint moves the clock.
+    for round in 0..3 {
+        assert_mixed_round(&mut runtime, &endpoint);
         match drive(&mut runtime) {
             Some(RuntimeOutput::SleepUntil(deadline)) => manual.advance_to(deadline),
             other => panic!(
-                "tick {tick}: expected the cadence hint, got {}",
+                "round {round}: expected the cadence hint, got {}",
                 describe(other.as_ref())
             ),
         }
     }
 
-    // The fourth tick finds the mock unprimed: a harness failure the
+    // The fourth round finds the mock unprimed: a harness failure the
     // provider classifies as Internal — reported, request-scoped, and the
     // breaker untouched.
-    let report = match drive(&mut runtime) {
-        Some(RuntimeOutput::Work {
-            result: Ok(mut reports),
-            ..
-        }) => reports.pop().expect("one acquisition, one report"),
-        other => panic!("expected the failed tick, got {}", describe(other.as_ref())),
-    };
+    let report = work(&mut runtime, "unprimed tick");
     assert_eq!(report.status().outcome(), Outcome::Failed);
     assert_eq!(
         report.status().failure_class(),

@@ -40,7 +40,9 @@ use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
+use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::RatePolicy;
+use nv_telemetry_orchestration::RecipeError;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
@@ -77,10 +79,13 @@ struct FixtureUnit {
 }
 
 impl FixtureUnit {
-    fn scripted(script: Vec<Result<AcquisitionParts, AcquisitionFailure>>) -> Arc<Self> {
+    fn scripted(
+        origin: Origin,
+        script: Vec<Result<AcquisitionParts, AcquisitionFailure>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             endpoint: endpoint(),
-            origin: origin(),
+            origin,
             script: Mutex::new(script.into()),
         })
     }
@@ -201,15 +206,20 @@ fn pipeline(
 ) -> (PollRuntime, ManualClock) {
     let manual = ManualClock::new();
     let clock = TestClock::new(&manual);
-    let unit = FixtureUnit::scripted(script);
+    let unit = FixtureUnit::scripted(origin(), script);
 
     let declarations = [ProviderDeclaration::polled(PROVIDER, REQUEST_CLASS, 1)];
-    let needs = vec![PollNeed::new(endpoint(), "fixture-target", cadence)];
+    let needs = vec![PollNeed::new(
+        endpoint(),
+        REQUEST_CLASS,
+        "fixture-target",
+        cadence,
+    )];
     let plan = plan(needs, &declarations).expect("the fixture declaration polls");
     let planned = plan.polls()[0].clone();
 
-    let subtree =
-        endpoint_subtree(policy, &clock, vec![(planned, unit)]).expect("one unit forms a subtree");
+    let subtree = endpoint_subtree(policy, &clock, vec![PollUnit::new(planned, unit, &clock)])
+        .expect("one unit forms a subtree");
     let runtime = Runtime::new(
         RuntimeConfig {
             global_max_in_flight: std::num::NonZeroUsize::MIN,
@@ -400,4 +410,142 @@ fn the_rate_bucket_defers_a_tick_to_the_refill_instant() {
     manual.advance_to(refill_at);
     let second = report(drive(&mut runtime)).expect("the refill admits the second tick");
     assert_eq!(second.status().started_at(), &at_offset(30));
+}
+
+#[test]
+fn two_request_classes_share_one_subtree() {
+    let manual = ManualClock::new();
+    let clock = TestClock::new(&manual);
+    let chassis_origin = Origin::builder()
+        .provider("fixture.chassis")
+        .request_class("chassis-read")
+        .build()
+        .expect("a valid origin");
+
+    let declarations = [
+        ProviderDeclaration::polled(PROVIDER, REQUEST_CLASS, 1),
+        ProviderDeclaration::polled("fixture.chassis", "chassis-read", 2),
+    ];
+    let needs = vec![
+        PollNeed::new(
+            endpoint(),
+            REQUEST_CLASS,
+            "fixture-target",
+            Duration::from_secs(30),
+        ),
+        PollNeed::new(
+            endpoint(),
+            "chassis-read",
+            "chassis-target",
+            Duration::from_secs(30),
+        ),
+    ];
+    let plan = plan(needs, &declarations).expect("both classes are served");
+    assert_eq!(plan.polls()[0].cost(), 1);
+    assert_eq!(plan.polls()[1].cost(), 2);
+
+    let sensor_unit = FixtureUnit::scripted(origin(), vec![Ok(states_parts(Vec::new()))]);
+    let chassis_unit = FixtureUnit::scripted(chassis_origin, vec![Ok(states_parts(Vec::new()))]);
+    let subtree = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        vec![
+            PollUnit::new(plan.polls()[0].clone(), sensor_unit, &clock),
+            PollUnit::new(plan.polls()[1].clone(), chassis_unit, &clock),
+        ],
+    )
+    .expect("two classes form one subtree");
+    let mut runtime: PollRuntime = Runtime::new(
+        RuntimeConfig {
+            global_max_in_flight: std::num::NonZeroUsize::MIN,
+            clock: ClockConfig::Manual(manual),
+        },
+        subtree,
+    );
+
+    // Both leaves are due at construction and dispatch in ring order, each
+    // report carrying its own provider's identity; then exactly one hint.
+    let first = report(drive(&mut runtime)).expect("a clean success");
+    assert_eq!(first.status().provider(), PROVIDER);
+    assert_eq!(first.status().request_class(), REQUEST_CLASS);
+    let second = report(drive(&mut runtime)).expect("a clean success");
+    assert_eq!(second.status().provider(), "fixture.chassis");
+    assert_eq!(second.status().request_class(), "chassis-read");
+    let _hint = sleep_deadline(drive(&mut runtime));
+    assert!(drive(&mut runtime).is_none(), "the hint is emitted once");
+}
+
+#[test]
+fn recipe_checks_survive_erasure() {
+    let manual = ManualClock::new();
+    let clock = TestClock::new(&manual);
+    let other_endpoint = || {
+        EndpointContext::builder()
+            .endpoint_id("bmc-lab-08")
+            .build()
+            .expect("a valid endpoint")
+    };
+    let declarations = [ProviderDeclaration::polled(PROVIDER, REQUEST_CLASS, 1)];
+    let planned = |endpoint: EndpointContext, target: &str| {
+        let needs = vec![PollNeed::new(
+            endpoint,
+            REQUEST_CLASS,
+            target,
+            Duration::from_secs(30),
+        )];
+        plan(needs, &declarations)
+            .expect("the fixture declaration polls")
+            .polls()[0]
+            .clone()
+    };
+
+    // A unit whose origin disagrees with its plan.
+    let foreign = Origin::builder()
+        .provider("fixture.other")
+        .request_class(REQUEST_CLASS)
+        .build()
+        .expect("a valid origin");
+    let unit = FixtureUnit::scripted(foreign, Vec::new());
+    let Err(error) = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        vec![PollUnit::new(planned(endpoint(), "t"), unit, &clock)],
+    ) else {
+        panic!("the origins disagree");
+    };
+    assert!(matches!(error, RecipeError::OriginMismatch { .. }));
+
+    // A unit whose endpoint disagrees with its plan.
+    let unit = Arc::new(FixtureUnit {
+        endpoint: other_endpoint(),
+        origin: origin(),
+        script: Mutex::new(VecDeque::new()),
+    });
+    let Err(error) = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        vec![PollUnit::new(planned(endpoint(), "t"), unit, &clock)],
+    ) else {
+        panic!("the endpoints disagree");
+    };
+    assert!(matches!(error, RecipeError::EndpointMismatch { .. }));
+
+    // Two planned polls spanning two endpoints in one subtree.
+    let unit_a = FixtureUnit::scripted(origin(), Vec::new());
+    let unit_b = Arc::new(FixtureUnit {
+        endpoint: other_endpoint(),
+        origin: origin(),
+        script: Mutex::new(VecDeque::new()),
+    });
+    let Err(error) = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        vec![
+            PollUnit::new(planned(endpoint(), "a"), unit_a, &clock),
+            PollUnit::new(planned(other_endpoint(), "b"), unit_b, &clock),
+        ],
+    ) else {
+        panic!("a subtree is one endpoint's admission scope");
+    };
+    assert!(matches!(error, RecipeError::MixedEndpoints { .. }));
 }

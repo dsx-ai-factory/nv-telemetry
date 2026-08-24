@@ -1,0 +1,9 @@
+{
+  "@odata.id": "/redfish/v1/Chassis/1U",
+  "@odata.type": "#Chassis.v1_26_0.Chassis",
+  "Id": "",
+  "Name": "1U Rack Mount Chassis",
+  "ChassisType": "RackMount",
+  "Manufacturer": "NVIDIA",
+  "Status": { "State": "Enabled", "Health": "OK" }
+}

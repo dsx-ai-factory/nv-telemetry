@@ -73,9 +73,9 @@ mod unix {
     use nv_telemetry_orchestration::EndpointFault;
     use nv_telemetry_orchestration::EndpointPolicy;
     use nv_telemetry_orchestration::Plan;
-    use nv_telemetry_orchestration::PlannedPoll;
     use nv_telemetry_orchestration::PollMeta;
     use nv_telemetry_orchestration::PollNeed;
+    use nv_telemetry_orchestration::PollUnit;
     use nv_telemetry_source::acquire;
     use nv_telemetry_source::Acquire;
     use nv_telemetry_source::Acquired;
@@ -239,6 +239,7 @@ mod unix {
             .map(|index| {
                 PollNeed::new(
                     endpoint(),
+                    REQUEST_CLASS,
                     format!("/redfish/v1/Chassis/1U/Sensors/S{index}"),
                     Duration::from_secs(30),
                 )
@@ -251,21 +252,22 @@ mod unix {
     struct SubtreeInput {
         policy: EndpointPolicy,
         clock: FrozenClock,
-        units: Vec<(PlannedPoll, Arc<FixtureUnit>)>,
+        units: Vec<PollUnit>,
     }
 
     fn subtree_input(count: usize) -> SubtreeInput {
         let plan = plan(fleet_needs(count), &[declaration()]).expect("the declaration polls");
+        let clock = FrozenClock {
+            manual: ManualClock::new(),
+        };
         let units = plan
             .polls()
             .iter()
-            .map(|planned| (planned.clone(), FixtureUnit::shared()))
+            .map(|planned| PollUnit::new(planned.clone(), FixtureUnit::shared(), &clock))
             .collect();
         SubtreeInput {
             policy: EndpointPolicy::default(),
-            clock: FrozenClock {
-                manual: ManualClock::new(),
-            },
+            clock,
             units,
         }
     }
@@ -342,7 +344,7 @@ mod unix {
     // gate is per benchmark and a dense turn is bulk-sized: it holds the
     // strict default while the one-unit turn needs the micro one.
     #[library_benchmark]
-    #[bench::dense_subtree(primed_runtime(SUBTREE_UNITS))]
+    #[bench::dense_erased(primed_runtime(SUBTREE_UNITS))]
     pub fn runtime_tick_dense(
         mut runtime: PollRuntime,
     ) -> RuntimeOutput<AcquisitionReport, EndpointFault> {
@@ -367,13 +369,13 @@ mod unix {
     // --- configure: what a config change pays ---
 
     #[library_benchmark]
-    #[bench::fleet(fleet_needs(FLEET_NEEDS))]
+    #[bench::matched_fleet(fleet_needs(FLEET_NEEDS))]
     pub fn plan_fleet(needs: Vec<PollNeed>) -> Plan {
         black_box(plan(needs, &[declaration()]).expect("the declaration polls"))
     }
 
     #[library_benchmark]
-    #[bench::chassis(subtree_input(SUBTREE_UNITS))]
+    #[bench::erased_chassis(subtree_input(SUBTREE_UNITS))]
     pub fn build_subtree(input: SubtreeInput) -> nv_telemetry_orchestration::EndpointSubtree {
         black_box(
             endpoint_subtree(&input.policy, &input.clock, input.units)

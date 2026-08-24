@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Chassis mapping: one document, two observation domains — the
+# enclosure's identity plate as inventory and its Status as states. An
+# nv.telemetry.mapping.v1.Manifest in protobuf text format, checked against
+# the DMTF schema index and the contract at `make codegen` time.
+
+source: "redfish"
+backend: BACKEND_SCHEMA_INDEX
+index: "nv-redfish-schema/dmtf"
+
+# A top-level resource is contained by nothing: no scope, `Id` names it.
+# The requested location lands as InventoryItem provenance, never identity.
+subject {
+  kind: "chassis"
+  id_path: "Id"
+}
+
+projections {
+  name: "chassis-inventory"
+  source_type: "Chassis"
+  target_type: "nv.telemetry.v1.InventoryItem"
+  # `subject` is identity, `source_key` is provenance — both are the
+  # compiler's to fill. ChassisType is Redfish-required, so a chassis with
+  # a recognized type always emits an item; an unrecognized type is
+  # reported as an issue instead of carried (until G5 preserves raw
+  # tokens), and everything else joins when present.
+  map_assemblies {
+    target_field: "attributes"
+    entries {
+      key: "chassis-type"
+      source_path: "ChassisType"
+    }
+    entries {
+      key: "manufacturer"
+      source_path: "Manufacturer"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "model"
+      source_path: "Model"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "sku"
+      source_path: "SKU"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "serial-number"
+      source_path: "SerialNumber"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "part-number"
+      source_path: "PartNumber"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "asset-tag"
+      source_path: "AssetTag"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "spare-part-number"
+      source_path: "SparePartNumber"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "version"
+      source_path: "Version"
+      null_policy: NULL_POLICY_ABSENT
+    }
+  }
+}
+
+projections {
+  name: "chassis-state"
+  source_type: "Chassis"
+  target_type: "nv.telemetry.v1.StateObservation"
+  constants { target_field: "name" value: "state" }
+  # DMTF spelling verbatim; the wire enumeration is open, so an unlisted
+  # value is reported rather than coerced.
+  fields {
+    source_path: "Status.State"
+    target_field: "value.string_value"
+    anchor: true
+    null_policy: NULL_POLICY_ABSENT
+    known_values: "Enabled"
+    known_values: "Disabled"
+    known_values: "StandbyOffline"
+    known_values: "StandbySpare"
+    known_values: "InTest"
+    known_values: "Starting"
+    known_values: "Absent"
+    known_values: "UnavailableOffline"
+    known_values: "Deferring"
+    known_values: "Quiesced"
+    known_values: "Updating"
+    known_values: "Qualified"
+    known_values: "Degraded"
+  }
+}
+
+projections {
+  name: "chassis-health"
+  source_type: "Chassis"
+  target_type: "nv.telemetry.v1.StateObservation"
+  constants { target_field: "name" value: "health" }
+  fields {
+    source_path: "Status.Health"
+    target_field: "value.string_value"
+    anchor: true
+    null_policy: NULL_POLICY_ABSENT
+    known_values: "OK"
+    known_values: "Warning"
+    known_values: "Critical"
+  }
+}

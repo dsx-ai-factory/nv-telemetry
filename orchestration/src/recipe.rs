@@ -6,8 +6,9 @@
 //!
 //! The milestone-1 slice of the architecture's admission stack — endpoint
 //! admission over the endpoint breaker over the rate bucket over the unit
-//! leaves. Request-class lanes and the class breaker are deliberately
-//! absent while one request class exists. The embedder composes these
+//! leaves. Units of different request classes share one round-robin
+//! ring; per-class lanes and the class breaker are deliberately absent
+//! until class-level policy exists. The embedder composes these
 //! subtrees under its own root and owns the `Runtime` driving loop; policy
 //! types here convert privately into dispatcher configuration, so the
 //! dispatcher's own vocabulary never leaks into embedder policy.
@@ -26,6 +27,7 @@ use nv_redfish_dispatcher::schedulers::TokenBucket;
 use nv_redfish_dispatcher::schedulers::TokenBucketConfig;
 use nv_redfish_dispatcher::CostUnits;
 use nv_redfish_dispatcher::WithCost;
+use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Origin;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionParts;
@@ -312,9 +314,50 @@ fn validate(policy: &EndpointPolicy) -> Result<(), RecipeError> {
     Ok(())
 }
 
+/// One planned poll bound to its acquisition unit, erased to the future
+/// level so units of different types share one subtree.
+pub struct PollUnit {
+    planned: PlannedPoll,
+    unit_endpoint: EndpointContext,
+    unit_origin: Origin,
+    make_work: Box<dyn FnMut() -> TelemetryWork + Send>,
+}
+
+impl PollUnit {
+    /// Pairs a planned poll with its unit. `clock` must be the clock the
+    /// subtree is later built with, so admitted stamps and leaf epochs
+    /// share one timeline. No checking happens here; the recipe compares
+    /// the plan against the unit's identity when the subtree is built.
+    pub fn new<A, C>(planned: PlannedPoll, unit: Arc<A>, clock: &C) -> Self
+    where
+        A: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
+        C: Clock + Clone + 'static,
+    {
+        let unit_endpoint = unit.endpoint().clone();
+        let unit_origin = unit.origin().clone();
+        let clock = clock.clone();
+        Self {
+            planned,
+            unit_endpoint,
+            unit_origin,
+            make_work: Box::new(move || poll_future(Arc::clone(&unit), clock.clone())),
+        }
+    }
+}
+
+impl std::fmt::Debug for PollUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollUnit")
+            .field("planned", &self.planned)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Builds one endpoint's subtree from its planned polls and their units.
 /// Leaf epochs and the bucket epoch come from `clock`, so the subtree and
-/// whatever timeline drives the runtime cannot diverge.
+/// whatever timeline drives the runtime cannot diverge. Units of different
+/// request classes share the round-robin ring; per-class lanes and the
+/// class breaker remain deliberately absent.
 ///
 /// # Errors
 ///
@@ -324,46 +367,40 @@ fn validate(policy: &EndpointPolicy) -> Result<(), RecipeError> {
 /// [`RecipeError::OriginMismatch`] when a planned poll and its unit
 /// disagree; and [`RecipeError::MixedEndpoints`] when the unit list spans
 /// more than one endpoint.
-pub fn endpoint_subtree<A, C>(
+pub fn endpoint_subtree<C: Clock>(
     policy: &EndpointPolicy,
     clock: &C,
-    units: Vec<(PlannedPoll, Arc<A>)>,
-) -> Result<EndpointSubtree, RecipeError>
-where
-    A: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
-    C: Clock + Clone + 'static,
-{
+    units: Vec<PollUnit>,
+) -> Result<EndpointSubtree, RecipeError> {
     if units.is_empty() {
         return Err(RecipeError::NoUnits);
     }
     validate(policy)?;
 
     let now = clock.instant();
-    let subtree_endpoint = units[0].0.endpoint().endpoint_id().to_owned();
+    let subtree_endpoint = units[0].planned.endpoint().endpoint_id().to_owned();
     let mut lanes = RoundRobin::new();
-    for (planned, unit) in units {
+    for unit in units {
+        let planned = &unit.planned;
         if planned.endpoint().endpoint_id() != subtree_endpoint {
             return Err(RecipeError::MixedEndpoints {
                 first: subtree_endpoint,
                 other: planned.endpoint().endpoint_id().to_owned(),
             });
         }
-        if planned.endpoint() != unit.endpoint() {
+        if planned.endpoint() != &unit.unit_endpoint {
             return Err(RecipeError::EndpointMismatch {
                 planned: planned.endpoint().endpoint_id().to_owned(),
-                unit: unit.endpoint().endpoint_id().to_owned(),
+                unit: unit.unit_endpoint.endpoint_id().to_owned(),
             });
         }
-        if planned.origin() != unit.origin() {
+        if planned.origin() != &unit.unit_origin {
             return Err(RecipeError::OriginMismatch {
                 planned: Box::new(planned.origin().clone()),
-                unit: Box::new(unit.origin().clone()),
+                unit: Box::new(unit.unit_origin.clone()),
             });
         }
-        let leaf = PeriodicLeaf::new(now, planned.cadence(), {
-            let clock = clock.clone();
-            move || poll_future(Arc::clone(&unit), clock.clone())
-        });
+        let leaf = PeriodicLeaf::new(now, planned.cadence(), unit.make_work);
         lanes.add_child(FixedCost::new(CostUnits::new(planned.cost()), leaf));
     }
 
