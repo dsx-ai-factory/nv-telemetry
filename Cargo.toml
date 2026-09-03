@@ -18,7 +18,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/nv-telemetry"
+repository = "https://github.com/dsx-ai-factory/nv-telemetry"
 
 [workspace.dependencies]
 # Workspace members. Dependencies run in one direction: schema -> model ->
