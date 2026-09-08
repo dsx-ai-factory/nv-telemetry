@@ -94,9 +94,6 @@ impl From<&BreakerPolicy> for CircuitBreakerConfig {
             sample_window: policy.sample_window,
             min_samples: policy.min_samples,
             cool_down: policy.cool_down,
-            // One probe decides recovery; more has a latent accounting bug
-            // upstream and buys nothing here.
-            half_open_max_probes: 1,
         }
     }
 }
