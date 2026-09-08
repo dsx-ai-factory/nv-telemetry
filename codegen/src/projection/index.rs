@@ -136,11 +136,12 @@ pub enum Shape {
 /// The parsed bundle; [`RedfishIndex`] borrows from it.
 pub struct Bundle {
     bundle: SchemaBundle,
+    documents: usize,
 }
 
 impl fmt::Debug for Bundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Bundle({} documents)", self.bundle.edmx_docs.len())
+        write!(f, "Bundle({} documents)", self.documents)
     }
 }
 
@@ -164,11 +165,12 @@ impl Bundle {
                 .map_err(|error| IndexError::Parse(path.clone(), format!("{error:?}")))?;
             documents.push(document);
         }
+        // Every document is a root: the query resolves across the whole
+        // vendored set, nothing is compiled.
+        let count = documents.len();
         Ok(Self {
-            bundle: SchemaBundle {
-                edmx_docs: documents,
-                root_set_threshold: None,
-            },
+            bundle: SchemaBundle::new(documents, Vec::new()),
+            documents: count,
         })
     }
 

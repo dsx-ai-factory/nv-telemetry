@@ -11,12 +11,14 @@
 //! breaker — which sees only success or failure — counts exactly the
 //! classes that indict the endpoint as failures. Every other outcome,
 //! including request-scoped failures, travels as a successful completion
-//! carrying its own status — and therefore registers as a *success* sample
-//! in the breaker's window: an endpoint mixing connectivity faults with
-//! request-scoped ones trips later than a purely unreachable one. A
-//! neutral sample kind needs a dispatcher addition; the dilution is the
-//! recorded cost of scoping until then. Both channels reach the driver; no
-//! status is ever lost to scheduling policy.
+//! carrying its own status — and registers as a *success* sample in the
+//! breaker's window deliberately: a `Protocol`, `Unsupported`, or `Device`
+//! failure is an answer from the endpoint, so it is evidence of the
+//! reachability the breaker samples, and an endpoint mixing connectivity
+//! faults with such answers rightly trips later than one that never
+//! answers. `Internal` — our own bug — says nothing about the endpoint and
+//! rides the same channel; that imprecision is accepted. Both channels
+//! reach the driver; no status is ever lost to scheduling policy.
 
 use std::sync::Arc;
 use std::time::Duration;
