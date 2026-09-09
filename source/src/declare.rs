@@ -12,8 +12,7 @@
 //!
 //! [`Acquire`]: crate::Acquire
 
-/// How a provider's requests reach the device. Closed to what this build
-/// can schedule; `Streamed` arrives with the gNMI milestone as an addition.
+/// How a provider's requests reach the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AcquisitionMode {
@@ -23,6 +22,11 @@ pub enum AcquisitionMode {
     /// walk holds its slot for all of them — which is why a provider that
     /// walks bounds the walk.
     Polled,
+
+    /// One admission opens one stream instance. Dropping the connect future
+    /// or returned stream cancels that instance; a reconnect is a separate
+    /// admission and a new stream instance.
+    Streamed,
 }
 
 /// The planner's vocabulary for one provider.
@@ -50,6 +54,23 @@ impl ProviderDeclaration {
             provider: provider.into(),
             request_class: request_class.into(),
             mode: AcquisitionMode::Polled,
+            cost,
+        }
+    }
+
+    /// Declares a streamed provider. `cost` weighs one connection attempt in
+    /// the same relative units that `polled` uses. Ongoing stream occupancy,
+    /// cancellation, and reconnection remain orchestration policy.
+    #[must_use]
+    pub fn streamed(
+        provider: impl Into<String>,
+        request_class: impl Into<String>,
+        cost: u64,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            request_class: request_class.into(),
+            mode: AcquisitionMode::Streamed,
             cost,
         }
     }

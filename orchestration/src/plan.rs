@@ -206,17 +206,16 @@ impl std::error::Error for PlanError {}
 /// Resolves needs against declarations: exactly one polled declaration
 /// serves each need's request class.
 ///
-/// Every declaration is validated whether or not a need references it —
-/// a broken declaration is a configuration error worth hearing about at
-/// plan time, not when a need eventually arrives. No needs is an empty
-/// plan, not an error.
+/// Every polled declaration is validated whether or not a need references it.
+/// Streamed declarations belong to separate stream planning and are ignored
+/// here. No needs is an empty plan, not an error.
 ///
 /// # Errors
 ///
 /// [`PlanError::NoProviderFor`] when nothing serves a need's class;
 /// [`PlanError::AmbiguousProviders`] when two declarations claim one class
 /// — loud until provider preference exists;
-/// [`PlanError::InvalidDeclaration`] and [`PlanError::ZeroCost`] when a
+/// [`PlanError::InvalidDeclaration`] and [`PlanError::ZeroCost`] when a polled
 /// declaration cannot be honored; and
 /// [`PlanError::InvalidCadence`] for a zero or beyond-a-year cadence.
 pub fn plan(needs: Vec<PollNeed>, declarations: &[ProviderDeclaration]) -> Result<Plan, PlanError> {
@@ -339,6 +338,49 @@ mod tests {
         let error = plan(Vec::new(), &declarations).expect_err("preference does not exist yet");
         assert!(
             matches!(&error, PlanError::AmbiguousProviders { request_class } if request_class == "sensor-read")
+        );
+    }
+
+    #[test]
+    fn streamed_declarations_do_not_change_polled_resolution() {
+        let declarations = [
+            ProviderDeclaration::polled("redfish.sensor.odata", "sensor-read", 1),
+            ProviderDeclaration::streamed("gnmi.dynamic", "sensor-read", 9),
+        ];
+
+        let needs = vec![PollNeed::new(
+            endpoint(),
+            "sensor-read",
+            "/redfish/v1/Chassis/1U/Sensors/S1",
+            Duration::from_secs(30),
+        )];
+
+        let plan = plan(needs, &declarations).expect("the polled provider serves the need");
+
+        assert_eq!(plan.polls().len(), 1);
+        assert_eq!(plan.polls()[0].origin().provider(), "redfish.sensor.odata");
+        assert_eq!(plan.polls()[0].cost(), 1);
+    }
+
+    #[test]
+    fn a_streamed_declaration_cannot_satisfy_a_poll_need() {
+        let declarations = [ProviderDeclaration::streamed(
+            "gnmi.dynamic",
+            "sensor-read",
+            1,
+        )];
+
+        let needs = vec![PollNeed::new(
+            endpoint(),
+            "sensor-read",
+            "/interfaces/interface/state/counters",
+            Duration::from_secs(30),
+        )];
+
+        let error = plan(needs, &declarations).expect_err("poll planning ignores streams");
+
+        assert!(
+            matches!(&error, PlanError::NoProviderFor { request_class } if request_class == "sensor-read")
         );
     }
 

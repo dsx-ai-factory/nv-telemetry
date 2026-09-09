@@ -30,11 +30,13 @@ use nv_telemetry_model::Origin;
 use nv_telemetry_model::ProjectionIssues;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_source::acquire;
+use nv_telemetry_source::stamp_item;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::Acquired;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
+use nv_telemetry_source::SubscriptionItem;
 
 use crate::clock::Clock;
 use crate::status::failed_status;
@@ -110,9 +112,10 @@ impl EndpointFault {
 /// The dispatcher payload shape: one boxed acquisition per tick.
 pub type TelemetryWork = nv_redfish_dispatcher::FutureWork<AcquisitionReport, EndpointFault>;
 
-/// Assembles one acquisition's outcome into its report. Pure: the entire
-/// status-and-issues doctrine, with no clock and no runtime, so every
-/// branch is directly testable.
+/// Assembles one acquisition's outcome into its report. A failed streamed
+/// connection attempt comes through this boundary because no stream item
+/// exists to stamp. Pure: the entire status-and-issues doctrine, with no clock
+/// and no runtime, so every branch is directly testable.
 ///
 /// # Errors
 ///
@@ -144,6 +147,45 @@ pub fn assemble(
             }
         }
     }
+}
+
+/// Stamps and assembles one reportable subscription item.
+///
+/// An `Ok` item represents one device notification. Parts that form valid
+/// model envelopes produce one report with one success status; an envelope
+/// failure produces an `Internal` failed status. An `Err` item is terminal for
+/// its stream instance and produces one failed status through the same breaker
+/// routing as a polled failure. Protocol control messages are filtered by the
+/// source and never passed to this function. Dropping the stream is
+/// cancellation, so it produces no item and no report.
+///
+/// `at` is the wall-clock instant when orchestration receives the projected
+/// item. `handling_duration` is the monotonic time from that receipt until
+/// orchestration is ready to assemble the report. The duration excludes time
+/// waiting for the next item, the stream's lifetime, and reconnect backoff.
+///
+/// # Errors
+///
+/// Returns an [`EndpointFault`] when the terminal failure is endpoint-scoped.
+/// The fault carries the failed status that the output driver must publish.
+pub fn assemble_stream_item<A>(
+    acquisition: &A,
+    at: Timestamp,
+    handling_duration: Duration,
+    item: SubscriptionItem,
+) -> Result<AcquisitionReport, EndpointFault>
+where
+    A: Acquire + ?Sized,
+{
+    let outcome = stamp_item(acquisition, at, item);
+
+    assemble(
+        acquisition.endpoint(),
+        acquisition.origin(),
+        at,
+        handling_duration,
+        outcome,
+    )
 }
 
 fn assemble_success(
@@ -409,5 +451,56 @@ mod tests {
             Some(FailureClass::Unsupported)
         );
         assert_eq!(report.status().retryable(), Some(false));
+    }
+
+    #[test]
+    fn each_stream_notification_produces_one_success_report() {
+        let unit = FixtureUnit {
+            endpoint: endpoint(),
+            origin: origin(),
+            parts: AcquisitionParts::new(Vec::new(), Vec::new()),
+        };
+
+        let item = Ok(AcquisitionParts::new(
+            vec![states_payload()],
+            vec![ProjectionIssue::missing("Reading")],
+        ));
+
+        let report = assemble_stream_item(&unit, at(), Duration::from_millis(3), item)
+            .expect("a notification is a report");
+
+        assert_eq!(report.batches().len(), 1);
+        assert_eq!(report.issues().map(|issues| issues.issues().len()), Some(1));
+        assert_eq!(report.status().outcome(), Outcome::Succeeded);
+        assert_eq!(report.status().started_at(), &at());
+        assert_eq!(report.status().duration_nanos(), Some(3_000_000));
+        assert_eq!(report.batches()[0].window().start(), &at());
+    }
+
+    #[test]
+    fn a_terminal_stream_failure_produces_one_failed_status() {
+        let unit = FixtureUnit {
+            endpoint: endpoint(),
+            origin: origin(),
+            parts: AcquisitionParts::new(Vec::new(), Vec::new()),
+        };
+
+        let item = Err(
+            AcquisitionFailure::new(AcquisitionFailureClass::Connectivity)
+                .with_detail("subscription closed"),
+        );
+
+        let fault = assemble_stream_item(&unit, at(), Duration::from_secs(8), item)
+            .expect_err("connectivity is endpoint-scoped");
+
+        assert_eq!(fault.status().outcome(), Outcome::Failed);
+
+        assert_eq!(
+            fault.status().failure_class(),
+            Some(FailureClass::Connectivity)
+        );
+
+        assert_eq!(fault.status().detail(), Some("subscription closed"));
+        assert_eq!(fault.status().duration_nanos(), Some(8_000_000_000));
     }
 }

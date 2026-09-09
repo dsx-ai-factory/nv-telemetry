@@ -8,9 +8,10 @@
 //! failure-class policy tables, and the assembly of every
 //! [`AcquisitionStatus`](nv_telemetry_model::AcquisitionStatus) and
 //! [`ProjectionIssues`](nv_telemetry_model::ProjectionIssues) envelope —
-//! sources never author either. One acquisition yields exactly one
-//! [`AcquisitionReport`], and the type makes anything else
-//! unrepresentable.
+//! sources never author either. One polled acquisition or reportable
+//! subscription item yields exactly one [`AcquisitionReport`] or endpoint
+//! fault, each carrying exactly one status. Stream synchronization controls
+//! and cancellation yield neither.
 //!
 //! The planner ([`plan`]) is static and deterministic: needs in, planned
 //! polls out, exactly one polled declaration serving each need's request
@@ -47,6 +48,7 @@ pub use recipe::PollUnit;
 pub use recipe::RatePolicy;
 pub use recipe::RecipeError;
 pub use report::assemble;
+pub use report::assemble_stream_item;
 pub use report::poll_future;
 pub use report::AcquisitionReport;
 pub use report::EndpointFault;
