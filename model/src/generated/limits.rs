@@ -95,6 +95,9 @@ pub const SIGNALDESCRIPTOR_UNIT_MAX_LEN: u32 = 64;
 /// `nv.telemetry.v1.SignalKey.facet` `max_len`, in bytes.
 pub const SIGNALKEY_FACET_MAX_LEN: u32 = 128;
 
+/// `nv.telemetry.v1.StateObservation.facet` `max_len`, in bytes.
+pub const STATEOBSERVATION_FACET_MAX_LEN: u32 = 128;
+
 /// `nv.telemetry.v1.StateObservation.name` `max_len`, in bytes.
 pub const STATEOBSERVATION_NAME_MAX_LEN: u32 = 256;
 

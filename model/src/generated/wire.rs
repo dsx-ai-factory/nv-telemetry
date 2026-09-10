@@ -475,7 +475,7 @@ pub struct Readings {
     #[prost(message, repeated, tag = "2")]
     pub samples: ::prost::alloc::vec::Vec<Reading>,
 }
-/// One observed fact about one resource: this subject's `name` facet had this
+/// One observed fact about one resource or signal: its named condition had this
 /// value. Deliberately one fact per observation rather than a bag, so partial
 /// observation needs no inner completeness story — the full structured
 /// snapshot is the resource graph's job.
@@ -493,19 +493,27 @@ pub struct StateObservation {
     /// the rest.
     #[prost(message, optional, tag = "4")]
     pub observed_at: ::core::option::Option<Timestamp>,
+    /// The signal this fact concerns, using exactly SignalKey.facet semantics.
+    /// Together with subject this identifies the descriptor whose unit applies
+    /// to a threshold.\* observation's reading. Absence selects only a signal
+    /// key with no facet; it is never a wildcard over the subject's signals.
+    /// Resource-wide facts such as health omit this field. Descriptors may
+    /// arrive in another batch; an unresolved key has an unknown unit.
+    #[prost(string, optional, tag = "5")]
+    pub facet: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// The state payload domain.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct States {
-    /// Deliberately not unique by subject and name. A batch reporting one facet
+    /// Deliberately not unique by subject, facet, and name. Reporting one fact
     /// twice looks like a contradiction from a polled source, but a streaming one
     /// — a gNMI ON_CHANGE subscription whose window covers an interface going
     /// down and back up — is reporting a series, and each observation carries its
     /// own timestamp to say so. Rejecting the pair would discard a real
     /// transition to enforce a snapshot shape only some sources have.
     ///
-    /// List position carries no order. When a (subject, name) occurs more than
-    /// once, every observation must carry observed_at and the timestamps must
+    /// List position carries no order. When a (subject, facet, name) occurs
+    /// more than once, every observation must carry observed_at and the timestamps must
     /// be distinct. A single observation of a facet may omit its timestamp.
     /// Consumers may order device timestamps only within a comparable clock
     /// domain. Never compare device time with the collector's window.start as a

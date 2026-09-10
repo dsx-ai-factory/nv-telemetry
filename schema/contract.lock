@@ -118,6 +118,7 @@ field nv.telemetry.v1.StateObservation 1 subject nv.telemetry.v1.Subject single 
 field nv.telemetry.v1.StateObservation 2 name string single explicit required max_len=256 non_empty
 field nv.telemetry.v1.StateObservation 3 value nv.telemetry.v1.Value single explicit required
 field nv.telemetry.v1.StateObservation 4 observed_at nv.telemetry.v1.Timestamp single explicit
+field nv.telemetry.v1.StateObservation 5 facet string single explicit max_len=128 non_empty
 field nv.telemetry.v1.States 1 observations nv.telemetry.v1.StateObservation repeated implicit unordered max_items=65536
 field nv.telemetry.v1.Subject 1 kind string single explicit required max_len=128 non_empty
 field nv.telemetry.v1.Subject 2 scope string repeated implicit max_items=16 max_len=256 non_empty

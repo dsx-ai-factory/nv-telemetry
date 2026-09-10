@@ -4250,6 +4250,7 @@ pub struct StateObservation {
     name: String,
     value: Value,
     observed_at: Option<Timestamp>,
+    facet: Option<String>,
 }
 impl crate::canonical::Canonical for StateObservation {
     fn canonical_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -4262,6 +4263,10 @@ impl crate::canonical::Canonical for StateObservation {
             .then_with(|| crate::canonical::cmp_option(
                 self.observed_at.as_ref(),
                 other.observed_at.as_ref(),
+            ))
+            .then_with(|| crate::canonical::cmp_option(
+                self.facet.as_ref(),
+                other.facet.as_ref(),
             ))
     }
 }
@@ -4277,6 +4282,10 @@ impl crate::canonical::Digest for StateObservation {
             crate::canonical::tag(state, 4);
             crate::canonical::Digest::digest(element, state);
         }
+        if let Some(element) = &self.facet {
+            crate::canonical::tag(state, 5);
+            crate::canonical::str_value(state, element);
+        }
         crate::canonical::end(state);
     }
 }
@@ -4288,6 +4297,9 @@ impl crate::encode::Emit for StateObservation {
         if let Some(element) = &self.observed_at {
             crate::encode::nested(4, element, buf);
         }
+        if let Some(element) = &self.facet {
+            ::prost::encoding::string::encode(5, element, buf);
+        }
     }
     fn emitted_len(&self) -> usize {
         crate::encode::nested_len(1, &self.subject)
@@ -4297,6 +4309,10 @@ impl crate::encode::Emit for StateObservation {
                 .observed_at
                 .as_ref()
                 .map_or(0, |element| crate::encode::nested_len(4, element))
+            + self
+                .facet
+                .as_ref()
+                .map_or(0, |element| ::prost::encoding::string::encoded_len(5, element))
     }
 }
 impl StateObservation {
@@ -4325,6 +4341,11 @@ impl StateObservation {
     pub fn observed_at(&self) -> Option<&Timestamp> {
         self.observed_at.as_ref()
     }
+    /// The `facet`, when present.
+    #[must_use]
+    pub fn facet(&self) -> Option<&str> {
+        self.facet.as_deref()
+    }
     fn check(&self) -> Result<(), Invalid> {
         if self.name.is_empty() {
             return Err(Invalid::field("name", Violation::Empty));
@@ -4334,6 +4355,19 @@ impl StateObservation {
             limits::STATEOBSERVATION_NAME_MAX_LEN,
         ) {
             return Err(Invalid::field("name", violation));
+        }
+        if let Some(element) = &self.facet {
+            if element.is_empty() {
+                return Err(Invalid::field("facet", Violation::Empty));
+            }
+        }
+        if let Some(element) = &self.facet {
+            if let Some(violation) = invalid::too_long(
+                element.len(),
+                limits::STATEOBSERVATION_FACET_MAX_LEN,
+            ) {
+                return Err(Invalid::field("facet", violation));
+            }
         }
         rules::state_observation(self)?;
         Ok(())
@@ -4347,6 +4381,7 @@ pub struct StateObservationBuilder {
     name: Option<String>,
     value: Option<Value>,
     observed_at: Option<Timestamp>,
+    facet: Option<String>,
 }
 impl StateObservationBuilder {
     /// Sets `subject`.
@@ -4373,6 +4408,12 @@ impl StateObservationBuilder {
         self.observed_at = Some(observed_at);
         self
     }
+    /// Sets `facet`.
+    #[must_use]
+    pub fn facet(mut self, facet: impl Into<String>) -> Self {
+        self.facet = Some(facet.into());
+        self
+    }
     /// Validates and builds.
     ///
     /// # Errors
@@ -4387,6 +4428,7 @@ impl StateObservationBuilder {
             name: self.name.ok_or_else(|| Invalid::field("name", Violation::Absent))?,
             value: self.value.ok_or_else(|| Invalid::field("value", Violation::Absent))?,
             observed_at: self.observed_at,
+            facet: self.facet,
         };
         built.check()?;
         Ok(built)
@@ -4412,6 +4454,7 @@ impl TryFrom<wire::StateObservation> for StateObservation {
                 .map(Timestamp::try_from)
                 .transpose()
                 .map_err(|error| error.at("observed_at"))?,
+            facet: wire.facet,
         };
         built.check()?;
         Ok(built)
@@ -4424,6 +4467,7 @@ impl From<StateObservation> for wire::StateObservation {
             name: Some(value.name),
             value: Some(value.value.into()),
             observed_at: value.observed_at.map(Into::into),
+            facet: value.facet,
         }
     }
 }

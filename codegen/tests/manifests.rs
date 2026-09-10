@@ -1107,6 +1107,26 @@ fn a_constant_over_the_targets_bound_is_rejected() {
 }
 
 #[test]
+fn state_signal_facets_are_emitted_and_validated() {
+    let mut state = state_projection("threshold.upper-critical");
+    state.constants.push(ConstantSpec {
+        target_field: "facet".to_owned(),
+        value: "power".to_owned(),
+    });
+    let files = emit(&[manifest(vec![state.clone()])]).expect("valid facet projection");
+    assert!(files
+        .iter()
+        .any(|(_, code)| code.contains("builder.facet(\"power\")")));
+    for (invalid, diagnostic) in [
+        (String::new(), "constant for `facet` is empty"),
+        ("x".repeat(129), "over the target's bound"),
+    ] {
+        state.constants[1].value = invalid;
+        rejects(manifest(vec![state.clone()]), diagnostic);
+    }
+}
+
+#[test]
 fn static_subject_values_obey_the_subject_schema() {
     let mut overlong = projection("overlong-subject-kind");
     overlong.subject = Some(SubjectSpec {

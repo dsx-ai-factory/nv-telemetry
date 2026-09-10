@@ -805,7 +805,12 @@ being the obvious case, is observed as resource state instead. The line is
 mutability. A threshold is writable on most implementations, which makes it a
 convergence target rather than reading metadata, and carrying it in both
 places would give one fact two representations that can disagree. Consumers
-that classify readings join by subject against the resource graph.
+that classify readings join by subject against the resource graph. Threshold
+units resolve through the exact `(StateObservation.subject,
+StateObservation.facet)` signal key. An absent facet matches only an absent
+`SignalKey.facet`; it does not select another signal on that resource.
+Projections validate facet strings using the schema's non-empty and length
+bounds, and state-series validation groups by `(subject, facet, name)`.
 
 ### Subjects
 

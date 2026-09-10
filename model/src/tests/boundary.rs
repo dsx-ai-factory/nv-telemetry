@@ -13,6 +13,8 @@ use crate::Coverage;
 use crate::EndpointContext;
 use crate::FailureClass;
 use crate::IssueKind;
+use crate::LogRecord;
+use crate::Logs;
 use crate::NumericValue;
 use crate::ObservationBatch;
 use crate::ObservationWindow;
@@ -124,6 +126,55 @@ fn a_batch_round_trips_through_the_validated_boundary() {
     let bytes = batch.encode_to_vec();
     let decoded = ObservationBatch::decode(&bytes).expect("wire round trip");
     assert_eq!(decoded, batch);
+}
+
+#[test]
+fn logs_are_partial_through_both_batch_boundaries() {
+    let base = valid_batch();
+    for complete in [false, true] {
+        for scoped in [false, true] {
+            for populated in [false, true] {
+                let mut coverage = Coverage::builder().completeness(if complete {
+                    Completeness::Complete
+                } else {
+                    Completeness::Partial
+                });
+                if scoped {
+                    coverage = coverage.scope(built_subject("log-service", "EventLog"));
+                }
+                let coverage = coverage.build().expect("coverage");
+                let records = if populated {
+                    vec![LogRecord::builder()
+                        .message("event")
+                        .build()
+                        .expect("record")]
+                } else {
+                    vec![]
+                };
+                let logs = Logs::builder().records(records).build().expect("logs");
+                let built = ObservationBatch::builder()
+                    .endpoint(base.endpoint().clone())
+                    .origin(base.origin().clone())
+                    .window(base.window().clone())
+                    .coverage(coverage.clone())
+                    .payload(Payload::Logs(logs.clone()))
+                    .build();
+                let mut raw: wire::ObservationBatch = base.clone().into();
+                raw.coverage = Some(coverage.into());
+                raw.payload = Some(wire::observation_batch::Payload::Logs(logs.into()));
+                let decoded = ObservationBatch::decode(&raw.encode_to_vec());
+                if complete {
+                    assert_eq!(built.unwrap_err().path(), "coverage.completeness");
+                    assert!(decoded
+                        .unwrap_err()
+                        .to_string()
+                        .contains("coverage.completeness"));
+                } else {
+                    assert_eq!(built.unwrap(), decoded.unwrap());
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -450,6 +501,106 @@ fn repeated_state_facets_require_distinct_timestamps() {
 }
 
 #[test]
+fn thresholds_resolve_units_by_exact_subject_and_facet() {
+    let subject = built_subject("power-supply", "PSU1");
+    let descriptors = [("power", "W"), ("energy", "kW.h")].map(|(facet, unit)| {
+        SignalDescriptor::builder()
+            .key(
+                SignalKey::builder()
+                    .subject(subject.clone())
+                    .facet(facet)
+                    .build()
+                    .unwrap(),
+            )
+            .unit(unit)
+            .build()
+            .unwrap()
+    });
+    let observations = [Some("power"), Some("energy"), None].map(|facet| {
+        let mut builder = StateObservation::builder()
+            .subject(subject.clone())
+            .name("threshold.upper-critical")
+            .value(Value::double(95.0).unwrap());
+        if let Some(facet) = facet {
+            builder = builder.facet(facet);
+        }
+        builder.build().unwrap()
+    });
+    let states = States::builder()
+        .observations(observations.to_vec())
+        .build()
+        .unwrap();
+    let decoded = States::try_from(wire::States::from(states.clone())).unwrap();
+    assert_eq!(decoded, states);
+    for (observation, expected) in observations.iter().zip([Some("W"), Some("kW.h"), None]) {
+        let unit = descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.key().subject() == observation.subject()
+                    && descriptor.key().facet() == observation.facet()
+            })
+            .and_then(SignalDescriptor::unit);
+        assert_eq!(unit, expected);
+    }
+}
+
+#[test]
+fn state_facet_bounds_match_signal_keys_at_both_boundaries() {
+    for facet in [String::new(), "x".repeat(128), "x".repeat(129)] {
+        let built = StateObservation::builder()
+            .subject(built_subject("sensor", "s1"))
+            .name("threshold.upper-critical")
+            .value(Value::double(95.0).unwrap())
+            .facet(facet.clone())
+            .build();
+        let decoded = StateObservation::try_from(wire::StateObservation {
+            subject: Some(built_subject("sensor", "s1").into()),
+            name: Some("threshold.upper-critical".into()),
+            value: Some(Value::double(95.0).unwrap().into()),
+            facet: Some(facet.clone()),
+            observed_at: None,
+        });
+        let key = SignalKey::builder()
+            .subject(built_subject("sensor", "s1"))
+            .facet(facet)
+            .build();
+        assert_eq!(built.is_ok(), key.is_ok());
+        assert_eq!(built, decoded);
+    }
+}
+
+#[test]
+fn interleaved_signal_facets_still_validate_each_series() {
+    // Canonical ordering sorts value before facet: power's repeats surround
+    // energy's single observation. Its missing timestamp is legal.
+    for stamps in [[None, None], [Some(10), Some(10)], [Some(10), Some(11)]] {
+        let observations = [
+            ("power", 1.0, stamps[0]),
+            ("energy", 2.0, None),
+            ("power", 3.0, stamps[1]),
+        ]
+        .map(|(facet, value, stamp)| {
+            let mut builder = StateObservation::builder()
+                .subject(built_subject("power-supply", "PSU1"))
+                .name("threshold.upper-critical")
+                .facet(facet)
+                .value(Value::double(value).unwrap());
+            if let Some(stamp) = stamp {
+                builder = builder.observed_at(Timestamp::new(stamp, 0).unwrap());
+            }
+            builder.build().unwrap()
+        })
+        .to_vec();
+        let decoded = States::try_from(wire::States {
+            observations: observations.iter().cloned().map(Into::into).collect(),
+        });
+        let built = States::builder().observations(observations).build();
+        assert_eq!(built.is_ok(), stamps == [Some(10), Some(11)]);
+        assert_eq!(built, decoded);
+    }
+}
+
+#[test]
 fn a_range_needs_a_bound_one_arm_and_order() {
     assert!(ValueRange::builder().build().is_err(), "no bound at all");
 
@@ -573,6 +724,7 @@ fn maximal_batches() -> Vec<wire::ObservationBatch> {
                     kind: Some(wire::value::Kind::StringValue("OK".into())),
                 }),
                 observed_at: Some(ts(30)),
+                facet: Some("power".into()),
             }],
         }),
         wire::observation_batch::Payload::Inventory(wire::Inventory {

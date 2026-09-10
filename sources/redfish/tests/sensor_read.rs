@@ -226,6 +226,32 @@ async fn query_options_do_not_change_resource_identity() {
 }
 
 #[tokio::test]
+async fn a_threshold_selects_the_sensors_exact_signal_key() {
+    let acquired = acquire(URI, include_str!("fixtures/sensor/nominal.json")).await;
+    let Payload::Readings(readings) = acquired.batches()[0].payload() else {
+        panic!("expected readings");
+    };
+    let Payload::States(states) = acquired.batches()[1].payload() else {
+        panic!("expected states");
+    };
+    let threshold = states
+        .observations()
+        .iter()
+        .find(|state| state.name() == "threshold.upper-critical")
+        .expect("threshold projected");
+    let descriptor = readings
+        .descriptors()
+        .iter()
+        .find(|descriptor| {
+            descriptor.key().subject() == threshold.subject()
+                && descriptor.key().facet() == threshold.facet()
+        })
+        .expect("threshold resolves to its exact signal key");
+    assert_eq!(threshold.facet(), None);
+    assert_eq!(descriptor.unit(), Some("Cel"));
+}
+
+#[tokio::test]
 async fn a_null_reading_is_a_quiet_device_not_an_issue() {
     let acquired = acquire(URI, include_str!("fixtures/sensor/reading-null.json")).await;
 

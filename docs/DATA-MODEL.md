@@ -59,7 +59,7 @@ batch applies exactly this rule and no other:
   that no longer exists. A descriptor present with no sample says the signal
   exists and has no value right now — a null `Reading`, a sensor offline. Sample
   absence is never a deletion; only descriptor absence is.
-- **`states`.** The `(subject, name)` facets are the population. A facet absent
+- **`states`.** The `(subject, facet, name)` facts are the population. A fact absent
   from a complete batch is a condition the resource no longer reports.
 - **`inventory`.** The subjects are the population. An absent subject is a
   removed part.
@@ -310,17 +310,20 @@ kept as provenance only on the graph route.
 
 The threshold lands here rather than in the descriptor because it is writable.
 A convergence consumer reads it as observed state and may drive it toward a
-desired value; a classification consumer joins it to the reading by subject.
-The threshold's `reading` is in the unit of the `SignalDescriptor` whose key
-is the same subject — `CPU1Temp`'s `Cel` — which is the binding rule for every
-threshold state: a threshold carries no unit of its own, and its unit is the
-descriptor's for the signal it guards, found by subject (and by facet, when the
-resource carries more than one signal). A consumer that has not seen that
-descriptor has a number it cannot interpret yet, not a dimensionless one.
+desired value; a classification consumer joins it to the reading by the exact
+`(subject, facet)` signal key. `StateObservation.facet` uses the same optional,
+non-empty, at-most-128-byte vocabulary as `SignalKey.facet`. Absence matches
+only a key with no facet; it never selects an arbitrary descriptor of the
+subject. The single-signal Sensor example omits facet on both sides, so this
+threshold's `reading` uses `CPU1Temp`'s `Cel`. A resource exposing power and
+energy instead uses distinct facets such as `"power"` and `"energy"` on its
+descriptors and thresholds. A threshold carries no unit of its own; a consumer
+that has not seen the descriptor for that exact key cannot interpret its
+number yet. It must not borrow a unit from another facet.
 
 **Repeated facets form a timestamped series.** `States.observations` is
 `unordered`: canonical position is not transition order. When a `(subject,
-name)` occurs more than once in a batch, every observation must carry
+facet, name)` occurs more than once in a batch, every observation must carry
 `observed_at` and no two may share an instant. Validation rejects missing or
 equal timestamps on repeated facets. A single observation may omit its time.
 
@@ -677,7 +680,7 @@ are endpoint-local in general (see *Identity*). The resource graph does not
 ship until a corpus fixture settles the dual-route case.
 
 **Units on thresholds.** A threshold in `states` carries no unit; it is bound
-to the unit of the `SignalDescriptor` for the same subject (and facet), which
+to the unit of the `SignalDescriptor` for the exact `(subject, facet)` key, which
 travels in a different batch. A consumer that has the threshold and not the
 descriptor holds a number it cannot yet interpret.
 
