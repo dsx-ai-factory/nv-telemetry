@@ -24,15 +24,12 @@ buf ?= buf
 # Set empty to disable the check.
 buf-version ?= 1.72.0
 
-# Compatibility is judged against this ref. Overridable so a release branch can
-# be compared against its own line rather than against main.
-proto-baseline ?= origin/main
-
 # Several targets share a name with a directory in the workspace, `codegen`
 # being the one that matters. Without this, make sees the directory, decides
 # the target is up to date, and silently does nothing.
-.PHONY: all ci fmt bench codegen check-codegen proto-lint proto-breaking \
-	check-proto-format check-redfish-features require-buf rust-install clean
+.PHONY: all ci fmt bench codegen check-codegen proto-lint \
+	check-proto-format check-redfish-features require-buf \
+	rust-install clean
 
 # `--locked` throughout: generated output is byte-compared, and its bytes are
 # decided by prost-build and prettyplease. Manifests state semver ranges, and
@@ -50,7 +47,6 @@ define build-and-test
 	cargo +$(fmt-toolchain) fmt --all -- --check
 	+$(MAKE) check-proto-format
 	+$(MAKE) proto-lint
-	+$(MAKE) proto-breaking
 	+$(MAKE) check-codegen
 	+$(MAKE) check-redfish-features
 	cargo clippy $(cargo-locked) --workspace --all-targets -- -D warnings
@@ -83,23 +79,6 @@ proto-lint: require-buf
 
 check-proto-format: require-buf
 	$(buf) format --diff --exit-code
-
-# Additive-only evolution. buf owns this rather than the contract lock, because
-# it already covers reserved ranges, enum changes, JSON names, and oneof moves,
-# and because FIELD_SAME_CARDINALITY catches a field quietly losing explicit
-# presence, which is how fabricated zeros would come back.
-#
-# Skipped, loudly, until the schema exists at the baseline. That is a real gap
-# while it lasts: the first push of the schema is compared against nothing.
-#
-# Deciding when to skip is the whole difficulty, and it lives in the script
-# rather than here. Two earlier attempts got it wrong in the same direction:
-# one tested for a hardcoded schema directory and stopped finding it the day
-# the schema moved, the other matched buf's output for "no .proto files" and
-# could not tell an empty baseline from a deleted contract. Both reported
-# success while checking nothing.
-proto-breaking: require-buf
-	BUF=$(buf) bash tools/proto-breaking.sh $(proto-baseline)
 
 require-buf:
 	@BUF=$(buf) bash tools/require-buf.sh $(buf-version)

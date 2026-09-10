@@ -54,3 +54,4 @@ pub use result::Acquired;
 pub use result::AcquisitionFailure;
 pub use result::AcquisitionFailureClass;
 pub use result::AcquisitionParts;
+pub use result::OMITTED_ISSUES_LOCATOR;

@@ -55,12 +55,16 @@ message LogRecord {
 
   // The resource the record is about, when the source names one — a Redfish
   // OriginOfCondition — as opposed to the service it was collected from,
-  // which is provenance and lives on the batch.
+  // which is provenance and lives on the batch as `Coverage.scope`.
   optional Subject subject = 4;
 
   // The source's identifier for this entry, when it has one, so incremental
-  // collection can resume and consumers can deduplicate. Deliberately no
-  // uniqueness constraint on the records list: sources that do not stamp
+  // collection can resume and consumers can deduplicate. Its namespace is the
+  // batch's `Coverage.scope` — the log service — so the deduplication key is
+  // (endpoint_id, coverage.scope, entry_id): two services on one endpoint both
+  // number their entries from 1. A service that is cleared reuses its ids; a
+  // consumer that must survive that also compares `occurred_at`. Deliberately
+  // no uniqueness constraint on the records list: sources that do not stamp
   // entries leave this absent, and a key that can be absent cannot decide
   // duplicates.
   optional string entry_id = 5 [(nv.telemetry.options.v1.field_invariant) = {

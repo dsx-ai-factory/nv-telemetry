@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command-line driver for the schema compiler, invoked by `make codegen` and
+//! Command-line driver for the schema compiler, invoked by `make codegen`,
 //! `make check-codegen`.
 
 // A command-line tool reports on stdout and stderr; the workspace lint that
@@ -16,8 +16,8 @@ use nv_telemetry_codegen::Outcome;
 const USAGE: &str = "\
 usage: nv-telemetry-codegen <command>
 
-  generate    rewrite the generated trees
-  --check     report whether the generated trees are up to date
+  generate               rewrite the generated trees
+  --check                report whether the generated trees are up to date
 
 Generated output includes the contract lock, validated model and wire types,
 projection modules, and provenance. All are checked in and compared byte for

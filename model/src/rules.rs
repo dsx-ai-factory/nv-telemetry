@@ -152,8 +152,43 @@ pub(crate) fn state_observation(_observation: &StateObservation) -> Result<(), I
     Ok(())
 }
 
-/// No cross-field rules; the schema states none for `States`.
-pub(crate) fn states(_states: &States) -> Result<(), Invalid> {
+/// A repeated (subject, facet, name) is a series: every observation carries a
+/// distinct timestamp, since canonical list position cannot preserve order.
+pub(crate) fn states(states: &States) -> Result<(), Invalid> {
+    // Facet follows the value in wire/canonical order, so observations of
+    // one signal need not be contiguous. Group by the full state identity.
+    let mut series = BTreeMap::new();
+    for (index, observation) in states.observations().iter().enumerate() {
+        series
+            .entry((
+                observation.subject(),
+                observation.facet(),
+                observation.name(),
+            ))
+            .or_insert_with(Vec::new)
+            .push((index, observation));
+    }
+    for observations in series.values() {
+        if observations.len() > 1 {
+            let mut instants = BTreeSet::new();
+            for &(index, observation) in observations {
+                let instant = observation.observed_at().ok_or_else(|| {
+                    Invalid::element(
+                        "observations",
+                        index,
+                        Violation::Rule("a repeated state facet requires observed_at"),
+                    )
+                })?;
+                if !instants.insert(instant) {
+                    return Err(Invalid::element(
+                        "observations",
+                        index,
+                        Violation::Rule("a repeated state facet requires distinct timestamps"),
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -295,10 +330,19 @@ pub(crate) fn projection_issues(issues: &ProjectionIssues) -> Result<(), Invalid
 /// "Scope on a graph batch means reachability from the scope subject ...
 /// Reachability is a wrapper rule on complete graphs."
 ///
-/// Only complete, scoped graph payloads are constrained: a partial walk may
-/// legitimately hold fragments its root cannot reach yet, and an unscoped
-/// batch declares no root to reach from.
+/// Logs are never complete. Complete, scoped graphs must be reachable: a
+/// partial walk may legitimately hold fragments its root cannot reach yet,
+/// and an unscoped batch declares no root to reach from.
 pub(crate) fn observation_batch(batch: &ObservationBatch) -> Result<(), Invalid> {
+    if matches!(batch.payload(), Payload::Logs(_))
+        && batch.coverage().completeness() == Completeness::Complete
+    {
+        return Err(Invalid::field(
+            "completeness",
+            Violation::Rule("a logs batch is never complete"),
+        )
+        .at("coverage"));
+    }
     let Payload::Resources(graph) = batch.payload() else {
         return Ok(());
     };

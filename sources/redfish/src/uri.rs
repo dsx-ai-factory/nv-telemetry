@@ -28,9 +28,49 @@ pub(crate) fn canonical(uri: &str) -> &str {
     }
 }
 
+/// The namespaced owner of a log service at a supported Redfish location.
+/// Keep the collection name as well as its local id: Systems/1 and
+/// Managers/1 are different owners on the same endpoint.
+pub(crate) fn log_service_owner(uri: &str) -> Option<(&str, &str)> {
+    let segments: Vec<_> = canonical(uri).split('/').collect();
+    match segments.as_slice() {
+        ["", "redfish", "v1", kind @ ("Systems" | "Managers" | "Chassis"), owner, "LogServices", service]
+            if !owner.is_empty() && !service.is_empty() =>
+        {
+            Some((kind, owner))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::canonical;
+    use super::log_service_owner;
+
+    #[test]
+    fn a_log_service_owner_keeps_its_namespace() {
+        assert_eq!(
+            log_service_owner("/redfish/v1/Systems/1/LogServices/SEL"),
+            Some(("Systems", "1"))
+        );
+        assert_eq!(
+            log_service_owner("/redfish/v1/Managers/1/LogServices/SEL?token=x"),
+            Some(("Managers", "1"))
+        );
+        assert_eq!(
+            log_service_owner("/redfish/v1/Chassis/1/LogServices/SEL"),
+            Some(("Chassis", "1"))
+        );
+        for path in [
+            "/LogServices/SEL",
+            "/redfish/v1/Odd/SEL",
+            "/redfish/v1/Systems//LogServices/SEL",
+            "/redfish/v1/Systems/1/LogServices/SEL/Entries",
+        ] {
+            assert_eq!(log_service_owner(path), None);
+        }
+    }
 
     #[test]
     fn a_property_fragment_names_the_same_resource_as_the_bare_uri() {

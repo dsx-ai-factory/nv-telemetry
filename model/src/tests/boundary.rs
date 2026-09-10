@@ -13,6 +13,8 @@ use crate::Coverage;
 use crate::EndpointContext;
 use crate::FailureClass;
 use crate::IssueKind;
+use crate::LogRecord;
+use crate::Logs;
 use crate::NumericValue;
 use crate::ObservationBatch;
 use crate::ObservationWindow;
@@ -28,8 +30,11 @@ use crate::ResourceGraph;
 use crate::ResourceRelation;
 use crate::SignalDescriptor;
 use crate::SignalKey;
+use crate::StateObservation;
+use crate::States;
 use crate::Subject;
 use crate::Timestamp;
+use crate::Value;
 use crate::ValueRange;
 use crate::Violation;
 
@@ -121,6 +126,55 @@ fn a_batch_round_trips_through_the_validated_boundary() {
     let bytes = batch.encode_to_vec();
     let decoded = ObservationBatch::decode(&bytes).expect("wire round trip");
     assert_eq!(decoded, batch);
+}
+
+#[test]
+fn logs_are_partial_through_both_batch_boundaries() {
+    let base = valid_batch();
+    for complete in [false, true] {
+        for scoped in [false, true] {
+            for populated in [false, true] {
+                let mut coverage = Coverage::builder().completeness(if complete {
+                    Completeness::Complete
+                } else {
+                    Completeness::Partial
+                });
+                if scoped {
+                    coverage = coverage.scope(built_subject("log-service", "EventLog"));
+                }
+                let coverage = coverage.build().expect("coverage");
+                let records = if populated {
+                    vec![LogRecord::builder()
+                        .message("event")
+                        .build()
+                        .expect("record")]
+                } else {
+                    vec![]
+                };
+                let logs = Logs::builder().records(records).build().expect("logs");
+                let built = ObservationBatch::builder()
+                    .endpoint(base.endpoint().clone())
+                    .origin(base.origin().clone())
+                    .window(base.window().clone())
+                    .coverage(coverage.clone())
+                    .payload(Payload::Logs(logs.clone()))
+                    .build();
+                let mut raw: wire::ObservationBatch = base.clone().into();
+                raw.coverage = Some(coverage.into());
+                raw.payload = Some(wire::observation_batch::Payload::Logs(logs.into()));
+                let decoded = ObservationBatch::decode(&raw.encode_to_vec());
+                if complete {
+                    assert_eq!(built.unwrap_err().path(), "coverage.completeness");
+                    assert!(decoded
+                        .unwrap_err()
+                        .to_string()
+                        .contains("coverage.completeness"));
+                } else {
+                    assert_eq!(built.unwrap(), decoded.unwrap());
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -411,6 +465,142 @@ fn a_complete_scoped_graph_must_hang_off_its_root() {
 }
 
 #[test]
+fn repeated_state_facets_require_distinct_timestamps() {
+    for stamps in [
+        [None, None],
+        [None, Some(10)],
+        [Some(10), Some(10)],
+        [Some(10), Some(11)],
+    ] {
+        let observations = ["down", "up"]
+            .into_iter()
+            .zip(stamps)
+            .map(|(value, stamp)| {
+                let mut builder = StateObservation::builder()
+                    .subject(built_subject("port", "eth0"))
+                    .name("state")
+                    .value(Value::string(value).expect("short value"));
+                if let Some(seconds) = stamp {
+                    builder = builder.observed_at(Timestamp::new(seconds, 0).expect("instant"));
+                }
+                builder.build().expect("observation")
+            })
+            .collect::<Vec<_>>();
+        let decoded = wire::States {
+            observations: observations.iter().cloned().map(Into::into).collect(),
+        };
+        let built = States::builder().observations(observations).build();
+        let decoded = States::try_from(decoded);
+        let valid = stamps == [Some(10), Some(11)];
+        assert_eq!(built.is_ok(), valid, "builder: {stamps:?}");
+        assert_eq!(decoded.is_ok(), valid, "decode: {stamps:?}");
+        if valid {
+            assert_eq!(built.unwrap(), decoded.unwrap());
+        }
+    }
+}
+
+#[test]
+fn thresholds_resolve_units_by_exact_subject_and_facet() {
+    let subject = built_subject("power-supply", "PSU1");
+    let descriptors = [("power", "W"), ("energy", "kW.h")].map(|(facet, unit)| {
+        SignalDescriptor::builder()
+            .key(
+                SignalKey::builder()
+                    .subject(subject.clone())
+                    .facet(facet)
+                    .build()
+                    .unwrap(),
+            )
+            .unit(unit)
+            .build()
+            .unwrap()
+    });
+    let observations = [Some("power"), Some("energy"), None].map(|facet| {
+        let mut builder = StateObservation::builder()
+            .subject(subject.clone())
+            .name("threshold.upper-critical")
+            .value(Value::double(95.0).unwrap());
+        if let Some(facet) = facet {
+            builder = builder.facet(facet);
+        }
+        builder.build().unwrap()
+    });
+    let states = States::builder()
+        .observations(observations.to_vec())
+        .build()
+        .unwrap();
+    let decoded = States::try_from(wire::States::from(states.clone())).unwrap();
+    assert_eq!(decoded, states);
+    for (observation, expected) in observations.iter().zip([Some("W"), Some("kW.h"), None]) {
+        let unit = descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.key().subject() == observation.subject()
+                    && descriptor.key().facet() == observation.facet()
+            })
+            .and_then(SignalDescriptor::unit);
+        assert_eq!(unit, expected);
+    }
+}
+
+#[test]
+fn state_facet_bounds_match_signal_keys_at_both_boundaries() {
+    for facet in [String::new(), "x".repeat(128), "x".repeat(129)] {
+        let built = StateObservation::builder()
+            .subject(built_subject("sensor", "s1"))
+            .name("threshold.upper-critical")
+            .value(Value::double(95.0).unwrap())
+            .facet(facet.clone())
+            .build();
+        let decoded = StateObservation::try_from(wire::StateObservation {
+            subject: Some(built_subject("sensor", "s1").into()),
+            name: Some("threshold.upper-critical".into()),
+            value: Some(Value::double(95.0).unwrap().into()),
+            facet: Some(facet.clone()),
+            observed_at: None,
+        });
+        let key = SignalKey::builder()
+            .subject(built_subject("sensor", "s1"))
+            .facet(facet)
+            .build();
+        assert_eq!(built.is_ok(), key.is_ok());
+        assert_eq!(built, decoded);
+    }
+}
+
+#[test]
+fn interleaved_signal_facets_still_validate_each_series() {
+    // Canonical ordering sorts value before facet: power's repeats surround
+    // energy's single observation. Its missing timestamp is legal.
+    for stamps in [[None, None], [Some(10), Some(10)], [Some(10), Some(11)]] {
+        let observations = [
+            ("power", 1.0, stamps[0]),
+            ("energy", 2.0, None),
+            ("power", 3.0, stamps[1]),
+        ]
+        .map(|(facet, value, stamp)| {
+            let mut builder = StateObservation::builder()
+                .subject(built_subject("power-supply", "PSU1"))
+                .name("threshold.upper-critical")
+                .facet(facet)
+                .value(Value::double(value).unwrap());
+            if let Some(stamp) = stamp {
+                builder = builder.observed_at(Timestamp::new(stamp, 0).unwrap());
+            }
+            builder.build().unwrap()
+        })
+        .to_vec();
+        let decoded = States::try_from(wire::States {
+            observations: observations.iter().cloned().map(Into::into).collect(),
+        });
+        let built = States::builder().observations(observations).build();
+        assert_eq!(built.is_ok(), stamps == [Some(10), Some(11)]);
+        assert_eq!(built, decoded);
+    }
+}
+
+#[test]
 fn a_range_needs_a_bound_one_arm_and_order() {
     assert!(ValueRange::builder().build().is_err(), "no bound at all");
 
@@ -432,49 +622,72 @@ fn a_range_needs_a_bound_one_arm_and_order() {
     assert!(backwards.is_err(), "min must not exceed max");
 }
 
-/// Maximal wire messages: every optional field set, every payload domain
-/// exercised. `TryFrom` consumes the wire message field by field and `From`
-/// rebuilds it; a field one of them forgets is silent data loss, and sparse
-/// round trips cannot see it. Maps carry a single entry so sorting cannot
-/// reorder them, making byte equality the assertion.
-// Long because it is exhaustive — one construction per payload domain with
-// every field populated. Trimming it to a length limit would reopen exactly
-// the blind spot it exists to close.
-#[allow(clippy::too_many_lines)]
-#[test]
-fn every_field_survives_the_validated_round_trip() {
-    let ts = |seconds: i64| wire::Timestamp {
+fn wire_timestamp(seconds: i64) -> wire::Timestamp {
+    wire::Timestamp {
         seconds: Some(seconds),
         nanos: Some(7),
-    };
-    let subject = |id: &str| wire::Subject {
+    }
+}
+
+fn wire_subject(id: &str) -> wire::Subject {
+    wire::Subject {
         kind: Some("sensor".into()),
         scope: vec!["1U".into()],
         id: Some(id.into()),
-    };
-    let key = |id: &str| wire::SignalKey {
-        subject: Some(subject(id)),
+    }
+}
+
+fn wire_key(id: &str) -> wire::SignalKey {
+    wire::SignalKey {
+        subject: Some(wire_subject(id)),
         facet: Some("state/counters".into()),
-    };
-    let map = wire::value::Map {
+    }
+}
+
+/// A single entry, so canonical sorting cannot reorder it and byte equality
+/// stays the assertion.
+fn wire_map() -> wire::value::Map {
+    wire::value::Map {
         entries: vec![wire::value::map::Entry {
             key: Some("serial".into()),
             value: Some(wire::Value {
                 kind: Some(wire::value::Kind::StringValue("SN-1".into())),
             }),
         }],
-    };
-    let numeric = |value: f64| wire::NumericValue {
+    }
+}
+
+fn wire_numeric(value: f64) -> wire::NumericValue {
+    wire::NumericValue {
         kind: Some(wire::numeric_value::Kind::DoubleValue(value)),
-    };
-    let endpoint = || wire::EndpointContext {
+    }
+}
+
+fn wire_endpoint() -> wire::EndpointContext {
+    wire::EndpointContext {
         endpoint_id: Some("bmc-lab-07".into()),
-        attributes: Some(map.clone()),
-    };
-    let origin = || wire::Origin {
+        attributes: Some(wire_map()),
+    }
+}
+
+fn wire_origin() -> wire::Origin {
+    wire::Origin {
         provider: Some("redfish".into()),
         request_class: Some("read".into()),
-    };
+    }
+}
+
+/// Maximal wire batches: every optional field set, one per payload domain.
+// Long because it is exhaustive — one construction per payload domain with
+// every field populated. Trimming it to a length limit would reopen exactly
+// the blind spot it exists to close.
+#[allow(clippy::too_many_lines)]
+fn maximal_batches() -> Vec<wire::ObservationBatch> {
+    let ts = wire_timestamp;
+    let subject = wire_subject;
+    let key = wire_key;
+    let map = wire_map();
+    let numeric = wire_numeric;
 
     let payloads = vec![
         wire::observation_batch::Payload::Readings(wire::Readings {
@@ -511,6 +724,7 @@ fn every_field_survives_the_validated_round_trip() {
                     kind: Some(wire::value::Kind::StringValue("OK".into())),
                 }),
                 observed_at: Some(ts(30)),
+                facet: Some("power".into()),
             }],
         }),
         wire::observation_batch::Payload::Inventory(wire::Inventory {
@@ -542,10 +756,11 @@ fn every_field_survives_the_validated_round_trip() {
         }),
     ];
 
-    for payload in payloads {
-        let maximal = wire::ObservationBatch {
-            endpoint: Some(endpoint()),
-            origin: Some(origin()),
+    payloads
+        .into_iter()
+        .map(|payload| wire::ObservationBatch {
+            endpoint: Some(wire_endpoint()),
+            origin: Some(wire_origin()),
             window: Some(wire::ObservationWindow {
                 start: Some(ts(1)),
                 end: Some(ts(2)),
@@ -555,8 +770,53 @@ fn every_field_survives_the_validated_round_trip() {
                 scope: Some(subject("1U")),
             }),
             payload: Some(payload),
-        };
+        })
+        .collect()
+}
 
+fn maximal_status() -> wire::AcquisitionStatus {
+    wire::AcquisitionStatus {
+        endpoint_id: Some("bmc-lab-07".into()),
+        provider: Some("redfish".into()),
+        request_class: Some("read".into()),
+        outcome: Some(2),
+        failure_class: Some(3),
+        retryable: Some(true),
+        started_at: Some(wire_timestamp(50)),
+        duration_nanos: Some(125_000),
+        detail: Some("timed out".into()),
+    }
+}
+
+/// Issues are given in canonical (path) order so the unordered sort cannot
+/// reorder them, keeping byte equality the assertion.
+fn maximal_issues() -> wire::ProjectionIssues {
+    wire::ProjectionIssues {
+        endpoint: Some(wire_endpoint()),
+        origin: Some(wire_origin()),
+        at: Some(wire_timestamp(60)),
+        issues: vec![
+            wire::ProjectionIssue {
+                path: Some("Id".into()),
+                kind: Some(wire::projection_issue::IssueKind::MissingRequired as i32),
+                detail: None,
+            },
+            wire::ProjectionIssue {
+                path: Some("Sensors[3].Reading".into()),
+                kind: Some(wire::projection_issue::IssueKind::Invalid as i32),
+                detail: Some("not a finite number".into()),
+            },
+        ],
+    }
+}
+
+/// Maximal wire messages: every optional field set, every payload domain
+/// exercised. `TryFrom` consumes the wire message field by field and `From`
+/// rebuilds it; a field one of them forgets is silent data loss, and sparse
+/// round trips cannot see it.
+#[test]
+fn every_field_survives_the_validated_round_trip() {
+    for maximal in maximal_batches() {
         let validated = ObservationBatch::try_from(maximal.clone()).expect("maximal batch valid");
         // The direct encoder against prost encoding the rebuilt wire tree:
         // byte equality, with every field of every domain present — the
@@ -571,17 +831,7 @@ fn every_field_survives_the_validated_round_trip() {
         );
     }
 
-    let status = wire::AcquisitionStatus {
-        endpoint_id: Some("bmc-lab-07".into()),
-        provider: Some("redfish".into()),
-        request_class: Some("read".into()),
-        outcome: Some(2),
-        failure_class: Some(3),
-        retryable: Some(true),
-        started_at: Some(ts(50)),
-        duration_nanos: Some(125_000),
-        detail: Some("timed out".into()),
-    };
+    let status = maximal_status();
     let validated = AcquisitionStatus::try_from(status.clone()).expect("maximal status valid");
     let direct = validated.encode_to_vec();
     assert_eq!(
@@ -595,25 +845,7 @@ fn every_field_survives_the_validated_round_trip() {
         "the direct status encoder diverged from prost"
     );
 
-    // Issues are given in canonical (path) order so the unordered sort
-    // cannot reorder them, keeping byte equality the assertion.
-    let issues = wire::ProjectionIssues {
-        endpoint: Some(endpoint()),
-        origin: Some(origin()),
-        at: Some(ts(60)),
-        issues: vec![
-            wire::ProjectionIssue {
-                path: Some("Id".into()),
-                kind: Some(wire::projection_issue::IssueKind::MissingRequired as i32),
-                detail: None,
-            },
-            wire::ProjectionIssue {
-                path: Some("Sensors[3].Reading".into()),
-                kind: Some(wire::projection_issue::IssueKind::Invalid as i32),
-                detail: Some("not a finite number".into()),
-            },
-        ],
-    };
+    let issues = maximal_issues();
     let validated = ProjectionIssues::try_from(issues.clone()).expect("maximal issues valid");
     let direct = validated.encode_to_vec();
     assert_eq!(

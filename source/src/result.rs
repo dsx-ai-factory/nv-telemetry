@@ -7,11 +7,15 @@
 //! the contract's central invariant made unrepresentable: a failed request
 //! emits no batch at all — never an empty one, never one with zeroes. A
 //! response that arrived with some fields unusable is the `Ok` side carrying
-//! issues; partial *failure* needs no representation because one admitted
-//! unit is one request, and per-resource units fail separately.
+//! issues. Partial *failure* has no representation of its own: a unit that
+//! walks a collection records a member the device answered for but would
+//! not serve as an issue against that member, and a failure that indicts the
+//! endpoint — or the collector — fails the whole unit, discarding what the
+//! walk had projected.
 
 use std::fmt;
 
+use nv_telemetry_model::limits::PROJECTIONISSUES_ISSUES_MAX_ITEMS;
 use nv_telemetry_model::Coverage;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Invalid;
@@ -24,6 +28,29 @@ use nv_telemetry_model::Timestamp;
 use crate::ProjectionIssue;
 
 pub(crate) const DETAIL_TRUNCATION_MARKER: &str = "...";
+
+/// The locator of the issue that stands in for issues the envelope's bound
+/// left no room for: a fact about the report, not about any source field.
+pub const OMITTED_ISSUES_LOCATOR: &str = "@omitted";
+
+/// At most `limit` issues: the first `limit - 1` kept and one closing issue
+/// at [`OMITTED_ISSUES_LOCATOR`] counting the rest. The envelope holds one
+/// issue per path up to the contract's bound and refuses more, which would
+/// discard every batch of an acquisition that merely had much to report; a
+/// collection walk over a faulty log is the case that reaches it.
+fn bounded_issues(mut issues: Vec<ProjectionIssue>, limit: usize) -> Vec<ProjectionIssue> {
+    if issues.len() <= limit {
+        return issues;
+    }
+    let kept = limit.saturating_sub(1);
+    let omitted = issues.len() - kept;
+    issues.truncate(kept);
+    issues.push(ProjectionIssue::invalid(
+        OMITTED_ISSUES_LOCATOR,
+        format!("{omitted} further issues omitted at the envelope's bound"),
+    ));
+    issues
+}
 
 type CoveredPayloads = Box<[(Coverage, Payload)]>;
 
@@ -51,6 +78,33 @@ pub enum AcquisitionFailureClass {
     Device,
     /// The failure was ours.
     Internal,
+}
+
+impl AcquisitionFailureClass {
+    /// Whether the class indicts the endpoint rather than one request of it.
+    ///
+    /// The endpoint breaker samples exactly these; everything else stays
+    /// with its request — `Protocol`, `Unsupported`, and `Device` are
+    /// answers, so they prove the endpoint reachable, and `Internal` is the
+    /// collector's own fault, which must not quarantine a device. A
+    /// collection walk uses the same line to decide whether one member's
+    /// failure ends the acquisition or is recorded against that member.
+    #[must_use]
+    pub const fn is_endpoint_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::Connectivity | Self::Authentication | Self::Timeout
+        )
+    }
+
+    /// Whether the class is an answer the device gave about one request —
+    /// `Protocol`, `Unsupported`, `Device` — as opposed to a failure to
+    /// reach it or the collector's own fault. A collection walk records
+    /// such a member and goes on; anything else ends the walk.
+    #[must_use]
+    pub const fn is_device_answer(self) -> bool {
+        matches!(self, Self::Protocol | Self::Unsupported | Self::Device)
+    }
 }
 
 impl From<AcquisitionFailureClass> for nv_telemetry_model::FailureClass {
@@ -84,7 +138,8 @@ impl AcquisitionParts {
     pub fn new(payloads: Vec<(Coverage, Payload)>, issues: Vec<ProjectionIssue>) -> Self {
         Self {
             payloads: payloads.into_boxed_slice(),
-            issues: issues.into_boxed_slice(),
+            issues: bounded_issues(issues, PROJECTIONISSUES_ISSUES_MAX_ITEMS as usize)
+                .into_boxed_slice(),
         }
     }
 
@@ -284,6 +339,21 @@ mod tests {
     use super::*;
     use crate::acquire;
     use crate::Acquire;
+
+    #[test]
+    fn issues_are_bounded_with_a_count_of_what_was_omitted() {
+        let issue =
+            |index: usize| ProjectionIssue::missing("LogEntry.Message").at_index("Members", index);
+        let five: Vec<_> = (0..5).map(issue).collect();
+
+        let bounded = bounded_issues(five.clone(), 3);
+        assert_eq!(&bounded[..2], &five[..2]);
+        assert_eq!(bounded[2].path(), OMITTED_ISSUES_LOCATOR);
+        assert!(format!("{:?}", bounded[2]).contains("3 further issues omitted"));
+
+        // At or under the bound nothing changes.
+        assert_eq!(bounded_issues(five.clone(), 5), five);
+    }
 
     struct FixtureAcquisition {
         endpoint: EndpointContext,

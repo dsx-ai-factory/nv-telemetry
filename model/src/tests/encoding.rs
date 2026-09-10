@@ -110,6 +110,7 @@ fn every_value_arm_encodes_byte_identically_to_prost() {
             name: Some("health".into()),
             value: Some(wire_value(every_arm)),
             observed_at: None,
+            facet: Some("power".into()),
         }],
     }));
 }

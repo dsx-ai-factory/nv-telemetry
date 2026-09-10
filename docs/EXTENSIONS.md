@@ -22,12 +22,10 @@ extension registry allocates numbers outside that range. A number in the 52000
 block therefore cannot be publicly registered, and no amount of documentation
 makes it collision-proof outside NVIDIA.
 
-That is an accepted trade, not an oversight. Registering globally would mean
-renumbering, and the number is baked into every serialized `FileDescriptorSet`
-this project ships — including stored history and anything a consumer has
-cached — so the cost rises with every release. If the schema is ever published
-for use outside NVIDIA, that is the moment to take a registered number, and the
-cost of doing it then should be weighed against doing it now.
+This is the current internal allocation. The library is under development,
+so the allocation may be refactored without preserving historical descriptor
+sets. Before publishing a stable schema outside NVIDIA, choose globally
+registered numbers and define a release compatibility policy.
 
 ## Coordination
 
@@ -90,13 +88,13 @@ Delete the declaration, the canary field, the struct field, the reader line,
 and the table row together; the compiler holds the halves to each other, in
 both directions, with the same errors as above.
 
-Then reserve both halves: `reserved 6;` **and** `reserved "max_len";`. A number
-reservation alone leaves the name free, so a later field can take the old name
+Once a stable contract is released, reserve both halves: `reserved 6;` **and**
+`reserved "max_len";`. A number reservation alone leaves the name free, so a later field can take the old name
 at a new number and collide with stored JSON and text-format data, which is
 exactly where old and new tooling meet.
 
-This applies to numbers that have been released. A number that only ever
-existed in an unmerged branch has no encoder to protect and no decoder to
-confuse, so removing it is a plain edit: renumber densely and reserve nothing.
-Reserving there records a history no consumer can observe, and burns numbers
-in a vocabulary still being designed.
+Those reservations apply once a stable contract has been released. The current
+development schema has no historical compatibility requirement: removing or
+renumbering an option is a coordinated edit of the declaration, compiler,
+canary, and generated artifacts. No reservation is required solely to preserve
+a development revision.

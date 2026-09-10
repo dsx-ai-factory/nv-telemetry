@@ -111,9 +111,14 @@ The schema itself is checked by [buf](https://buf.build), configured in
 
 ```
 make proto-lint      # style and naming, including enum value prefixes
-make proto-breaking  # reject changes that strand an older consumer
 make fmt             # formats Rust and .proto together
 ```
+
+The library and schema are under active development. Breaking refactors are
+allowed; `nv.telemetry.v1` is not yet a compatibility promise. Checks validate
+the current schema and its generated output, not historical schemas or saved
+wire fixtures. `contract.lock` remains a readable schema snapshot, and model
+tests enforce validation, canonicalization, and encode/decode round trips.
 
 buf is a checker only. The descriptor set is built by protox from
 `schema/build.rs`, so `cargo build` needs no external binary and a consumer of

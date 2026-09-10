@@ -1,0 +1,9 @@
+{
+  "@odata.id": "/redfish/v1/Systems/1/LogServices/SEL/Entries/1",
+  "@odata.type": "#LogEntry.v1_21_0.LogEntry",
+  "Id": "1",
+  "Name": "System Event Log Entry 1",
+  "EntryType": "VendorTrace",
+  "Created": "2026-03-01T10:00:00Z",
+  "Message": "Vendor trace record"
+}

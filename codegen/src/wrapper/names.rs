@@ -84,15 +84,18 @@ pub(super) fn snake(camel_name: &str) -> String {
 }
 
 /// `FailureClass` -> `FAILURE_CLASS`.
-pub(super) fn screaming(camel_name: &str) -> String {
+fn screaming(camel_name: &str) -> String {
     camel_name.to_shouty_snake_case()
 }
 
-/// `FAILURE_CLASS_CONNECTIVITY` with prefix `FAILURE_CLASS_` -> `Connectivity`.
-pub(super) fn arm_name(value_name: &str, prefix: &str) -> String {
+/// The model variant of a contract enum value: `FAILURE_CLASS_CONNECTIVITY`
+/// of `FailureClass` -> `Connectivity`. The one derivation, so the projection
+/// emitter names exactly the variant the model emitter generated.
+pub(crate) fn variant_name(enum_short_name: &str, value_name: &str) -> String {
+    let prefix = format!("{}_", screaming(enum_short_name));
     camel(
         &value_name
-            .strip_prefix(prefix)
+            .strip_prefix(prefix.as_str())
             .unwrap_or(value_name)
             .to_ascii_lowercase(),
     )

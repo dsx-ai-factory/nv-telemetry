@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The LogEntry mapping: one entry of a log service becomes one LogRecord.
+# An nv.telemetry.mapping.v1.Manifest in protobuf text format, checked
+# against the DMTF schema index and the contract at `make codegen` time.
+#
+# A record is a fact in its own right, not an observation of a named
+# thing, so the manifest declares no subject. `LogRecord.subject` — what
+# the entry is about, Redfish's OriginOfCondition — stays unset until
+# device-derived locations can be turned into subjects. The provider walks
+# the service's entries collection; this projects a single entry.
+
+source: "redfish"
+backend: BACKEND_SCHEMA_INDEX
+index: "nv-redfish-schema/dmtf"
+
+projections {
+  name: "log-record"
+  source_type: "LogEntry"
+  target_type: "nv.telemetry.v1.LogRecord"
+  # When the device says it happened. `Created` is stamped on every SEL
+  # entry; the rarer `EventTimestamp` rides along as an attribute.
+  fields {
+    source_path: "Created"
+    target_field: "occurred_at"
+  }
+  # The contract's own ladder: rows map Redfish's EventSeverity into it, and
+  # a value outside the rows is reported rather than guessed at. `OK` is an
+  # informational event, not the absence of severity.
+  fields {
+    source_path: "Severity"
+    target_field: "severity"
+    null_policy: NULL_POLICY_ABSENT
+    value_map { from: "OK" to: "SEVERITY_INFO" }
+    value_map { from: "Warning" to: "SEVERITY_WARNING" }
+    value_map { from: "Critical" to: "SEVERITY_CRITICAL" }
+  }
+  # Verbatim device text; empty is ordinary when the text lives in a
+  # message registry under MessageId. An entry without one is malformed:
+  # `required` reports it and no record is emitted.
+  fields {
+    source_path: "Message"
+    target_field: "message"
+    required: true
+    null_policy: NULL_POLICY_ABSENT
+  }
+  # The source's own identifier, so consumers can deduplicate and resume.
+  fields {
+    source_path: "Id"
+    target_field: "entry_id"
+  }
+  map_assemblies {
+    target_field: "attributes"
+    entries {
+      key: "message-id"
+      source_path: "MessageId"
+    }
+    entries {
+      key: "entry-type"
+      source_path: "EntryType"
+    }
+    entries {
+      key: "entry-code"
+      source_path: "EntryCode"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "sensor-type"
+      source_path: "SensorType"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "sensor-number"
+      source_path: "SensorNumber"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "resolved"
+      source_path: "Resolved"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "event-timestamp"
+      source_path: "EventTimestamp"
+    }
+    entries {
+      key: "oem-record-format"
+      source_path: "OemRecordFormat"
+      null_policy: NULL_POLICY_ABSENT
+    }
+  }
+}

@@ -83,8 +83,8 @@ fn an_unknown_enum_value_survives_rather_than_collapsing() {
 fn unknown_fields_are_dropped_on_re_encode() {
     // prost keeps no unknown-field storage. A component built on these types
     // cannot forward a newer producer's fields — it silently strips them. The
-    // evolution gate is additive-only, so this is the substrate's cost, and it
-    // is pinned here so the behaviour is a decision rather than a surprise.
+    // behavior is pinned here as a property of the current substrate, not a
+    // promise of compatibility across schema revisions.
     let known = wire::Subject {
         kind: Some("sensor".into()),
         scope: vec![],

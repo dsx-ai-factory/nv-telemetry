@@ -145,6 +145,8 @@ projections {
   target_type: "nv.telemetry.v1.StateObservation"
   # Thresholds are writable device configuration — state, not descriptor
   # metadata. One form, expanded per member.
+  # Sensor exposes one signal: facet is absent on both this state and its
+  # SignalKey. This is an exact key match, not a wildcard over other facets.
   expansion {
     members: "UpperCaution"
     members: "UpperCritical"
@@ -155,6 +157,8 @@ projections {
     constants { target_field: "name" value: "threshold.{member-kebab}" }
     map_assemblies {
       target_field: "value"
+      # The threshold is its facets: none present, no observation.
+      anchor: true
       entries {
         key: "activation"
         source_path: "Thresholds.{member}.Activation"

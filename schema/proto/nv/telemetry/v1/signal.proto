@@ -77,8 +77,10 @@ message SignalDescriptor {
     max_len: 128
   }];
 
-  // Unit of every sample under this key, in UCUM. Absent for dimensionless
-  // signals — which is the encoding for that, rather than the empty string.
+  // Unit of every sample under this key, in UCUM. Absent means the unit is not
+  // known — the source stated none — never that the signal is dimensionless:
+  // a count or a ratio carries UCUM's unity, "1". A consumer may combine two
+  // "1" signals and must not combine two whose units it does not know.
   optional string unit = 3 [(nv.telemetry.options.v1.field_invariant) = {
     non_empty: true
     max_len: 64

@@ -29,11 +29,11 @@ use crate::projection::spec::SubjectSpec;
 use crate::projection::RedfishIndex;
 use crate::projection::ResolvedField;
 
-// Enum numbers mirror manifest.proto; buf breaking guards the mirror.
+// Enum numbers mirror the current manifest schema; the test below checks them.
 const SCHEMA_INDEX: i32 = 1;
 const NULL_UNSPECIFIED: i32 = 0;
 const NULL_ABSENT: i32 = 1;
-const NULL_INVALID: i32 = 2;
+pub(super) const NULL_INVALID: i32 = 2;
 const NULL_EXPLICIT: i32 = 3;
 const CARDINALITY_UNSPECIFIED: i32 = 0;
 const CARDINALITY_SINGLE: i32 = 1;
@@ -62,11 +62,21 @@ const SUBJECT_TYPE: &str = "nv.telemetry.v1.Subject";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TargetProfile {
     pub(crate) target: &'static str,
-    pub(crate) identity_field: &'static str,
-    pub(crate) identity: IdentityKind,
+    /// How the target names what it observes. `None` for a record that is
+    /// a fact in its own right rather than an observation of a named
+    /// thing: nothing is derived from a subject declaration, so the
+    /// manifest declares none.
+    pub(crate) identity: Option<Identity>,
     /// A string field the compiler fills with the canonical request
     /// location — the target type's provenance. Reserved from manifests.
     pub(crate) provenance: Option<&'static str>,
+}
+
+/// The compiler-filled identity field of a target and what fills it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Identity {
+    pub(crate) field: &'static str,
+    pub(crate) kind: IdentityKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,30 +85,42 @@ pub(crate) enum IdentityKind {
     Subject,
 }
 
+const KEY: Identity = Identity {
+    field: "key",
+    kind: IdentityKind::SignalKey,
+};
+const SUBJECT: Identity = Identity {
+    field: "subject",
+    kind: IdentityKind::Subject,
+};
+
 const TARGET_PROFILES: &[TargetProfile] = &[
     TargetProfile {
         target: "nv.telemetry.v1.SignalDescriptor",
-        identity_field: "key",
-        identity: IdentityKind::SignalKey,
+        identity: Some(KEY),
         provenance: None,
     },
     TargetProfile {
         target: "nv.telemetry.v1.Reading",
-        identity_field: "key",
-        identity: IdentityKind::SignalKey,
+        identity: Some(KEY),
         provenance: None,
     },
     TargetProfile {
         target: "nv.telemetry.v1.StateObservation",
-        identity_field: "subject",
-        identity: IdentityKind::Subject,
+        identity: Some(SUBJECT),
         provenance: None,
     },
     TargetProfile {
         target: "nv.telemetry.v1.InventoryItem",
-        identity_field: "subject",
-        identity: IdentityKind::Subject,
+        identity: Some(SUBJECT),
         provenance: Some("source_key"),
+    },
+    // A log record's `subject` is what the entry is *about*, when the
+    // source names one — not identity — and stays reserved by type.
+    TargetProfile {
+        target: "nv.telemetry.v1.LogRecord",
+        identity: None,
+        provenance: None,
     },
 ];
 
@@ -108,6 +130,47 @@ pub(crate) fn target_profile(target: &str) -> Option<TargetProfile> {
         .iter()
         .copied()
         .find(|profile| profile.target == target)
+}
+
+/// Whether the target is a registered profile that carries no identity.
+pub(crate) fn is_identity_less(target: &str) -> bool {
+    target_profile(target).is_some_and(|profile| profile.identity.is_none())
+}
+
+/// Whether the target field a dotted path lands in is contract-required at
+/// its root. Emission gates the instance on such a landing exactly as on an
+/// anchor — ordinary absence must suppress the message, never reach the
+/// builder — so every rule that asks "is this instance gated?" asks here.
+pub(crate) fn root_required(
+    vocabulary: &Vocabulary,
+    target: &MessageDescriptor,
+    path: &str,
+) -> bool {
+    let root = path.split('.').next().unwrap_or(path);
+    target
+        .get_field_by_name(root)
+        .and_then(|root| vocabulary.field_invariant(&root))
+        .is_some_and(|invariant| invariant.required)
+}
+
+/// Whether a declaration gates its instance's output: an `anchor`, a
+/// manifest `required`, or a contract-required landing.
+pub(crate) fn field_gates(
+    vocabulary: &Vocabulary,
+    target: &MessageDescriptor,
+    field: &FieldSpec,
+) -> bool {
+    field.anchor || field.required || root_required(vocabulary, target, &field.target_field)
+}
+
+/// Whether an assembly gates its instance's output: declared as the anchor,
+/// or landing in a contract-required field.
+pub(crate) fn assembly_gates(
+    vocabulary: &Vocabulary,
+    target: &MessageDescriptor,
+    assembly: &AssemblySpec,
+) -> bool {
+    assembly.anchor || root_required(vocabulary, target, &assembly.target_field)
 }
 
 /// One manifest declaration that breaks a rule.
@@ -229,6 +292,22 @@ pub enum Reason {
         path: String,
         value: String,
     },
+    SubjectWithoutIdentity(String),
+    UnanchoredAssembly,
+    EnumTargetWithoutValueMap {
+        path: String,
+        target: String,
+    },
+    KnownValuesOnEnumTarget(String),
+    UnknownTargetEnumValue {
+        path: String,
+        value: String,
+        target: String,
+    },
+    UnspecifiedTargetEnumValue {
+        path: String,
+        value: String,
+    },
     EmptyKnownValue(String),
     UnresolvedPlaceholder(String),
     DuplicateMember(String),
@@ -302,8 +381,8 @@ impl fmt::Display for Reason {
             Self::UnsupportedTargetProfile(name) => write!(
                 f,
                 "target `{name}` has no projection profile; the compiler \
-                 supports SignalDescriptor, Reading, StateObservation, and \
-                 InventoryItem"
+                 supports SignalDescriptor, Reading, StateObservation, \
+                 InventoryItem, and LogRecord"
             ),
             Self::TargetProfileDrift { target, detail } => write!(
                 f,
@@ -427,6 +506,45 @@ impl fmt::Display for Reason {
                 "`{path}` names `{value}`, which the source enumeration does \
                  not declare; the row would never match anything"
             ),
+            Self::SubjectWithoutIdentity(target) => write!(
+                f,
+                "target `{target}` carries no identity, so the projection's \
+                 subject declaration would populate nothing; remove it"
+            ),
+            Self::UnanchoredAssembly => f.write_str(
+                "map assemblies are the only gate on this projection's output \
+                 and none is `anchor`: an empty assembly would emit a message \
+                 that says nothing; declare `anchor: true` on the assembly \
+                 the target exists to carry",
+            ),
+            Self::EnumTargetWithoutValueMap { path, target } => write!(
+                f,
+                "`{path}` lands in the contract enumeration `{target}` without \
+                 a value_map; the source and contract spellings differ by \
+                 construction, so every member reaching the contract must be \
+                 mapped explicitly"
+            ),
+            Self::KnownValuesOnEnumTarget(path) => write!(
+                f,
+                "`{path}` declares known_values but lands in a contract \
+                 enumeration, which projects through value_map rows, not \
+                 verbatim tokens"
+            ),
+            Self::UnknownTargetEnumValue {
+                path,
+                value,
+                target,
+            } => write!(
+                f,
+                "`{path}` maps to `{value}`, which the contract enumeration \
+                 `{target}` does not declare"
+            ),
+            Self::UnspecifiedTargetEnumValue { path, value } => write!(
+                f,
+                "`{path}` maps to `{value}`, the enumeration's unspecified \
+                 value, which the contract rejects; a source value the \
+                 mapping does not cover is left unmapped and reported"
+            ),
             Self::EmptyKnownValue(path) => write!(
                 f,
                 "`{path}` declares an empty known enum value; no Rust enum variant can represent it"
@@ -541,10 +659,11 @@ fn check_manifest(
         report(violations, Reason::DuplicateManifestModule(module));
     }
 
-    let inherited = manifest
-        .projections
-        .iter()
-        .any(|projection| projection.subject.is_none());
+    // Identity-less projections inherit nothing, so they cannot keep a
+    // manifest subject alive.
+    let inherited = manifest.projections.iter().any(|projection| {
+        projection.subject.is_none() && !is_identity_less(&projection.target_type)
+    });
     if manifest.subject.is_some() && !manifest.projections.is_empty() && !inherited {
         report(violations, Reason::SubjectNeverInherited);
     }
@@ -667,44 +786,36 @@ fn check_payload_pairing(
     }
 }
 
-/// Whether the descriptor projection's output is conditional: an anchored or
-/// required field, a contract-required landing, or an assembly (its own
-/// gate) can each suppress the instance.
+/// Whether the descriptor projection's output is conditional: a gating field
+/// or a gating assembly — the same predicates emission gates on — can
+/// suppress the instance.
 fn descriptor_gated(
     projection: &ProjectionSpec,
     contract: &DescriptorPool,
     vocabulary: &Vocabulary,
 ) -> bool {
-    let target = contract.get_message_by_name(&projection.target_type);
-    let expansion_fields = projection
-        .expansion
-        .iter()
-        .flat_map(|expansion| expansion.fields.iter());
-    let gated_field = projection
+    let Some(target) = contract.get_message_by_name(&projection.target_type) else {
+        return projection
+            .fields
+            .iter()
+            .chain(projection.expansion.iter().flat_map(|e| e.fields.iter()))
+            .any(|field| field.anchor || field.required);
+    };
+    let expansion = projection.expansion.as_ref();
+    let fields = projection
         .fields
         .iter()
-        .chain(expansion_fields)
-        .any(|field| {
-            if field.anchor || field.required {
-                return true;
-            }
-            let root = field
-                .target_field
-                .split('.')
-                .next()
-                .unwrap_or(&field.target_field);
-            target
-                .as_ref()
-                .and_then(|target| target.get_field_by_name(root))
-                .and_then(|root| vocabulary.field_invariant(&root))
-                .is_some_and(|invariant| invariant.required)
-        });
-    let has_assemblies = !projection.map_assemblies.is_empty()
-        || projection
-            .expansion
-            .as_ref()
-            .is_some_and(|expansion| !expansion.map_assemblies.is_empty());
-    gated_field || has_assemblies
+        .chain(expansion.into_iter().flat_map(|e| e.fields.iter()));
+    let assemblies = projection
+        .map_assemblies
+        .iter()
+        .chain(expansion.into_iter().flat_map(|e| e.map_assemblies.iter()));
+    fields
+        .into_iter()
+        .any(|field| field_gates(vocabulary, &target, field))
+        || assemblies
+            .into_iter()
+            .any(|assembly| assembly_gates(vocabulary, &target, assembly))
 }
 
 /// What walking a path's proper prefixes established: whether any segment
@@ -806,16 +917,45 @@ impl<'a, 'b> Checker<'a, 'b> {
 
         self.check_target_profile(&projection.target_type);
 
-        self.check_subject(projection.subject.as_ref().or(manifest_subject), vocabulary);
+        // An identity-less target derives nothing from a subject, so only
+        // the projection's own declaration is at fault; a manifest-level one
+        // serves its siblings and is not this projection's to remove.
+        if is_identity_less(&projection.target_type) {
+            if projection.subject.is_some() {
+                self.push(Reason::SubjectWithoutIdentity(
+                    projection.target_type.clone(),
+                ));
+            }
+        } else {
+            self.check_subject(projection.subject.as_ref().or(manifest_subject), vocabulary);
+        }
 
         for instance in self.expand(projection) {
             let mut anchors = 0usize;
+            let mut gated = false;
             for field in &instance.fields {
                 self.check_field(field);
                 anchors += usize::from(field.anchor);
+                gated |= self
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| field_gates(vocabulary, target, field));
+            }
+            for assembly in &instance.map_assemblies {
+                anchors += usize::from(assembly.anchor);
+                gated |= self
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| assembly_gates(vocabulary, target, assembly));
             }
             if anchors > 1 {
                 self.push(Reason::MultipleAnchors);
+            }
+            // Nothing gates output and the assemblies are the only outputs
+            // that could: every document would emit a message that says
+            // nothing.
+            if !gated && self.target.is_some() && !instance.map_assemblies.is_empty() {
+                self.push(Reason::UnanchoredAssembly);
             }
 
             for constant in &instance.constants {
@@ -854,50 +994,78 @@ impl<'a, 'b> Checker<'a, 'b> {
             self.push(Reason::UnsupportedTargetProfile(target_name.to_owned()));
             return;
         };
-        let Some(identity) = target.get_field_by_name(profile.identity_field) else {
-            self.push(Reason::TargetProfileDrift {
-                target: target_name.to_owned(),
-                detail: format!("identity field `{}` is absent", profile.identity_field),
-            });
-            return;
-        };
-        let expected = match profile.identity {
-            IdentityKind::SignalKey => SIGNAL_KEY,
-            IdentityKind::Subject => SUBJECT_TYPE,
-        };
-        let actual = match identity.kind() {
-            Kind::Message(message) => message.full_name().to_owned(),
-            other => format!("{other:?}"),
-        };
-        if actual != expected {
-            self.push(Reason::TargetProfileDrift {
-                target: target_name.to_owned(),
-                detail: format!(
-                    "identity field `{}` is `{actual}`, expected `{expected}`",
-                    profile.identity_field
-                ),
-            });
-        }
+        if let Some(identity) = profile.identity {
+            let Some(field) = target.get_field_by_name(identity.field) else {
+                self.push(Reason::TargetProfileDrift {
+                    target: target_name.to_owned(),
+                    detail: format!("identity field `{}` is absent", identity.field),
+                });
+                return;
+            };
+            let expected = match identity.kind {
+                IdentityKind::SignalKey => SIGNAL_KEY,
+                IdentityKind::Subject => SUBJECT_TYPE,
+            };
+            let actual = match field.kind() {
+                Kind::Message(message) => message.full_name().to_owned(),
+                other => format!("{other:?}"),
+            };
+            if actual != expected {
+                self.push(Reason::TargetProfileDrift {
+                    target: target_name.to_owned(),
+                    detail: format!(
+                        "identity field `{}` is `{actual}`, expected `{expected}`",
+                        identity.field
+                    ),
+                });
+            }
 
-        let identity_fields: Vec<String> = target
-            .fields()
-            .filter_map(|field| match field.kind() {
-                Kind::Message(message)
-                    if message.full_name() == SIGNAL_KEY || message.full_name() == SUBJECT_TYPE =>
+            let identity_fields: Vec<String> = target
+                .fields()
+                .filter_map(|field| match field.kind() {
+                    Kind::Message(message)
+                        if message.full_name() == SIGNAL_KEY
+                            || message.full_name() == SUBJECT_TYPE =>
+                    {
+                        Some(field.name().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if identity_fields.as_slice() != [identity.field] {
+                self.push(Reason::TargetProfileDrift {
+                    target: target_name.to_owned(),
+                    detail: format!(
+                        "identity fields are {identity_fields:?}, expected only `{}`",
+                        identity.field
+                    ),
+                });
+            }
+        } else {
+            // The identity-less promise, verified: nothing keyed, and any
+            // subject-typed field optional — a required one would be
+            // identity the compiler never fills and the manifest may not.
+            for field in target.fields() {
+                let Kind::Message(message) = field.kind() else {
+                    continue;
+                };
+                let required = self
+                    .vocabulary
+                    .field_invariant(&field)
+                    .is_some_and(|invariant| invariant.required);
+                if message.full_name() == SIGNAL_KEY
+                    || (message.full_name() == SUBJECT_TYPE && required)
                 {
-                    Some(field.name().to_owned())
+                    self.push(Reason::TargetProfileDrift {
+                        target: target_name.to_owned(),
+                        detail: format!(
+                            "field `{}` is `{}`, which an identity-less profile cannot carry",
+                            field.name(),
+                            message.full_name()
+                        ),
+                    });
                 }
-                _ => None,
-            })
-            .collect();
-        if identity_fields.as_slice() != [profile.identity_field] {
-            self.push(Reason::TargetProfileDrift {
-                target: target_name.to_owned(),
-                detail: format!(
-                    "identity fields are {identity_fields:?}, expected only `{}`",
-                    profile.identity_field
-                ),
-            });
+            }
         }
 
         if let Some(provenance) = profile.provenance {
@@ -1346,8 +1514,41 @@ impl<'a, 'b> Checker<'a, 'b> {
         let Some(members) = &resolved.enum_members else {
             return;
         };
-        if !matches!(target.kind(), Kind::String) {
-            return;
+        match target.kind() {
+            Kind::String => {}
+            // A contract enumeration: rows name its values by their
+            // schema spelling, and the unspecified value is unrepresentable
+            // in the model, so no row may reach it.
+            Kind::Enum(contract_enum) => {
+                let target_name = contract_enum.full_name().to_owned();
+                if value_map.is_empty() {
+                    self.push(Reason::EnumTargetWithoutValueMap {
+                        path: path.to_owned(),
+                        target: target_name.clone(),
+                    });
+                }
+                if !known_values.is_empty() {
+                    self.push(Reason::KnownValuesOnEnumTarget(path.to_owned()));
+                }
+                for (_, to) in value_map {
+                    match contract_enum.get_value_by_name(to) {
+                        Some(value) if value.number() == 0 => {
+                            self.push(Reason::UnspecifiedTargetEnumValue {
+                                path: path.to_owned(),
+                                value: to.clone(),
+                            });
+                        }
+                        Some(_) => {}
+                        None => self.push(Reason::UnknownTargetEnumValue {
+                            path: path.to_owned(),
+                            value: to.clone(),
+                            target: target_name.clone(),
+                        }),
+                    }
+                }
+                return;
+            }
+            _ => return,
         }
 
         let mut outputs: Vec<&str> = value_map.iter().map(|(_, to)| to.as_str()).collect();
@@ -1455,7 +1656,9 @@ impl<'a, 'b> Checker<'a, 'b> {
                 // covered by construction, and provenance is also reserved,
                 // so demanding manifest coverage would be a contradiction.
                 if !required
-                    || field.name() == profile.identity_field
+                    || profile
+                        .identity
+                        .is_some_and(|identity| identity.field == field.name())
                     || profile.provenance == Some(field.name())
                 {
                     continue;
@@ -1551,4 +1754,40 @@ pub(crate) fn resolve_target(message: &MessageDescriptor, path: &str) -> Option<
         current = next;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_constants_match_the_current_manifest_schema() {
+        let pool = crate::pool().expect("current schema decodes");
+        for (kind, name, expected) in [
+            ("Backend", "BACKEND_SCHEMA_INDEX", SCHEMA_INDEX),
+            ("NullPolicy", "NULL_POLICY_UNSPECIFIED", NULL_UNSPECIFIED),
+            ("NullPolicy", "NULL_POLICY_ABSENT", NULL_ABSENT),
+            ("NullPolicy", "NULL_POLICY_INVALID", NULL_INVALID),
+            ("NullPolicy", "NULL_POLICY_EXPLICIT_NULL", NULL_EXPLICIT),
+            (
+                "Cardinality",
+                "CARDINALITY_UNSPECIFIED",
+                CARDINALITY_UNSPECIFIED,
+            ),
+            ("Cardinality", "CARDINALITY_SINGLE", CARDINALITY_SINGLE),
+            ("Cardinality", "CARDINALITY_ELEMENTWISE", ELEMENTWISE),
+        ] {
+            let enumeration = pool
+                .get_enum_by_name(&format!("nv.telemetry.mapping.v1.{kind}"))
+                .expect("manifest enum");
+            let value = enumeration
+                .get_value_by_name(name)
+                .expect("manifest enum value");
+            assert_eq!(
+                value.number(),
+                expected,
+                "update the compiler alongside {name}"
+            );
+        }
+    }
 }

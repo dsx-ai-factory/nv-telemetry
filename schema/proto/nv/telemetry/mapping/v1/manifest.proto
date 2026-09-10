@@ -148,13 +148,21 @@ message ConstantField {
 }
 
 // One map-valued target field built from a fixed set of source paths. The
-// assembly emits only when at least one entry is usable; empty means the
-// projection produces no output at all, so an assembly is its own anchor.
+// assembly emits only when at least one entry is usable; an empty assembly
+// omits the field, unless it is the projection's anchor.
 message MapAssembly {
   // Dotted path of the map-valued target field.
   string target_field = 1;
 
   repeated MapEntry entries = 2;
+
+  // The map is what the target message exists to carry, as
+  // FieldMapping.anchor: empty means no output and no issue. An inventory
+  // item is its attributes. A projection whose only gate on output would be
+  // its assemblies must anchor one of them, or every document would emit a
+  // message that says nothing; one anchor per projection, across fields and
+  // assemblies.
+  bool anchor = 3;
 }
 
 // One entry of an assembled map.

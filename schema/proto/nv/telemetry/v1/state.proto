@@ -6,7 +6,7 @@
 // This is where writable things land. A descriptor carries only what a signal
 // is; an alarm threshold is writable on most implementations, which makes it
 // a convergence target rather than reading metadata, so it is observed here
-// and consumers join it to readings by subject.
+// and consumers join it to readings by (subject, facet).
 
 syntax = "proto3";
 
@@ -20,7 +20,7 @@ option csharp_namespace = "Nvidia.NvTelemetry.V1";
 option go_package = "github.com/NVIDIA/nv-telemetry/gen/nv/telemetry/v1;telemetryv1";
 option java_package = "com.nvidia.nvtelemetry.v1";
 
-// One observed fact about one resource: this subject's `name` facet had this
+// One observed fact about one resource or signal: its named condition had this
 // value. Deliberately one fact per observation rather than a bag, so partial
 // observation needs no inner completeness story — the full structured
 // snapshot is the resource graph's job.
@@ -42,18 +42,37 @@ message StateObservation {
   // When the source stamps the observation itself; the batch window covers
   // the rest.
   optional Timestamp observed_at = 4;
+
+  // The signal this fact concerns, using exactly SignalKey.facet semantics.
+  // Together with subject this identifies the descriptor whose unit applies
+  // to a threshold.* observation's reading. Absence selects only a signal
+  // key with no facet; it is never a wildcard over the subject's signals.
+  // Resource-wide facts such as health omit this field. Descriptors may
+  // arrive in another batch; an unresolved key has an unknown unit.
+  optional string facet = 5 [(nv.telemetry.options.v1.field_invariant) = {
+    non_empty: true
+    max_len: 128
+  }];
 }
 
 // The state payload domain.
 message States {
   option (nv.telemetry.options.v1.message_invariant) = {validated: true};
 
-  // Deliberately not unique by subject and name. A batch reporting one facet
+  // Deliberately not unique by subject, facet, and name. Reporting one fact
   // twice looks like a contradiction from a polled source, but a streaming one
   // — a gNMI ON_CHANGE subscription whose window covers an interface going
   // down and back up — is reporting a series, and each observation carries its
   // own timestamp to say so. Rejecting the pair would discard a real
   // transition to enforce a snapshot shape only some sources have.
+  //
+  // List position carries no order. When a (subject, facet, name) occurs
+  // more than once, every observation must carry observed_at and the timestamps must
+  // be distinct. A single observation of a facet may omit its timestamp.
+  // Consumers may order device timestamps only within a comparable clock
+  // domain. Never compare device time with the collector's window.start as a
+  // fallback. The embedder fences obsolete endpoint/plan generations before
+  // delivery and defines provider authority; neither is encoded in this batch.
   repeated StateObservation observations = 1 [(nv.telemetry.options.v1.field_invariant) = {
     unordered: true
     max_items: 65536

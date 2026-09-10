@@ -36,7 +36,7 @@ fn the_checked_in_wire_types_match_the_schema() {
 #[test]
 fn a_contract_sub_package_is_refused_rather_than_dropped() {
     // The file filter matches sub-packages but only one module is emitted, so
-    // a sub-package would be linted, locked, and compatibility-checked while
+    // a sub-package would be linted and locked while
     // having no type in the data plane — and every gate would stay green.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

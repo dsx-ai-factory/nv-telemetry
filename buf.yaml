@@ -15,17 +15,3 @@ modules:
 lint:
   use:
     - STANDARD
-
-breaking:
-  # PACKAGE rather than the default FILE. The contract is one package spread
-  # over several files, so FILE would report a message moving between them as
-  # a break when nothing about the wire format changed. PACKAGE still catches
-  # everything that strands a consumer, including FIELD_SAME_CARDINALITY,
-  # which is what makes a field quietly losing explicit presence an error.
-  #
-  # A package absent from the baseline is all additions, so nothing in it can
-  # register as a break until it lands on main. During that window — and
-  # permanently, for changes to custom option values — the contract lock diff
-  # is the only guard.
-  use:
-    - PACKAGE

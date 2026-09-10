@@ -28,6 +28,8 @@ projections {
   # tokens), and everything else joins when present.
   map_assemblies {
     target_field: "attributes"
+    # The item is its attributes: nothing usable, no item.
+    anchor: true
     entries {
       key: "chassis-type"
       source_path: "ChassisType"

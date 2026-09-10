@@ -34,11 +34,7 @@ jobs:
   latest-dependencies:
     runs-on: ubuntu-latest
     steps:
-      # Full history: the schema's backward-compatibility check compares
-      # against origin/main.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@master
         with:

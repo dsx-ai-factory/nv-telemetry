@@ -50,6 +50,33 @@ Get this wrong in the safe direction. If a walk was truncated, a request
 partially failed, or you are unsure, emit `PARTIAL`. A wrong `COMPLETE`
 deletes real inventory from a consumer's view.
 
+What "everything there is" means is decided per payload domain, because each
+domain names its things differently, and a consumer reconciling a complete
+batch applies exactly this rule and no other:
+
+- **`readings`.** The descriptors are the population. A `SignalKey` known
+  inside the scope and absent from a complete batch's descriptors is a signal
+  that no longer exists. A descriptor present with no sample says the signal
+  exists and has no value right now — a null `Reading`, a sensor offline. Sample
+  absence is never a deletion; only descriptor absence is.
+- **`states`.** The `(subject, facet, name)` facts are the population. A fact absent
+  from a complete batch is a condition the resource no longer reports.
+- **`inventory`.** The subjects are the population. An absent subject is a
+  removed part.
+- **`resources`.** A complete graph replaces the previously collected resource
+  and relation sets for the same endpoint, scope, and collection definition.
+  Deletions are old members absent from the new snapshot, even though those
+  members are no longer reachable through its edges. Reachability validates
+  the included graph; it does not prove exhaustive collection. A walk with an
+  unresolved collection branch is `PARTIAL` and cannot delete any old member.
+  Providers must define which relation kinds and external targets delimit the
+  collection before emitting `COMPLETE`; consumers must not infer that
+  boundary from the current graph alone.
+- **`logs`.** Never `COMPLETE`. A log is a stream of which the device retains a
+  window; a walk reports the entries it saw, and the device may have rotated
+  others out or appended since. `Coverage.scope` names the service walked —
+  the namespace of every record's `entry_id` — and completeness is `PARTIAL`.
+
 ## Identity: `Subject`
 
 Every observed thing is named by a `Subject`, and the same physical thing gets
@@ -94,6 +121,24 @@ list means "no containing scope", which a top-level chassis genuinely has; an
 empty *element* means a scope the walk failed to name, which would place the
 subject under a container that does not exist.
 
+**What the shipped subjects are, and are not.** The projections that ship
+derive a subject from the resource's own `Id` and the container named in the
+location the collector requested — a *source representation* of identity. It
+is stable across polls of one endpoint and unique within it, and it joins to
+the rest of the fleet through `EndpointContext.endpoint_id`, so today's
+subjects are endpoint-local: two endpoints reporting `{sensor, [1U], Inlet}`
+are two sensors until something says otherwise. A *canonical* identity — one
+subject for one physical thing seen from two endpoints, or from two routes on
+one endpoint — is a resolution step this model has not performed, and the
+contract does not pretend it has: the first rule above is the goal the
+`Subject` shape is built to carry, not a property the shipped data has.
+The gate before the resource graph ships is a corpus fixture that proves the
+dual-route case one way or the other — a sensor reached through
+`/Chassis/1U/Sensors/Inlet` and through `/Chassis/1U/Thermal#/Temperatures/0`
+must yield one `SignalKey`, or two subjects joined by a relation, on purpose
+and pinned. Until then the dual-route limitation below stands, and a consumer
+keys its state on `(endpoint_id, subject)`.
+
 ## Signals: `SignalKey` and `SignalDescriptor`
 
 Readings are split into *what a signal is* (metadata) and *what it read*
@@ -122,6 +167,15 @@ carry thresholds. A Redfish `Threshold.Reading` is writable — the DMTF schema
 marks it `readonly: false` — which makes it a convergence target, not reading
 metadata. Thresholds are observed as `StateObservation`s instead. Carrying
 them in both places would give one fact two representations that can disagree.
+
+`unit` is UCUM, and its absence means **unknown** — the source stated no unit
+— never dimensionless. A dimensionless signal carries UCUM's unity, `"1"`, the
+way a count or a ratio does. The distinction is load-bearing for a consumer
+doing arithmetic: it may combine two `"1"` signals and must not combine two
+whose units it does not know, and an absent unit collapsing into "no unit" is
+how a temperature gets averaged with a fan speed. A projection sets `"1"` only
+when the source's type says so (a YANG counter is a count); it never guesses it
+for a bare number.
 
 A `Readings` payload carries its descriptors alongside its samples, so a batch
 is self-describing: a consumer arriving mid-stream, or reading one batch out
@@ -256,7 +310,32 @@ kept as provenance only on the graph route.
 
 The threshold lands here rather than in the descriptor because it is writable.
 A convergence consumer reads it as observed state and may drive it toward a
-desired value; a classification consumer joins it to the reading by subject.
+desired value; a classification consumer joins it to the reading by the exact
+`(subject, facet)` signal key. `StateObservation.facet` uses the same optional,
+non-empty, at-most-128-byte vocabulary as `SignalKey.facet`. Absence matches
+only a key with no facet; it never selects an arbitrary descriptor of the
+subject. The single-signal Sensor example omits facet on both sides, so this
+threshold's `reading` uses `CPU1Temp`'s `Cel`. A resource exposing power and
+energy instead uses distinct facets such as `"power"` and `"energy"` on its
+descriptors and thresholds. A threshold carries no unit of its own; a consumer
+that has not seen the descriptor for that exact key cannot interpret its
+number yet. It must not borrow a unit from another facet.
+
+**Repeated facets form a timestamped series.** `States.observations` is
+`unordered`: canonical position is not transition order. When a `(subject,
+facet, name)` occurs more than once in a batch, every observation must carry
+`observed_at` and no two may share an instant. Validation rejects missing or
+equal timestamps on repeated facets. A single observation may omit its time.
+
+Device `observed_at` values can be ordered only within a comparable clock
+domain and clock epoch. Collector `window.start` is a separate domain: never
+substitute it into device-time ordering. Within a collector's uninterrupted
+clock epoch, unstamped polls can be ordered by their admission times. A clock
+reset or provider change requires an embedder decision about authority.
+Before delivering results, the embedder must discard completions from obsolete
+endpoint/plan generations. Generation fences and provider authority are local
+control state, not fields currently carried on the wire; external consumers
+need that delivery contract or must retain the ambiguity.
 
 ### When `Reading` is `null`
 
@@ -266,9 +345,11 @@ routine — a PSU bay with no supply installed, a fan mid-spin-up, a sensor in
 
 `Reading.value` is required and `NumericValue` has no null arm, so **no sample
 is emitted**. Emit the `SignalDescriptor` anyway, so the signal is known to
-exist, and put the condition in `states`. Then mark the batch `PARTIAL` unless
-you genuinely walked everything — a `COMPLETE` readings batch missing this
-sample tells a consumer the sensor is gone.
+exist, and put the condition in `states`. A complete readings batch may omit
+the sample: it is the descriptor's absence, never the sample's, that tells a
+consumer a signal is gone, and the descriptor is there. Mark the batch
+`PARTIAL` unless you genuinely walked everything — for the usual reason, not
+for this one.
 
 ---
 
@@ -279,7 +360,7 @@ Source: a walk of `/redfish/v1/Chassis/1U` and its links.
 ```
 ObservationBatch
   origin:   { provider: "redfish.graph", request_class: "chassis-walk" }
-  coverage: { completeness: COMPLETE,
+  coverage: { completeness: PARTIAL,
               scope: { kind: "chassis", id: "1U" } }
   resources:
     resources: [
@@ -309,10 +390,10 @@ ObservationBatch
 Four things this example is demonstrating:
 
 **Scope on a graph means reachability, not subject equality.** The batch is
-complete for chassis `1U`, meaning everything reachable from that subject by
-outgoing edges. This constrains projections: a walk that records only the
-inverse relation — each child naming its parent — produces a graph its own
-root cannot reach, and the completeness claim becomes meaningless.
+partial for chassis `1U`: its `Drives` collection was not walked. It cannot
+establish deletion of a previously observed drive. A fully enumerated snapshot
+must include outgoing edges from its scope root to the collected nodes, but
+that structural check alone never proves the walk was exhaustive.
 
 **`properties_complete` is required and it matters.** `true` means "this is
 the device's full representation" — a property absent here is one the device
@@ -384,9 +465,11 @@ value happens to be small. Choosing by value would move a signal between arms
 as a reading crossed zero or lost its fraction, and every such move registers
 as a content change to a consumer comparing hashes.
 
-**No unit.** OpenConfig rarely carries a `units` statement, so
-`SignalDescriptor.unit` is absent. Absent means dimensionless, which is a
-known weakness of the current model — see the limitations below.
+**No unit, or `"1"`.** OpenConfig rarely carries a `units` statement, so
+`SignalDescriptor.unit` is absent for most leaves — *unknown*, and a consumer
+treats it so. `in-octets` is the exception in the other direction: YANG types
+it `counter64`, a count, so the projection may declare UCUM's `"1"` from the
+type. It must not declare `"1"` for a `decimal64` it cannot place.
 
 **Streams are `PARTIAL`.** A subscription update reports what changed; it
 never asserts what else exists.
@@ -491,9 +574,9 @@ be fabrication pointing the other way, and would fail a whole batch over it.
 The rule holds for identifiers, projected vocabulary tokens, and
 library-generated values, where an empty string is only ever a failed read. And
 `reject_unspecified` rejects the zero value only, never an unrecognised one —
-a value this build does not know is a newer producer naming something real, so
-rejecting it would make every added enum value a breaking change for older
-consumers. Unknown values decode; what to do about one is the consumer's call.
+an unrecognised numeric token remains distinct from an unspecified value.
+Unknown values decode; what to do about one is the consumer's call. This
+preservation behavior is not a cross-revision compatibility promise.
 
 `unique_by` names the fields that identify an element rather than comparing
 whole elements, because the contradictions worth catching are the ones where
@@ -592,10 +675,19 @@ resources share one ETag and one fetch time; keep it whole and the elements
 lose their subjects.
 
 **Dual sensor routes.** The same physical sensor reached via `/Sensors` and via
-`/Thermal#/Temperatures` produces different `SignalKey`s today.
+`/Thermal#/Temperatures` produces different `SignalKey`s today, and subjects
+are endpoint-local in general (see *Identity*). The resource graph does not
+ship until a corpus fixture settles the dual-route case.
 
-**Units on thresholds.** A threshold in `states` carries no unit; the unit
-lives on a `SignalDescriptor` in a different batch.
+**Units on thresholds.** A threshold in `states` carries no unit; it is bound
+to the unit of the `SignalDescriptor` for the exact `(subject, facet)` key, which
+travels in a different batch. A consumer that has the threshold and not the
+descriptor holds a number it cannot yet interpret.
+
+**Logs are never complete, and a walk is bounded.** A log read reports at most
+the provider's member and time budget of entries per poll and starts over next
+poll, so a log that grows faster than it is polled is sampled, not followed. A
+resumable walk keyed on `entry_id` is the recorded follow-up.
 
 ---
 
@@ -603,8 +695,14 @@ lives on a `SignalDescriptor` in a different batch.
 
 - Never fabricate. No sample is better than a zero, and no batch is better
   than an empty one.
-- Prefer `PARTIAL`. `COMPLETE` is a deletion instruction.
-- The subject is what the thing is. The URI is provenance.
+- Prefer `PARTIAL`. `COMPLETE` is a deletion instruction, and what it deletes
+  is decided per domain: descriptors, facets, subjects, reachable resources —
+  never samples, never log records.
+- The subject is what the thing is. The URI is provenance. Until identity is
+  resolved across routes, key state on `(endpoint_id, subject)`.
+- An absent `unit` is unknown. Dimensionless is `"1"`.
+- A repeated state facet requires distinct timestamps in one clock domain;
+  list position never carries transition order.
 - Pick the numeric arm from the source's declared type, once, and never vary
   it per poll.
 - Thresholds and anything else writable are state, not metadata.

@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Demo embedder: polls one Redfish endpoint's sensors and chassis on a
-//! cadence and
-//! prints the three output streams — batches, statuses, and issues — one
-//! tagged line each.
+//! Demo embedder: polls one Redfish endpoint's sensors, chassis, and log
+//! services on a cadence and prints the three output streams — batches,
+//! statuses, and issues — one tagged line each.
 //!
 //! This binary is the embedder role the architecture assigns outside the
 //! library: it owns the endpoint list, the driving loop, and the timer.
@@ -41,12 +40,14 @@ use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::SystemClock;
 use nv_telemetry_redfish::ChassisRead;
+use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
 use url::Url;
 
 const USAGE: &str = "\
 usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
            [--sensor <odata-id> ...] [--chassis <odata-id> ...]
+           [--log-service <odata-id> ...]
            [--cadence-ms <ms>] [--count <n>] [--base-url <url>] [--insecure]
 
   mock    poll the in-process BMC mock, replaying fixtures/
@@ -57,11 +58,17 @@ usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
 Prints one tagged line per stream item: batch, issues, status.
 ";
 
+/// The mock log fixture's own entries collection and member: what the
+/// replayed service document links to, whatever `--log-service` named.
+const LOG_ENTRIES: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries";
+const LOG_ENTRY: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries/1";
+
 struct Args {
     mode: Mode,
     endpoint_id: String,
     sensors: Vec<String>,
     chassis: Vec<String>,
+    log_services: Vec<String>,
     cadence: Duration,
     count: usize,
     base_url: Option<String>,
@@ -101,6 +108,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut endpoint_id = None;
     let mut sensors = Vec::new();
     let mut chassis = Vec::new();
+    let mut log_services = Vec::new();
     let mut cadence = Duration::from_secs(5);
     let mut count = 10;
     let mut base_url = None;
@@ -119,6 +127,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--endpoint-id" => endpoint_id = Some(value("--endpoint-id")?),
             "--sensor" => sensors.push(value("--sensor")?),
             "--chassis" => chassis.push(value("--chassis")?),
+            "--log-service" => log_services.push(value("--log-service")?),
             "--cadence-ms" => {
                 let ms = value("--cadence-ms")?
                     .parse()
@@ -140,14 +149,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if mode == Mode::Http && base_url.is_none() {
         return Err("http mode needs `--base-url`".to_owned());
     }
-    if sensors.is_empty() && chassis.is_empty() {
-        return Err("at least one `--sensor` or `--chassis` is required".to_owned());
+    if sensors.is_empty() && chassis.is_empty() && log_services.is_empty() {
+        return Err(
+            "at least one `--sensor`, `--chassis`, or `--log-service` is required".to_owned(),
+        );
     }
     Ok(Args {
         mode,
         endpoint_id: endpoint_id.ok_or("`--endpoint-id` is required")?,
         sensors,
         chassis,
+        log_services,
         cadence,
         count,
         base_url,
@@ -184,12 +196,21 @@ async fn run(args: &Args) -> Result<(), String> {
                 args.cadence,
             )
         }))
+        .chain(args.log_services.iter().map(|service| {
+            PollNeed::new(
+                endpoint.clone(),
+                LogRead::<()>::REQUEST_CLASS,
+                service.clone(),
+                args.cadence,
+            )
+        }))
         .collect();
     let plan = plan(
         needs,
         &[
             SensorRead::<()>::declaration(),
             ChassisRead::<()>::declaration(),
+            LogRead::<()>::declaration(),
         ],
     )
     .map_err(|error| format!("plan: {error}"))?;
@@ -199,16 +220,25 @@ async fn run(args: &Args) -> Result<(), String> {
             let bmc = Arc::new(nv_redfish_bmc_mock::Bmc::<nv_redfish_bmc_mock::Error>::default());
             let sensor_fixture = include_str!("../fixtures/sensor.json");
             let chassis_fixture = include_str!("../fixtures/chassis.json");
+            let log_service_fixture = include_str!("../fixtures/log-service.json");
+            let log_entries_fixture = include_str!("../fixtures/log-entries.json");
+            let log_entry_fixture = include_str!("../fixtures/log-entry.json");
             // Mock expectations are one-shot AND strict-FIFO, so priming
             // follows dispatch order: the ring visits targets in needs
-            // order each round. Target-major priming would mismatch the
-            // moment there are two targets.
+            // order each round, and a log read asks three times — the
+            // service, its entries collection, then each member. The
+            // collection and entry URIs are the fixture's own.
             for _ in 0..args.count {
                 for sensor in &args.sensors {
                     bmc.expect(Expect::get(sensor, sensor_fixture));
                 }
                 for chassis in &args.chassis {
                     bmc.expect(Expect::get(chassis, chassis_fixture));
+                }
+                for service in &args.log_services {
+                    bmc.expect(Expect::get(service, log_service_fixture));
+                    bmc.expect(Expect::get(LOG_ENTRIES, log_entries_fixture));
+                    bmc.expect(Expect::get(LOG_ENTRY, log_entry_fixture));
                 }
             }
             let units = units(&plan, &bmc, clock);
@@ -266,6 +296,9 @@ where
             } else if planned.origin().request_class() == ChassisRead::<B>::REQUEST_CLASS {
                 let unit = ChassisRead::new(endpoint, target, Arc::clone(bmc));
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+            } else if planned.origin().request_class() == LogRead::<B>::REQUEST_CLASS {
+                let unit = LogRead::new(endpoint, target, Arc::clone(bmc));
+                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
             } else {
                 unreachable!("the plan selects only declared providers")
             }
@@ -293,7 +326,7 @@ async fn drive(
 
     println!(
         "polling {} target(s) on `{}` every {:?}, {} report(s)",
-        args.sensors.len() + args.chassis.len(),
+        args.sensors.len() + args.chassis.len() + args.log_services.len(),
         endpoint.endpoint_id(),
         args.cadence,
         args.count

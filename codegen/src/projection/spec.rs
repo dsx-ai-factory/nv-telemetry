@@ -193,6 +193,7 @@ pub struct ConstantSpec {
 pub struct AssemblySpec {
     pub target_field: String,
     pub entries: Vec<EntrySpec>,
+    pub anchor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -424,6 +425,7 @@ fn assembly_spec(message: &DynamicMessage) -> AssemblySpec {
             null_policy: number(entry, "null_policy"),
             value_map: value_map(entry),
         }),
+        anchor: boolean(message, "anchor"),
     }
 }
 
