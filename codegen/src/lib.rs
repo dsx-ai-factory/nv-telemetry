@@ -267,8 +267,6 @@ pub fn workspace_root() -> Result<PathBuf, Error> {
 /// [`Error::Backend`] if wire types cannot be rendered, [`Error::Root`] if the
 /// workspace root cannot be located, or [`Error::Io`] if a generated file
 /// cannot be read or written.
-///
-/// Backward compatibility is not judged here; `buf breaking` owns it.
 pub fn run(mode: Mode) -> Result<Outcome, Error> {
     let pool = pool()?;
     let vocabulary = options::Vocabulary::resolve(&pool).map_err(Error::Vocabulary)?;

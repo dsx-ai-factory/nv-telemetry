@@ -152,8 +152,40 @@ pub(crate) fn state_observation(_observation: &StateObservation) -> Result<(), I
     Ok(())
 }
 
-/// No cross-field rules; the schema states none for `States`.
-pub(crate) fn states(_states: &States) -> Result<(), Invalid> {
+/// A repeated (subject, name) is a series: every observation carries a
+/// distinct timestamp, since canonical list position cannot preserve order.
+pub(crate) fn states(states: &States) -> Result<(), Invalid> {
+    // Canonicalization sorts by subject then name, making each facet contiguous.
+    let observations = states.observations();
+    let mut start = 0;
+    for index in 1..=observations.len() {
+        if index < observations.len()
+            && observations[index].subject() == observations[start].subject()
+            && observations[index].name() == observations[start].name()
+        {
+            continue;
+        }
+        if index - start > 1 {
+            let mut instants = BTreeSet::new();
+            for (offset, observation) in observations[start..index].iter().enumerate() {
+                let instant = observation.observed_at().ok_or_else(|| {
+                    Invalid::element(
+                        "observations",
+                        start + offset,
+                        Violation::Rule("a repeated state facet requires observed_at"),
+                    )
+                })?;
+                if !instants.insert(instant) {
+                    return Err(Invalid::element(
+                        "observations",
+                        start + offset,
+                        Violation::Rule("a repeated state facet requires distinct timestamps"),
+                    ));
+                }
+            }
+        }
+        start = index;
+    }
     Ok(())
 }
 

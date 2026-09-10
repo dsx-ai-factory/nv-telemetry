@@ -1,0 +1,6 @@
+{
+  "@odata.id": "/redfish/v1/Systems/1/LogServices/SEL",
+  "@odata.type": "#LogService.v1_8_0.LogService",
+  "Id": "SEL",
+  "Name": "System Event Log"
+}

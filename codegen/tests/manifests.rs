@@ -153,12 +153,52 @@ fn inventory_projection(name: &str) -> ProjectionSpec {
         fields: Vec::new(),
         map_assemblies: vec![AssemblySpec {
             target_field: "attributes".to_owned(),
+            anchor: true,
             entries: vec![EntrySpec {
                 key: "manufacturer".to_owned(),
                 source_path: "Manufacturer".to_owned(),
                 null_policy: ABSENT,
                 value_map: Vec::new(),
             }],
+        }],
+        ..projection(name)
+    }
+}
+
+/// A log-shaped projection: an identity-less target, so no subject; an
+/// instant landing, a contract-enumeration landing through `value_map`,
+/// verbatim text, and an attributes assembly over the remaining primitives.
+fn log_projection(name: &str) -> ProjectionSpec {
+    let mut severity = field("Severity", "severity");
+    severity.value_map = vec![
+        ("OK".to_owned(), "SEVERITY_INFO".to_owned()),
+        ("Warning".to_owned(), "SEVERITY_WARNING".to_owned()),
+        ("Critical".to_owned(), "SEVERITY_CRITICAL".to_owned()),
+    ];
+    let mut message = field("Message", "message");
+    message.required = true;
+    ProjectionSpec {
+        source_type: "LogEntry".to_owned(),
+        target_type: "nv.telemetry.v1.LogRecord".to_owned(),
+        subject: None,
+        fields: vec![
+            field("Created", "occurred_at"),
+            severity,
+            message,
+            field("Id", "entry_id"),
+        ],
+        map_assemblies: vec![AssemblySpec {
+            target_field: "attributes".to_owned(),
+            anchor: false,
+            entries: ["MessageId", "SensorNumber", "Resolved", "EventTimestamp"]
+                .into_iter()
+                .map(|path| EntrySpec {
+                    key: path.to_owned(),
+                    source_path: path.to_owned(),
+                    null_policy: ABSENT,
+                    value_map: Vec::new(),
+                })
+                .collect(),
         }],
         ..projection(name)
     }
@@ -200,6 +240,141 @@ fn expanded(members: Vec<&str>, path: &str) -> ProjectionSpec {
         }),
         ..projection("sample")
     }
+}
+
+#[test]
+fn a_log_record_projection_passes_and_emits() {
+    passes(manifest(vec![log_projection("log-record")]));
+    let files =
+        emit(&[manifest(vec![log_projection("log-record")])]).expect("the log projection emits");
+    let module = files
+        .iter()
+        .find(|(path, _)| path.ends_with("test.rs"))
+        .map(|(_, text)| text.as_str())
+        .expect("the manifest's module is rendered");
+    // The instant hook's `Err` is the residual tier: propagated, never an
+    // issue.
+    assert!(module.contains("Some(crate::instant::timestamp(value)?)"));
+    assert!(module.contains("::nv_telemetry_model::Severity::Info"));
+    assert!(module.contains("::nv_telemetry_model::Value::int(value)"));
+    assert!(module.contains("::nv_telemetry_model::Value::bool(value)"));
+    assert!(module
+        .contains("::nv_telemetry_model::Value::timestamp(crate::instant::timestamp(value)?)"));
+    assert!(
+        !module.contains("let Some(subject) = subject"),
+        "an identity-less target derives no subject"
+    );
+}
+
+#[test]
+fn an_assembly_only_projection_must_anchor_one_assembly() {
+    // Nothing else gates output: without an anchor every document would
+    // emit an item that says nothing.
+    let mut item = inventory_projection("chassis-inventory");
+    item.map_assemblies[0].anchor = false;
+    rejects(manifest(vec![item]), "none is `anchor`");
+}
+
+#[test]
+fn an_assembly_in_a_contract_required_field_gates_without_an_anchor() {
+    // `StateObservation.value` is contract-required: an empty map must
+    // suppress the observation, never reach the builder — the same
+    // automatic gate a field landing there gets.
+    let unanchored = || {
+        let mut state = state_map_projection(vec![map_entry("activation".to_owned())]);
+        state.map_assemblies[0].anchor = false;
+        state
+    };
+    passes(manifest(vec![unanchored()]));
+    let files = emit(&[manifest(vec![unanchored()])]).expect("the projection emits");
+    let module = files
+        .iter()
+        .find(|(path, _)| path.ends_with("test.rs"))
+        .map(|(_, text)| text.as_str())
+        .expect("the manifest's module is rendered");
+    assert!(
+        module.contains("!state_map_value_entries.is_empty()"),
+        "the required landing gates the instance"
+    );
+}
+
+#[test]
+fn an_assembly_anchor_counts_toward_the_single_anchor() {
+    let mut log = log_projection("log-record");
+    log.fields[0].anchor = true;
+    log.map_assemblies[0].anchor = true;
+    rejects(manifest(vec![log]), "more than one `anchor`");
+}
+
+#[test]
+fn a_manifest_subject_serving_siblings_does_not_fail_a_log_projection() {
+    // The manifest-level subject is the sibling's to inherit; the log
+    // projection declares none of its own and is not at fault.
+    let mut manifest = manifest(vec![
+        log_projection("log-record"),
+        state_projection("state"),
+    ]);
+    manifest.projections[1].subject = None;
+    manifest.subject = Some(subject());
+    passes(manifest);
+}
+
+#[test]
+fn a_subject_on_an_identity_less_target_is_rejected() {
+    let mut log = log_projection("log-record");
+    log.subject = Some(subject());
+    rejects(manifest(vec![log]), "carries no identity");
+}
+
+#[test]
+fn a_contract_enumeration_target_needs_a_value_map() {
+    let mut log = log_projection("log-record");
+    log.fields[1].value_map.clear();
+    rejects(manifest(vec![log]), "without a value_map");
+}
+
+#[test]
+fn known_values_do_not_land_in_a_contract_enumeration() {
+    let mut log = log_projection("log-record");
+    log.fields[1].known_values = vec!["OK".to_owned()];
+    rejects(manifest(vec![log]), "lands in a contract enumeration");
+}
+
+#[test]
+fn a_value_map_row_must_name_a_contract_enumeration_value() {
+    let mut log = log_projection("log-record");
+    log.fields[1].value_map[0].1 = "SEVERITY_LOUD".to_owned();
+    rejects(manifest(vec![log]), "does not declare");
+}
+
+#[test]
+fn a_value_map_row_may_not_reach_the_unspecified_value() {
+    let mut log = log_projection("log-record");
+    log.fields[1].value_map[0].1 = "SEVERITY_UNSPECIFIED".to_owned();
+    rejects(manifest(vec![log]), "unspecified value");
+}
+
+#[test]
+fn text_does_not_land_in_an_instant() {
+    let mut log = log_projection("log-record");
+    log.fields[0] = field("MessageId", "occurred_at");
+    emit_rejects(manifest(vec![log]), "no conversion from");
+}
+
+#[test]
+fn identity_less_and_identity_targets_do_not_share_a_source_type() {
+    let mut state = state_projection("log-state");
+    "LogEntry".clone_into(&mut state.source_type);
+    state.fields = vec![field("Message", "value.string_value")];
+    state.subject = Some(SubjectSpec {
+        kind: "log-entry".to_owned(),
+        scope: Vec::new(),
+        id_path: "Id".to_owned(),
+    });
+    emit_rejects(
+        manifest(vec![log_projection("log-record"), state]),
+        "mix identity-less and identity-carrying targets",
+    );
 }
 
 // The baseline is clean, so each rejection below is its mutation's.
@@ -352,6 +527,7 @@ fn a_nested_assembly_target_is_rejected_by_name() {
     let mut broken = projection("sample");
     broken.map_assemblies = vec![AssemblySpec {
         target_field: "value.map_value".to_owned(),
+        anchor: false,
         entries: vec![EntrySpec {
             key: "reading".to_owned(),
             source_path: "Reading".to_owned(),
@@ -367,6 +543,7 @@ fn assemblies_build_value_maps_only() {
     let mut broken = projection("sample");
     broken.map_assemblies = vec![AssemblySpec {
         target_field: "key".to_owned(),
+        anchor: false,
         entries: vec![EntrySpec {
             key: "reading".to_owned(),
             source_path: "Reading".to_owned(),
@@ -513,6 +690,7 @@ fn unknown_raw_manifest_enum_numbers_are_rejected() {
     entry.fields.clear();
     entry.map_assemblies = vec![AssemblySpec {
         target_field: "value".to_owned(),
+        anchor: true,
         entries: vec![EntrySpec {
             key: "reading".to_owned(),
             source_path: "Reading".to_owned(),
@@ -720,6 +898,7 @@ fn an_entry_key_rejects_placeholders() {
     expansion.fields = Vec::new();
     expansion.map_assemblies = vec![AssemblySpec {
         target_field: "value".to_owned(),
+        anchor: true,
         entries: vec![EntrySpec {
             key: "{member}".to_owned(),
             source_path: "Thresholds.{member}.Activation".to_owned(),
@@ -779,6 +958,7 @@ fn assembly_entries_get_the_same_source_checks_as_fields() {
     }];
     broken.map_assemblies = vec![AssemblySpec {
         target_field: "value".to_owned(),
+        anchor: true,
         entries: vec![EntrySpec {
             key: "conditions".to_owned(),
             source_path: "Status.Conditions".to_owned(),
@@ -969,6 +1149,7 @@ fn state_map_projection(entries: Vec<EntrySpec>) -> ProjectionSpec {
         }],
         map_assemblies: vec![AssemblySpec {
             target_field: "value".to_owned(),
+            anchor: true,
             entries,
         }],
         ..projection("state-map")

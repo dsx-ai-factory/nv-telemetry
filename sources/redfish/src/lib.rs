@@ -3,13 +3,15 @@
 
 //! Redfish acquisition.
 //!
-//! Two providers ship: [`SensorRead`] — one sensor `OData` GET projected
-//! into a readings batch and a states batch, per `docs/DATA-MODEL.md`'s
-//! worked example — and [`ChassisRead`] — one chassis GET projected into an
-//! inventory batch and a states batch. Transport rides nv-redfish's `Bmc`
-//! trait, so the providers are generic over HTTP and the mock the fixture
-//! corpus replays through; reqwest and tokio enter the workspace only here,
-//! behind the `bmc-http` feature.
+//! Three providers ship, one [`Read`] envelope each: [`SensorRead`] — one
+//! sensor `OData` GET projected into a readings batch and a states batch,
+//! per `docs/DATA-MODEL.md`'s worked example — [`ChassisRead`] — one chassis
+//! GET projected into an inventory batch and a states batch — and
+//! [`LogRead`] — a walk over a log service's entries projected into logs
+//! batches. Transport rides nv-redfish's `Bmc` trait, so the providers are
+//! generic over HTTP and the mock the fixture corpus replays through;
+//! reqwest and tokio enter the workspace only here, behind the `bmc-http`
+//! feature.
 //!
 //! Projection is *declared* in `manifests/` and compiled into
 //! `src/generated/` by `make codegen`: deterministic, I/O-free functions
@@ -23,10 +25,19 @@
 
 mod failure;
 mod generated;
+mod instant;
 mod projection;
 mod provider;
 mod uri;
 
 pub use failure::ClassifyError;
+pub use provider::ChassisKind;
 pub use provider::ChassisRead;
+pub use provider::LogKind;
+pub use provider::LogRead;
+pub use provider::Read;
+pub use provider::ReadKind;
+pub use provider::SensorKind;
 pub use provider::SensorRead;
+pub use provider::WalkBudget;
+pub use provider::TRUNCATED_WALK_LOCATOR;

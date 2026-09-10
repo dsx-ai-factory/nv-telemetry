@@ -6,7 +6,7 @@
 //! The guarantee is that a schema edit without a regenerated tree fails, which
 //! rests on the rendered snapshot matching the committed file byte for byte.
 //!
-//! Backward compatibility is checked by `make proto-breaking`, not here.
+//! The contract is under development; this checks current-schema freshness.
 
 use nv_telemetry_codegen::lock::Snapshot;
 use nv_telemetry_codegen::options::Vocabulary;

@@ -448,8 +448,8 @@ fn a_widened_bound_is_an_error_rather_than_a_silent_zero() {
 
 #[test]
 fn a_bound_losing_explicit_presence_is_an_error() {
-    // Dropping `optional` keeps the type and the number, so `buf breaking`
-    // sees a compatible edit — but it collapses `max_items: 0`, meaning "must
+    // Dropping `optional` keeps the type and the number but collapses
+    // `max_items: 0`, meaning "must
     // be empty", into "no bound at all". The vocabulary has had exactly this
     // bug once already.
     let pool = pool_with_vocabulary(

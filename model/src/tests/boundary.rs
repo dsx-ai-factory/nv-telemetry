@@ -28,8 +28,11 @@ use crate::ResourceGraph;
 use crate::ResourceRelation;
 use crate::SignalDescriptor;
 use crate::SignalKey;
+use crate::StateObservation;
+use crate::States;
 use crate::Subject;
 use crate::Timestamp;
+use crate::Value;
 use crate::ValueRange;
 use crate::Violation;
 
@@ -411,6 +414,42 @@ fn a_complete_scoped_graph_must_hang_off_its_root() {
 }
 
 #[test]
+fn repeated_state_facets_require_distinct_timestamps() {
+    for stamps in [
+        [None, None],
+        [None, Some(10)],
+        [Some(10), Some(10)],
+        [Some(10), Some(11)],
+    ] {
+        let observations = ["down", "up"]
+            .into_iter()
+            .zip(stamps)
+            .map(|(value, stamp)| {
+                let mut builder = StateObservation::builder()
+                    .subject(built_subject("port", "eth0"))
+                    .name("state")
+                    .value(Value::string(value).expect("short value"));
+                if let Some(seconds) = stamp {
+                    builder = builder.observed_at(Timestamp::new(seconds, 0).expect("instant"));
+                }
+                builder.build().expect("observation")
+            })
+            .collect::<Vec<_>>();
+        let decoded = wire::States {
+            observations: observations.iter().cloned().map(Into::into).collect(),
+        };
+        let built = States::builder().observations(observations).build();
+        let decoded = States::try_from(decoded);
+        let valid = stamps == [Some(10), Some(11)];
+        assert_eq!(built.is_ok(), valid, "builder: {stamps:?}");
+        assert_eq!(decoded.is_ok(), valid, "decode: {stamps:?}");
+        if valid {
+            assert_eq!(built.unwrap(), decoded.unwrap());
+        }
+    }
+}
+
+#[test]
 fn a_range_needs_a_bound_one_arm_and_order() {
     assert!(ValueRange::builder().build().is_err(), "no bound at all");
 
@@ -432,49 +471,72 @@ fn a_range_needs_a_bound_one_arm_and_order() {
     assert!(backwards.is_err(), "min must not exceed max");
 }
 
-/// Maximal wire messages: every optional field set, every payload domain
-/// exercised. `TryFrom` consumes the wire message field by field and `From`
-/// rebuilds it; a field one of them forgets is silent data loss, and sparse
-/// round trips cannot see it. Maps carry a single entry so sorting cannot
-/// reorder them, making byte equality the assertion.
-// Long because it is exhaustive — one construction per payload domain with
-// every field populated. Trimming it to a length limit would reopen exactly
-// the blind spot it exists to close.
-#[allow(clippy::too_many_lines)]
-#[test]
-fn every_field_survives_the_validated_round_trip() {
-    let ts = |seconds: i64| wire::Timestamp {
+fn wire_timestamp(seconds: i64) -> wire::Timestamp {
+    wire::Timestamp {
         seconds: Some(seconds),
         nanos: Some(7),
-    };
-    let subject = |id: &str| wire::Subject {
+    }
+}
+
+fn wire_subject(id: &str) -> wire::Subject {
+    wire::Subject {
         kind: Some("sensor".into()),
         scope: vec!["1U".into()],
         id: Some(id.into()),
-    };
-    let key = |id: &str| wire::SignalKey {
-        subject: Some(subject(id)),
+    }
+}
+
+fn wire_key(id: &str) -> wire::SignalKey {
+    wire::SignalKey {
+        subject: Some(wire_subject(id)),
         facet: Some("state/counters".into()),
-    };
-    let map = wire::value::Map {
+    }
+}
+
+/// A single entry, so canonical sorting cannot reorder it and byte equality
+/// stays the assertion.
+fn wire_map() -> wire::value::Map {
+    wire::value::Map {
         entries: vec![wire::value::map::Entry {
             key: Some("serial".into()),
             value: Some(wire::Value {
                 kind: Some(wire::value::Kind::StringValue("SN-1".into())),
             }),
         }],
-    };
-    let numeric = |value: f64| wire::NumericValue {
+    }
+}
+
+fn wire_numeric(value: f64) -> wire::NumericValue {
+    wire::NumericValue {
         kind: Some(wire::numeric_value::Kind::DoubleValue(value)),
-    };
-    let endpoint = || wire::EndpointContext {
+    }
+}
+
+fn wire_endpoint() -> wire::EndpointContext {
+    wire::EndpointContext {
         endpoint_id: Some("bmc-lab-07".into()),
-        attributes: Some(map.clone()),
-    };
-    let origin = || wire::Origin {
+        attributes: Some(wire_map()),
+    }
+}
+
+fn wire_origin() -> wire::Origin {
+    wire::Origin {
         provider: Some("redfish".into()),
         request_class: Some("read".into()),
-    };
+    }
+}
+
+/// Maximal wire batches: every optional field set, one per payload domain.
+// Long because it is exhaustive — one construction per payload domain with
+// every field populated. Trimming it to a length limit would reopen exactly
+// the blind spot it exists to close.
+#[allow(clippy::too_many_lines)]
+fn maximal_batches() -> Vec<wire::ObservationBatch> {
+    let ts = wire_timestamp;
+    let subject = wire_subject;
+    let key = wire_key;
+    let map = wire_map();
+    let numeric = wire_numeric;
 
     let payloads = vec![
         wire::observation_batch::Payload::Readings(wire::Readings {
@@ -542,10 +604,11 @@ fn every_field_survives_the_validated_round_trip() {
         }),
     ];
 
-    for payload in payloads {
-        let maximal = wire::ObservationBatch {
-            endpoint: Some(endpoint()),
-            origin: Some(origin()),
+    payloads
+        .into_iter()
+        .map(|payload| wire::ObservationBatch {
+            endpoint: Some(wire_endpoint()),
+            origin: Some(wire_origin()),
             window: Some(wire::ObservationWindow {
                 start: Some(ts(1)),
                 end: Some(ts(2)),
@@ -555,8 +618,53 @@ fn every_field_survives_the_validated_round_trip() {
                 scope: Some(subject("1U")),
             }),
             payload: Some(payload),
-        };
+        })
+        .collect()
+}
 
+fn maximal_status() -> wire::AcquisitionStatus {
+    wire::AcquisitionStatus {
+        endpoint_id: Some("bmc-lab-07".into()),
+        provider: Some("redfish".into()),
+        request_class: Some("read".into()),
+        outcome: Some(2),
+        failure_class: Some(3),
+        retryable: Some(true),
+        started_at: Some(wire_timestamp(50)),
+        duration_nanos: Some(125_000),
+        detail: Some("timed out".into()),
+    }
+}
+
+/// Issues are given in canonical (path) order so the unordered sort cannot
+/// reorder them, keeping byte equality the assertion.
+fn maximal_issues() -> wire::ProjectionIssues {
+    wire::ProjectionIssues {
+        endpoint: Some(wire_endpoint()),
+        origin: Some(wire_origin()),
+        at: Some(wire_timestamp(60)),
+        issues: vec![
+            wire::ProjectionIssue {
+                path: Some("Id".into()),
+                kind: Some(wire::projection_issue::IssueKind::MissingRequired as i32),
+                detail: None,
+            },
+            wire::ProjectionIssue {
+                path: Some("Sensors[3].Reading".into()),
+                kind: Some(wire::projection_issue::IssueKind::Invalid as i32),
+                detail: Some("not a finite number".into()),
+            },
+        ],
+    }
+}
+
+/// Maximal wire messages: every optional field set, every payload domain
+/// exercised. `TryFrom` consumes the wire message field by field and `From`
+/// rebuilds it; a field one of them forgets is silent data loss, and sparse
+/// round trips cannot see it.
+#[test]
+fn every_field_survives_the_validated_round_trip() {
+    for maximal in maximal_batches() {
         let validated = ObservationBatch::try_from(maximal.clone()).expect("maximal batch valid");
         // The direct encoder against prost encoding the rebuilt wire tree:
         // byte equality, with every field of every domain present — the
@@ -571,17 +679,7 @@ fn every_field_survives_the_validated_round_trip() {
         );
     }
 
-    let status = wire::AcquisitionStatus {
-        endpoint_id: Some("bmc-lab-07".into()),
-        provider: Some("redfish".into()),
-        request_class: Some("read".into()),
-        outcome: Some(2),
-        failure_class: Some(3),
-        retryable: Some(true),
-        started_at: Some(ts(50)),
-        duration_nanos: Some(125_000),
-        detail: Some("timed out".into()),
-    };
+    let status = maximal_status();
     let validated = AcquisitionStatus::try_from(status.clone()).expect("maximal status valid");
     let direct = validated.encode_to_vec();
     assert_eq!(
@@ -595,25 +693,7 @@ fn every_field_survives_the_validated_round_trip() {
         "the direct status encoder diverged from prost"
     );
 
-    // Issues are given in canonical (path) order so the unordered sort
-    // cannot reorder them, keeping byte equality the assertion.
-    let issues = wire::ProjectionIssues {
-        endpoint: Some(endpoint()),
-        origin: Some(origin()),
-        at: Some(ts(60)),
-        issues: vec![
-            wire::ProjectionIssue {
-                path: Some("Id".into()),
-                kind: Some(wire::projection_issue::IssueKind::MissingRequired as i32),
-                detail: None,
-            },
-            wire::ProjectionIssue {
-                path: Some("Sensors[3].Reading".into()),
-                kind: Some(wire::projection_issue::IssueKind::Invalid as i32),
-                detail: Some("not a finite number".into()),
-            },
-        ],
-    };
+    let issues = maximal_issues();
     let validated = ProjectionIssues::try_from(issues.clone()).expect("maximal issues valid");
     let direct = validated.encode_to_vec();
     assert_eq!(

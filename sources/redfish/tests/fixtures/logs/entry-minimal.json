@@ -1,0 +1,9 @@
+{
+  "@odata.id": "/redfish/v1/Systems/1/LogServices/SEL/Entries/2",
+  "@odata.type": "#LogEntry.v1_21_0.LogEntry",
+  "Id": "2",
+  "Name": "System Event Log Entry 2",
+  "EntryType": "Event",
+  "Created": "2026-03-01T10:05:00Z",
+  "Message": "System boot complete"
+}

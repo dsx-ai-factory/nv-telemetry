@@ -17,7 +17,11 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AcquisitionMode {
-    /// One request per admission, on a cadence the plan supplies.
+    /// One acquisition per admission, on a cadence the plan supplies. The
+    /// unit of admission is the acquisition, not the request: a single
+    /// resource read is one request, a collection walk is several, and the
+    /// walk holds its slot for all of them — which is why a provider that
+    /// walks bounds the walk.
     Polled,
 }
 
@@ -31,8 +35,11 @@ pub struct ProviderDeclaration {
 }
 
 impl ProviderDeclaration {
-    /// Declares a polled provider. `cost` is a relative request weight in
-    /// the dispatcher's token units; `1` is a plain single-resource read.
+    /// Declares a polled provider. `cost` is a relative weight per admission
+    /// in the dispatcher's token units; `1` is a plain single-resource read.
+    /// A unit that issues several requests per admission is metered at this
+    /// one weight for all of them, so a walk declaring `1` leans on its own
+    /// bound to keep the endpoint's rate honest.
     #[must_use]
     pub fn polled(
         provider: impl Into<String>,

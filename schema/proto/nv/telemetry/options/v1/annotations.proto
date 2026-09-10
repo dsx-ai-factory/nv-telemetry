@@ -74,9 +74,8 @@ message FieldInvariant {
   // happened, and what the source called that representation, are not.
   //
   // Like `zero_is_meaningful`, adding or removing this on a field a hashable
-  // message reaches changes existing hashes, and `buf breaking` cannot see
-  // option values. The contract lock records it so the diff is the review
-  // surface.
+  // message reaches changes existing hashes. The contract lock records
+  // option values so the diff is the review surface.
   bool collection_metadata = 7;
 
   // The value must not be empty, for strings and bytes alike.

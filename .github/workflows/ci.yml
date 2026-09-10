@@ -28,11 +28,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      # Full history: the schema's backward-compatibility check compares
-      # against origin/main, which a shallow clone would not contain.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
@@ -50,7 +46,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # buf checks the schema: style, formatting, and backward compatibility.
+      # buf checks the current schema: style and formatting.
       # Downloaded rather than installed through an action, because NVIDIA's
       # allowlist admits only actions/* and a short list of others. Pinned to
       # the version the Makefile checks for: a new lint rule landing in a buf

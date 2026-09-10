@@ -1,0 +1,17 @@
+{
+  "@odata.id": "/redfish/v1/Systems/1/LogServices/SEL/Entries/1",
+  "@odata.type": "#LogEntry.v1_21_0.LogEntry",
+  "Id": "1",
+  "Name": "System Event Log Entry 1",
+  "EntryType": "SEL",
+  "EntryCode": "Upper Critical - going high",
+  "SensorType": "Temperature",
+  "SensorNumber": 7,
+  "Severity": "Critical",
+  "Created": "2026-03-01T12:00:00+02:00",
+  "EventTimestamp": "2026-03-01T11:59:58+02:00",
+  "Message": "CPU1 Temp upper critical threshold crossed",
+  "MessageId": "Base.1.19.ThresholdCrossed",
+  "Resolved": false,
+  "OemRecordFormat": "Legacy"
+}

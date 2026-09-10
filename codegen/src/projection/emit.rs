@@ -45,8 +45,12 @@ use prost_reflect::MessageDescriptor;
 use quote::format_ident;
 use quote::quote;
 
+use super::lint::NULL_INVALID;
 use crate::options::Vocabulary;
+use crate::projection::lint::assembly_gates;
+use crate::projection::lint::is_identity_less;
 use crate::projection::lint::resolve_target;
+use crate::projection::lint::root_required;
 use crate::projection::lint::target_profile;
 use crate::projection::lint::IdentityKind;
 use crate::projection::lint::TargetProfile;
@@ -67,9 +71,7 @@ use crate::provenance;
 use crate::wrapper::names::constant_stem;
 use crate::wrapper::names::ident;
 use crate::wrapper::names::short_name;
-
-// Null-policy numbers mirror manifest.proto; buf breaking guards the mirror.
-const NULL_INVALID: i32 = 2;
+use crate::wrapper::names::variant_name;
 
 /// The hand-written value vocabulary: construction is a fixed constructor
 /// table, the emission counterpart of the model emitter's `HAND_WRITTEN`
@@ -78,6 +80,9 @@ const NUMERIC_VALUE: &str = "nv.telemetry.v1.NumericValue";
 const VALUE: &str = "nv.telemetry.v1.Value";
 const VALUE_MAP: &str = "nv.telemetry.v1.Value.Map";
 const SUBJECT: &str = "nv.telemetry.v1.Subject";
+/// The one message a `DateTimeOffset` lands in, whole, outside the value
+/// vocabulary.
+const TIMESTAMP: &str = "nv.telemetry.v1.Timestamp";
 
 const HEADER: &str = "\
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -170,10 +175,17 @@ enum SourceClass {
     /// `Edm.Decimal`, or a type definition over it: an `f64` in the source
     /// crate's generated Rust.
     Decimal,
+    /// `Edm.Int64`: an `i64`.
+    Int64,
+    /// `Edm.Boolean`: a `bool`.
+    Boolean,
+    /// `Edm.DateTimeOffset`: the source crate's `Copy` wrapper over an
+    /// offset-aware instant.
+    DateTimeOffset,
     /// `Edm.String`, or a type definition over it: a `String`.
     Text,
     /// An enumeration: a generated `Copy` enum whose members project to
-    /// strings.
+    /// strings, or through `value_map` rows to a contract enumeration.
     Enum,
 }
 
@@ -187,8 +199,10 @@ struct Landing {
 }
 
 enum LandingKind {
-    /// A plain string field of a generated message.
-    PlainString(FieldDescriptor),
+    /// A field of a generated message, set whole through its setter: a
+    /// string, a contract enumeration, or a `Timestamp`. The descriptor's
+    /// kind decides which conversions land in it.
+    Field(FieldDescriptor),
     /// A constructor of the hand-written value vocabulary: the leaf is the
     /// named oneof arm of `NumericValue` or `Value`.
     VocabArm {
@@ -201,7 +215,7 @@ enum LandingKind {
 impl LandingKind {
     fn description(&self) -> String {
         match self {
-            Self::PlainString(field) => field.full_name().to_owned(),
+            Self::Field(field) => field.full_name().to_owned(),
             Self::VocabArm {
                 vocabulary, arm, ..
             } => format!("{vocabulary}.{arm}"),
@@ -210,7 +224,7 @@ impl LandingKind {
 
     fn field(&self) -> &FieldDescriptor {
         match self {
-            Self::PlainString(field) | Self::VocabArm { field, .. } => field,
+            Self::Field(field) | Self::VocabArm { field, .. } => field,
         }
     }
 }
@@ -221,6 +235,15 @@ enum Conversion {
     Decimal {
         constructor: String,
     },
+    /// An infallible constructor of the value vocabulary — `int`, `bool` —
+    /// over a primitive the source already holds in the target's shape.
+    Scalar {
+        constructor: String,
+        method: &'static str,
+    },
+    Timestamp {
+        destination: TimestampDestination,
+    },
     Text {
         check: TextCheck,
         destination: TextDestination,
@@ -229,13 +252,28 @@ enum Conversion {
         namespace: String,
         name: String,
         rows: Vec<(String, String)>,
-        destination: TextDestination,
+        destination: EnumDestination,
     },
 }
 
 enum TextDestination {
     Plain,
     Vocabulary(String),
+}
+
+enum TimestampDestination {
+    /// The field takes the `Timestamp` itself.
+    Field,
+    /// The `timestamp_value` arm of the value vocabulary.
+    Vocabulary(String),
+}
+
+enum EnumDestination {
+    /// Members project to their row's text.
+    Text(TextDestination),
+    /// Members project through their row to a variant of the model's
+    /// enumeration `model`, named as the model emitter named it.
+    Contract { model: String },
 }
 
 /// The target leaf's own bounds, mirrored as pre-checks so the builder's
@@ -364,28 +402,45 @@ impl Emitter<'_> {
 
         // The effective subject; projections that inherit the manifest's
         // share one derivation, and identical declarations agree by value.
-        let effective = group
+        // Identity-less targets derive none, and a source type feeding both
+        // kinds would need a derivation only some instances consume.
+        let identity_less = group
             .iter()
-            .map(|projection| {
-                projection
-                    .subject
-                    .as_ref()
-                    .or(self.manifest.subject.as_ref())
-                    .ok_or_else(|| {
-                        format!(
-                            "{manifest}: `{}`: no subject survived checking",
-                            projection.name
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let subject_spec = effective[0];
-        if effective.iter().any(|subject| *subject != subject_spec) {
+            .filter(|projection| is_identity_less(&projection.target_type))
+            .count();
+        let subject_spec = if identity_less == group.len() {
+            None
+        } else if identity_less > 0 {
             return Err(format!(
-                "{manifest}: projections over `{source_type}` declare distinct subjects; \
-                 one subject derivation is required per source type"
+                "{manifest}: projections over `{source_type}` mix identity-less and \
+                 identity-carrying targets; one subject derivation per source type \
+                 is required, so split them across source types"
             ));
-        }
+        } else {
+            let effective = group
+                .iter()
+                .map(|projection| {
+                    projection
+                        .subject
+                        .as_ref()
+                        .or(self.manifest.subject.as_ref())
+                        .ok_or_else(|| {
+                            format!(
+                                "{manifest}: `{}`: no subject survived checking",
+                                projection.name
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let subject_spec = effective[0];
+            if effective.iter().any(|subject| *subject != subject_spec) {
+                return Err(format!(
+                    "{manifest}: projections over `{source_type}` declare distinct subjects; \
+                     one subject derivation is required per source type"
+                ));
+            }
+            Some(subject_spec)
+        };
 
         // Every local the function body will bind. Seeded with the names
         // the template already gives meaning, because derived locals come
@@ -481,9 +536,11 @@ impl Emitter<'_> {
                     .find(|(target_type, _)| *target_type == instance.target_type)
                     .map(|(_, field_name)| ident(field_name))
                     .expect("the instance's target collection is planned");
-                needs_key |= profile.identity == IdentityKind::SignalKey;
+                needs_key |= profile
+                    .identity
+                    .is_some_and(|identity| identity.kind == IdentityKind::SignalKey);
                 needs_provenance |= profile.provenance.is_some();
-                assemblies.extend(Self::instance_assembly(
+                assemblies.extend(self.instance_assembly(
                     &instance,
                     &target,
                     profile,
@@ -495,13 +552,30 @@ impl Emitter<'_> {
             }
         }
 
-        let (subject_tokens, helpers) =
-            self.subject_derivation(source_type, &source_param, subject_spec, &mut locals)?;
-        let needs_location = needs_provenance
-            || subject_spec
-                .scope
-                .iter()
-                .any(|contributor| matches!(contributor, ScopeSpec::LocationTemplate { .. }));
+        // The derivation and its gate travel together: identity failure
+        // empties every collection while the issues still name each fault,
+        // and without identity there is nothing to derive or to fail.
+        let (subject_tokens, helpers, needs_location) = match subject_spec {
+            Some(subject_spec) => {
+                let (derivation, helpers) =
+                    self.subject_derivation(source_type, &source_param, subject_spec, &mut locals)?;
+                let needs_location = needs_provenance
+                    || subject_spec.scope.iter().any(|contributor| {
+                        matches!(contributor, ScopeSpec::LocationTemplate { .. })
+                    });
+                let tokens = quote! {
+                    #derivation
+                    let Some(subject) = subject else {
+                        return Ok(#parts_name {
+                            #(#parts_idents: Vec::new(),)*
+                            issues,
+                        });
+                    };
+                };
+                (tokens, helpers, needs_location)
+            }
+            None => (TokenStream::new(), TokenStream::new(), needs_provenance),
+        };
 
         let key_binding = needs_key.then(|| {
             quote! {
@@ -554,12 +628,6 @@ impl Emitter<'_> {
                 #evaluations
 
                 #subject_tokens
-                let Some(subject) = subject else {
-                    return Ok(#parts_name {
-                        #(#parts_idents: Vec::new(),)*
-                        issues,
-                    });
-                };
 
                 #key_binding
                 #(let mut #parts_idents = Vec::new();)*
@@ -621,23 +689,18 @@ impl Emitter<'_> {
 
         // A contract-required landing gates output exactly as an anchor
         // does: ordinary absence must suppress the item, never reach the
-        // builder. `required` on the manifest additionally reports it.
+        // builder. `required` on the manifest additionally reports it. The
+        // lint's predicate, so the two cannot disagree on what gates.
         let root = landing
             .setter_path
             .first()
             .expect("a checked target landing has a root field");
-        let root_field = target
-            .get_field_by_name(root)
-            .expect("a checked target root remains present");
-        let target_required = self
-            .vocabulary
-            .field_invariant(&root_field)
-            .is_some_and(|invariant| invariant.required);
-        let gates = if field.anchor || field.required || target_required {
-            vec![quote! { #local.is_some() }]
-        } else {
-            Vec::new()
-        };
+        let gates =
+            if field.anchor || field.required || root_required(self.vocabulary, target, root) {
+                vec![quote! { #local.is_some() }]
+            } else {
+                Vec::new()
+            };
 
         let tokens = quote! { let #local = #evaluation; };
         Ok((
@@ -705,6 +768,9 @@ impl Emitter<'_> {
         // assembly target to it, so the landing is fixed by the source.
         let arm = match Self::source_class(leaf, context)? {
             SourceClass::Decimal => "double_value",
+            SourceClass::Int64 => "int_value",
+            SourceClass::Boolean => "bool_value",
+            SourceClass::DateTimeOffset => "timestamp_value",
             SourceClass::Text | SourceClass::Enum => "string_value",
         };
         let field = self
@@ -749,7 +815,8 @@ impl Emitter<'_> {
         context: &str,
     ) -> Result<Conversion, String> {
         let class = Self::source_class(leaf, context)?;
-        match (&landing.kind, class) {
+        let kind = &landing.kind;
+        match (kind, class) {
             (
                 LandingKind::VocabArm {
                     vocabulary, arm, ..
@@ -758,39 +825,64 @@ impl Emitter<'_> {
             ) if arm == "double_value" => Ok(Conversion::Decimal {
                 constructor: vocabulary.clone(),
             }),
-            (kind, SourceClass::Text) => Ok(Conversion::Text {
+            (
+                LandingKind::VocabArm {
+                    vocabulary, arm, ..
+                },
+                SourceClass::Int64,
+            ) if arm == "int_value" => Ok(Conversion::Scalar {
+                constructor: vocabulary.clone(),
+                method: "int",
+            }),
+            (
+                LandingKind::VocabArm {
+                    vocabulary, arm, ..
+                },
+                SourceClass::Boolean,
+            ) if arm == "bool_value" => Ok(Conversion::Scalar {
+                constructor: vocabulary.clone(),
+                method: "bool",
+            }),
+            (
+                LandingKind::VocabArm {
+                    vocabulary, arm, ..
+                },
+                SourceClass::DateTimeOffset,
+            ) if arm == "timestamp_value" => Ok(Conversion::Timestamp {
+                destination: TimestampDestination::Vocabulary(vocabulary.clone()),
+            }),
+            (LandingKind::Field(field), SourceClass::DateTimeOffset) if is_timestamp(field) => {
+                Ok(Conversion::Timestamp {
+                    destination: TimestampDestination::Field,
+                })
+            }
+            (_, SourceClass::Text) => Ok(Conversion::Text {
                 check: self.text_check(kind.field()),
                 destination: text_destination(kind, leaf, context)?,
             }),
-            (kind, SourceClass::Enum) => {
-                let destination = text_destination(kind, leaf, context)?;
-                let members = leaf.enum_members.as_ref().ok_or_else(|| {
-                    format!(
-                        "{context}: `{}.{}` lost its members",
-                        leaf.namespace, leaf.name
-                    )
-                })?;
-                let mut rows = value_map.to_vec();
-                for known in known_values {
-                    if !rows.iter().any(|(from, _)| from == known) {
-                        rows.push((known.clone(), known.clone()));
-                    }
-                }
-                if rows.is_empty() {
-                    rows.extend(
-                        members
-                            .iter()
-                            .map(|member| (member.clone(), member.clone())),
-                    );
-                }
-                Ok(Conversion::Enum {
+            (LandingKind::Field(field), SourceClass::Enum) => match field.kind() {
+                // Into a contract enumeration the rows are the lint-checked
+                // value_map alone: nothing is projected verbatim.
+                Kind::Enum(contract_enum) => Ok(Conversion::Enum {
                     namespace: leaf.namespace.clone(),
                     name: leaf.name.clone(),
-                    rows,
-                    destination,
-                })
+                    rows: value_map.to_vec(),
+                    destination: EnumDestination::Contract {
+                        model: short_name(contract_enum.full_name()),
+                    },
+                }),
+                _ => text_enum(kind, leaf, value_map, known_values, context),
+            },
+            (LandingKind::VocabArm { .. }, SourceClass::Enum) => {
+                text_enum(kind, leaf, value_map, known_values, context)
             }
-            (kind, SourceClass::Decimal) => Err(format!(
+            (
+                _,
+                SourceClass::Decimal
+                | SourceClass::Int64
+                | SourceClass::Boolean
+                | SourceClass::DateTimeOffset,
+            ) => Err(format!(
                 "{context}: no conversion from `{}.{}` into `{}`",
                 leaf.namespace,
                 leaf.name,
@@ -821,6 +913,9 @@ impl Emitter<'_> {
         }
         match primitive {
             "Decimal" => Ok(SourceClass::Decimal),
+            "Int64" => Ok(SourceClass::Int64),
+            "Boolean" => Ok(SourceClass::Boolean),
+            "DateTimeOffset" => Ok(SourceClass::DateTimeOffset),
             other => Err(format!(
                 "{context}: no conversion from `Edm.{other}` is implemented; \
                  extending the compiler is required"
@@ -846,7 +941,9 @@ impl Emitter<'_> {
     /// landings, and assemblies; build the target; push it into its parts
     /// collection.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn instance_assembly(
+        &self,
         instance: &ProjectionSpec,
         target: &MessageDescriptor,
         profile: TargetProfile,
@@ -856,13 +953,13 @@ impl Emitter<'_> {
         context: &str,
     ) -> Result<TokenStream, String> {
         let target_model = ident(&short_name(target.full_name()));
-        let identity_setter = ident(profile.identity_field);
-        let identity = match profile.identity {
-            IdentityKind::SignalKey => quote! { builder = builder.#identity_setter(key.clone()); },
-            IdentityKind::Subject => {
-                quote! { builder = builder.#identity_setter(subject.clone()); }
+        let identity = profile.identity.map(|identity| {
+            let setter = ident(identity.field);
+            match identity.kind {
+                IdentityKind::SignalKey => quote! { builder = builder.#setter(key.clone()); },
+                IdentityKind::Subject => quote! { builder = builder.#setter(subject.clone()); },
             }
-        };
+        });
         let provenance = profile.provenance.map(|field| {
             let setter = ident(field);
             quote! { builder = builder.#setter(crate::uri::canonical(location)); }
@@ -906,19 +1003,17 @@ impl Emitter<'_> {
                 Ok(quote! { builder = builder.#setter(#value); })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let assembly_setters = assemblies.iter().map(|(local, assembly)| {
-            let setter = ident(&assembly.target_field);
-            let lands_on_map = target.get_field_by_name(&assembly.target_field).is_some_and(
-                |field| matches!(field.kind(), Kind::Message(message) if message.full_name() == VALUE_MAP),
-            );
-            if lands_on_map {
-                quote! { builder = builder.#setter(#local.into_iter().collect()); }
-            } else {
-                quote! {
-                    builder = builder.#setter(::nv_telemetry_model::Value::map(#local)?);
-                }
-            }
-        });
+        // An assembly gates the instance when it is the anchor or lands in
+        // a contract-required field — the lint's predicate, so an empty map
+        // never reaches a builder that would refuse it.
+        let gated: Vec<bool> = assemblies
+            .iter()
+            .map(|(_, assembly)| assembly_gates(self.vocabulary, target, assembly))
+            .collect();
+        let assembly_setters = assemblies
+            .iter()
+            .zip(&gated)
+            .map(|((local, assembly), gated)| assembly_setter(target, local, assembly, *gated));
 
         let body = quote! {
             let mut builder = ::nv_telemetry_model::#target_model::builder();
@@ -929,12 +1024,15 @@ impl Emitter<'_> {
             #(#assembly_setters)*
             #collection.push(builder.build()?);
         };
+        let assembly_conditions = assemblies
+            .iter()
+            .zip(&gated)
+            .filter(|(_, gated)| **gated)
+            .map(|((local, _), _)| quote! { !#local.is_empty() });
         let conditions = outputs
             .iter()
             .flat_map(|output| output.gates.iter().cloned())
-            .chain(assemblies.iter().map(|(local, _)| {
-                quote! { !#local.is_empty() }
-            }))
+            .chain(assembly_conditions)
             .collect::<Vec<_>>();
         Ok(if conditions.is_empty() {
             body
@@ -1132,6 +1230,38 @@ impl Emitter<'_> {
     }
 }
 
+/// One assembly's setter: the entries collect into the target's map field,
+/// or into a `Value::map` when the field is the value vocabulary. A gating
+/// assembly has already suppressed the whole instance when empty; any other
+/// omits the field instead.
+fn assembly_setter(
+    target: &MessageDescriptor,
+    local: &Ident,
+    assembly: &AssemblySpec,
+    gated: bool,
+) -> TokenStream {
+    let setter = ident(&assembly.target_field);
+    let lands_on_map = target.get_field_by_name(&assembly.target_field).is_some_and(
+        |field| matches!(field.kind(), Kind::Message(message) if message.full_name() == VALUE_MAP),
+    );
+    let set = if lands_on_map {
+        quote! { builder = builder.#setter(#local.into_iter().collect()); }
+    } else {
+        quote! {
+            builder = builder.#setter(::nv_telemetry_model::Value::map(#local)?);
+        }
+    };
+    if gated {
+        set
+    } else {
+        quote! {
+            if !#local.is_empty() {
+                #set
+            }
+        }
+    }
+}
+
 /// Builds sub-messages for outputs whose setter paths share a head segment —
 /// `range.min` and `range.max` become one `range` — inline in the evaluation
 /// phase, so the build's issue lands in declaration order. Recurses for
@@ -1281,6 +1411,28 @@ fn conversion_tokens(conversion: &Conversion, issue_path: &str) -> TokenStream {
                 }
             }
         }
+        Conversion::Scalar {
+            constructor,
+            method,
+        } => {
+            let constructor = vocab_type(constructor);
+            let method = ident(method);
+            quote! { Some(#constructor::#method(value)) }
+        }
+        // The source crate owns the instant conversion, as it owns the
+        // location grammar: one hand-written hook per source shape. Its
+        // `Err` is the residual tier — the hook cannot fail on what the
+        // source type holds — so it propagates as a builder refusal does.
+        Conversion::Timestamp { destination } => {
+            let instant = quote! { crate::instant::timestamp(value)? };
+            match destination {
+                TimestampDestination::Field => quote! { Some(#instant) },
+                TimestampDestination::Vocabulary(vocabulary) => {
+                    let constructor = vocab_type(vocabulary);
+                    quote! { Some(#constructor::timestamp(#instant)) }
+                }
+            }
+        }
         Conversion::Text { check, destination } => {
             let value = quote! { value };
             let accept = text_accept(destination, &value);
@@ -1295,8 +1447,17 @@ fn conversion_tokens(conversion: &Conversion, issue_path: &str) -> TokenStream {
             let enum_type = source_type_tokens(namespace, name);
             let arms = rows.iter().map(|(from, to)| {
                 let variant = escaped_ident(&casemungler::to_camel(from));
-                let value = quote! { #to };
-                let output = text_accept(destination, &value);
+                let output = match destination {
+                    EnumDestination::Text(destination) => {
+                        let value = quote! { #to };
+                        text_accept(destination, &value)
+                    }
+                    EnumDestination::Contract { model } => {
+                        let variant = ident(&variant_name(model, to));
+                        let model = ident(model);
+                        quote! { Some(::nv_telemetry_model::#model::#variant) }
+                    }
+                };
                 quote! { #enum_type::#variant => #output, }
             });
             quote! {
@@ -1592,31 +1753,76 @@ fn target_landing(
             },
         });
     }
-    match leaf.kind() {
-        Kind::String => Ok(Landing {
-            setter_path: segments
-                .iter()
-                .map(|segment| (*segment).to_owned())
-                .collect(),
-            kind: LandingKind::PlainString(leaf),
-        }),
-        other => Err(format!(
-            "{context}: no conversion lands on `{target_field}` ({other:?}); \
-             extending the compiler is required"
-        )),
+    let lands = matches!(leaf.kind(), Kind::String | Kind::Enum(_)) || is_timestamp(&leaf);
+    if !lands {
+        return Err(format!(
+            "{context}: no conversion lands on `{target_field}` ({:?}); \
+             extending the compiler is required",
+            leaf.kind()
+        ));
     }
+    Ok(Landing {
+        setter_path: segments
+            .iter()
+            .map(|segment| (*segment).to_owned())
+            .collect(),
+        kind: LandingKind::Field(leaf),
+    })
+}
+
+fn is_timestamp(field: &FieldDescriptor) -> bool {
+    matches!(field.kind(), Kind::Message(message) if message.full_name() == TIMESTAMP)
 }
 
 /// Text landings only: a plain string field, or the string arm of the value
 /// vocabulary. `None` is a landing text cannot populate.
 fn constant_destination(kind: &LandingKind) -> Option<TextDestination> {
     match kind {
-        LandingKind::PlainString(_) => Some(TextDestination::Plain),
+        LandingKind::Field(field) if matches!(field.kind(), Kind::String) => {
+            Some(TextDestination::Plain)
+        }
         LandingKind::VocabArm {
             vocabulary, arm, ..
         } if arm == "string_value" => Some(TextDestination::Vocabulary(vocabulary.clone())),
-        LandingKind::VocabArm { .. } => None,
+        LandingKind::Field(_) | LandingKind::VocabArm { .. } => None,
     }
+}
+
+/// An enumeration projecting to text: `value_map` rows first, then
+/// `known_values` verbatim, and with neither declared every member verbatim.
+fn text_enum(
+    kind: &LandingKind,
+    leaf: &Step,
+    value_map: &[(String, String)],
+    known_values: &[String],
+    context: &str,
+) -> Result<Conversion, String> {
+    let destination = text_destination(kind, leaf, context)?;
+    let members = leaf.enum_members.as_ref().ok_or_else(|| {
+        format!(
+            "{context}: `{}.{}` lost its members",
+            leaf.namespace, leaf.name
+        )
+    })?;
+    let mut rows = value_map.to_vec();
+    for known in known_values {
+        if !rows.iter().any(|(from, _)| from == known) {
+            rows.push((known.clone(), known.clone()));
+        }
+    }
+    if rows.is_empty() {
+        rows.extend(
+            members
+                .iter()
+                .map(|member| (member.clone(), member.clone())),
+        );
+    }
+    Ok(Conversion::Enum {
+        namespace: leaf.namespace.clone(),
+        name: leaf.name.clone(),
+        rows,
+        destination: EnumDestination::Text(destination),
+    })
 }
 
 fn text_destination(

@@ -155,6 +155,8 @@ projections {
     constants { target_field: "name" value: "threshold.{member-kebab}" }
     map_assemblies {
       target_field: "value"
+      # The threshold is its facets: none present, no observation.
+      anchor: true
       entries {
         key: "activation"
         source_path: "Thresholds.{member}.Activation"

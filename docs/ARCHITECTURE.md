@@ -454,8 +454,8 @@ would hash equal and join to the same resource.
 Rejection stops at the zero value. An enum value the build does not recognise
 is a newer producer naming something real, so it decodes rather than
 invalidating the message; deciding what to do with it belongs to the consumer.
-The alternative would make every added enum value a breaking change, which
-contradicts the additive-only evolution rule.
+Preserving the numeric token keeps an unrecognised answer distinct from an
+unspecified value without requiring the consumer to understand its meaning.
 
 ### Foreign types
 
@@ -584,19 +584,19 @@ resource inside a hashable graph still has its collection metadata skipped. Enco
 encoding is not canonical across implementations, and unknown fields would
 make equal graphs hash unequal. Absent fields contribute nothing, so a schema
 revision that adds fields changes a hash only when those fields carry data —
-an upgrade that observes nothing new reports no change. Field numbers are
-never reused, which the breaking-change checks enforce, so a number labels the
-same meaning forever.
+an upgrade that observes nothing new reports no change. Field numbers label
+meanings within the current schema. During development, a schema refactor may
+change them, so content hashes from different revisions
+must not be assumed comparable.
 
 A field whose zero value is declared meaningful is the exception in the other
 direction: it has no "present" to test, so it is hashed unconditionally.
 Either kind of annotation change on a field a hashable message reaches —
 declaring a zero meaningful, marking collection metadata, or removing either —
-changes every existing hash. Nothing catches that automatically: the
-compatibility check compares numbers, types, and cardinality, not the values
-of custom options, so it is a review obligation, and the contract lock records
-annotations so that the diff makes it visible. Hashing also requires validated construction, since equal
-content only hashes equal once canonicalization has run.
+changes every existing hash. These changes are a review obligation; the
+contract lock records annotations so that the diff makes them visible.
+Hashing also requires validated construction, since equal content only hashes
+equal once canonicalization has run.
 
 The hash is a generated capability computed where comparison happens, not a
 field carried on the wire, so it always reflects the comparer's own decoded
@@ -605,32 +605,22 @@ and must not report spurious change.
 
 ### Evolution
 
-The package is versioned; within a major version changes are additive only,
-enforced by `buf breaking` against the schema as it stands on the main branch.
-The `PACKAGE` category is used rather than the stricter default: the contract
-is one package spread over several files, so the default would report a message
-moving between files as a break when nothing about the wire format changed.
-`PACKAGE` still catches everything that strands a consumer — a deleted field
-whose number was not reserved, a changed type, a reused number — including
-`FIELD_SAME_CARDINALITY`, which is what makes a field quietly losing explicit
-presence an error rather than a silent return of fabricated zeros. Persisted
-batches decode across minor revisions.
+The library and `nv.telemetry.v1` schema are under active development. The
+package suffix identifies the current schema; it is not a stability promise.
+Refactors may change fields, field numbers, validation rules, generated APIs,
+and hashing semantics. Earlier serialized data is not required to remain
+readable, and no historical-schema compatibility gate restricts development.
+A release compatibility policy will be defined when the contract stabilizes.
 
-Compatibility is deliberately not checked by hand. A comparison written here
-would have to grow a case at a time for reserved ranges, enum changes, JSON
-names, and oneof moves, and would be wrong in the interval before each one was
-noticed.
+The checked-in contract lock records every declaration: messages and fields
+with their numbers, types, cardinality, presence, and annotations, enum values,
+and oneofs with their members and invariants. It is a review surface and a
+freshness check: a schema edit must arrive with matching generated output.
 
-A separate, checked-in contract lock records every declaration: messages and
-fields with their numbers, types, cardinality, presence, and annotations, enum
-values with their numbers, and oneofs with their members and invariants. Its
-job is staleness, not compatibility: regenerating it and finding the tree unchanged is what proves a
-schema edit arrived with its generated output.
-
-Wire compatibility is not source compatibility: adding a field regenerates a
-struct with one more public field, which breaks exhaustive struct literals.
-Construction outside generated code therefore goes through builders, and
-struct literals are not part of the stable contract.
+Current-schema guarantees remain enforced: explicit presence, bounds,
+cross-field validation, canonicalization, encode/decode round trips, and
+deterministic generation. Builders retain validated construction and private
+representations; they do not imply a stable API during development.
 
 ## The schema compiler
 
@@ -743,15 +733,19 @@ writes exactly those, byte-compared against the checked-in tree. Files under
 a generated directory that no manifest produces anymore are reported as
 orphans for the operator to delete — the compiler never removes files.
 
-Target construction is therefore profile-based. The initial unary profiles
-are `SignalDescriptor` and `Reading`, whose sole identity landing is `key`, and
-`StateObservation`, whose sole identity landing is `subject`. A profile is an
-explicit promise that the compiler knows how to complete that target's
-builder and triage every device-driven invariant. Reflection verifies the
-promise against the contract, but never invents a profile. Messages with no
-identity, multiple identities, batch/payload shapes, and helper messages are
-rejected as projection roots until their construction semantics are designed
-and registered deliberately.
+Target construction is therefore profile-based. The unary profiles are
+`SignalDescriptor` and `Reading`, whose sole identity landing is `key`;
+`StateObservation` and `InventoryItem`, whose sole identity landing is
+`subject` (the item also carries compiler-filled provenance); and
+`LogRecord`, which carries no identity at all — a record is a fact in its own
+right, so its manifest declares no subject and emission derives none, while
+its `subject` field (what the entry is about) stays reserved by type. A
+profile is an explicit promise that the compiler knows how to complete that
+target's builder and triage every device-driven invariant. Reflection
+verifies the promise against the contract, but never invents a profile.
+Messages with multiple identities, batch/payload shapes, and helper messages
+are rejected as projection roots until their construction semantics are
+designed and registered deliberately.
 
 Profiles also carry payload-level obligations that no unary builder can prove.
 For a source type that emits `Reading`, compilation requires exactly one
@@ -883,9 +877,14 @@ Graph snapshots may represent an entire endpoint or a subtree of one. Subject
 scope on a graph means reachability from the scope subject rather than subject
 equality, because a graph is a connected structure and the natural unit of
 partial collection is a subtree such as one chassis and its contents. A
-complete graph can establish absence for resources and relationships within
-that scope. A partial graph updates observed facts but cannot establish that
-omitted facts were removed.
+complete graph replaces the prior snapshot's resource and relationship sets
+for the same endpoint, scope, and collection definition. Previously collected
+members missing from the new snapshot are removed, even when they are no
+longer reachable in the new graph. The provider must define the relation kinds
+and external-target boundaries it enumerates. Reachability of included nodes
+is a structural check, never proof of exhaustive collection. A walk with an
+unresolved collection branch must remain partial. A partial graph updates
+observed facts but cannot establish that omitted facts were removed.
 
 Reachability follows relations from source to target. A subtree therefore has
 to hang off its root by outgoing edges, which is a constraint on projections: a
@@ -963,8 +962,18 @@ The embedder owns fan-out and delivery. Consumer queues must be bounded and
 their overflow behavior explicit. A slow consumer must not retain unbounded
 history or silently impose application-wide backpressure.
 
-The library guarantees ordering only at a documented local scope, such as an
-endpoint/provider task; it does not imply global ordering across endpoints.
+The embedder fences endpoint and plan generations before delivery: an old
+acquisition completing after replacement must not overwrite the new plan's
+observations. It also defines provider authority when providers overlap.
+These are local control facts, currently absent from the wire; an external
+consumer needs the corresponding delivery contract.
+
+Timestamp ordering applies only within a comparable clock domain and epoch.
+Device `observed_at` and collector `window.start` must never be compared using
+one as the other's fallback. Clock resets, equal or absent timestamps, and
+provider changes can leave observations unordered; consumers preserve that
+ambiguity instead of deriving order from canonical list position. No global
+ordering across endpoints is implied.
 
 ## Optional integrations
 
@@ -991,9 +1000,8 @@ guarantees from the type system into validation and tests.
    validated ingress is fuzzed.
 
 Schema hygiene sits outside these tiers and belongs to buf: style and naming
-through `buf lint`, formatting through `buf format`, and compatibility through
-`buf breaking`. That is a build-time concern nothing else in the stack covers,
-and keeping it separate from the invariant rules is deliberate — the rules
+through `buf lint` and formatting through `buf format`. That is a build-time
+concern nothing else in the stack covers, and keeping it separate from the invariant rules is deliberate — the rules
 encode what the data must mean, which no general linter can know, while the
 things buf checks are exactly the ones a general linter already knows better
 than we would. The cost is one more binary a contributor installs.
@@ -1072,10 +1080,9 @@ falsifiable by one scenario:
 5. projection survives real devices rather than their schemas — a payload
    corpus spanning vendors and firmware revisions replayed through it;
 6. the contract is a wire contract, not a Rust one — a cross-process consumer
-   decoding batches produced under a newer minor revision;
-7. evolution is additive-only in practice — a revision adding fields accepted
-   while a removal, a reused number, and a field losing explicit presence are
-   each rejected;
+   decoding batches produced against the same current schema;
+7. current-schema correctness is enforced — missing explicit presence, invalid
+   annotations, and stale generated output are each rejected;
 8. sharing by reference costs nothing until a boundary — allocation,
    memory-retention, and throughput measurements, with in-process fan-out
    measured against encode-at-boundary costs.

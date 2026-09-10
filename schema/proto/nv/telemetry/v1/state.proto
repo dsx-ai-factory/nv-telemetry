@@ -54,6 +54,14 @@ message States {
   // down and back up — is reporting a series, and each observation carries its
   // own timestamp to say so. Rejecting the pair would discard a real
   // transition to enforce a snapshot shape only some sources have.
+  //
+  // List position carries no order. When a (subject, name) occurs more than
+  // once, every observation must carry observed_at and the timestamps must
+  // be distinct. A single observation of a facet may omit its timestamp.
+  // Consumers may order device timestamps only within a comparable clock
+  // domain. Never compare device time with the collector's window.start as a
+  // fallback. The embedder fences obsolete endpoint/plan generations before
+  // delivery and defines provider authority; neither is encoded in this batch.
   repeated StateObservation observations = 1 [(nv.telemetry.options.v1.field_invariant) = {
     unordered: true
     max_items: 65536

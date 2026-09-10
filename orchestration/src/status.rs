@@ -45,18 +45,11 @@ pub fn default_retryable(class: AcquisitionFailureClass) -> bool {
 }
 
 /// Whether the class is an endpoint-scoped fact the endpoint breaker
-/// samples. Everything else stays with its request class — and `Internal`
-/// with the collector, because our own bug must not quarantine a device.
+/// samples: the source crate's own line, so a provider walking a collection
+/// and the breaker scope agree on which failures indict the endpoint.
 #[must_use]
-pub fn trips_endpoint_breaker(class: AcquisitionFailureClass) -> bool {
-    match class {
-        AcquisitionFailureClass::Connectivity
-        | AcquisitionFailureClass::Authentication
-        | AcquisitionFailureClass::Timeout => true,
-        // Protocol, Unsupported, Device, Internal — and any class this
-        // table has not judged: none may quarantine a device.
-        _ => false,
-    }
+pub const fn trips_endpoint_breaker(class: AcquisitionFailureClass) -> bool {
+    class.is_endpoint_scoped()
 }
 
 /// The status a completed, successful acquisition earns. `retryable` and

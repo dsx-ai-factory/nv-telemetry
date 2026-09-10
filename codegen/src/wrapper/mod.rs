@@ -64,12 +64,11 @@ use quote::format_ident;
 use quote::quote;
 
 pub use self::limits::limits;
-use self::names::arm_name;
 use self::names::docs;
 use self::names::ident;
-use self::names::screaming;
 use self::names::short_name;
 use self::names::snake;
+use self::names::variant_name;
 use self::plans::plan_field;
 use self::plans::plan_oneof;
 use self::plans::Plan;
@@ -311,7 +310,6 @@ fn enum_items(
     let short = short_name(full);
     claim(claimed, &short, &format!("enum `{full}`"))?;
     let name = ident(&short);
-    let prefix = format!("{}_", screaming(&short));
 
     let doc = docs(&[
         format!("Validated form of `{full}`."),
@@ -337,7 +335,7 @@ fn enum_items(
         if entry.number() == 0 {
             continue;
         }
-        let arm = arm_name(entry.name(), &prefix);
+        let arm = variant_name(&short, entry.name());
         // Deriving can produce something Rust cannot spell — stripping the
         // enum prefix from `FORM_FACTOR_2U` leaves a variant starting with a
         // digit — and `format_ident!` would panic on it, a generator crash

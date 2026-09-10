@@ -12,6 +12,9 @@
 pub(crate) mod chassis;
 
 #[rustfmt::skip]
+pub(crate) mod logs;
+
+#[rustfmt::skip]
 pub(crate) mod sensor;
 
 #[rustfmt::skip]

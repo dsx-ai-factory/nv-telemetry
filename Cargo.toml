@@ -73,6 +73,10 @@ nv-redfish-bmc-mock = "0.16"
 nv-redfish-csdl-compiler = "0.16"
 nv-redfish-schema = "0.16"
 nv-redfish-dispatcher = "0.16"
+# The instant type behind nv-redfish's `Edm.DateTimeOffset`; `sources/redfish`
+# reads seconds and nanos off it for the contract's `Timestamp`.
+time = { version = "0.3", default-features = false }
+futures-timer = "3"
 url = "2"
 
 # Dev-only: fixture JSON for the acquisition corpus, and the executor

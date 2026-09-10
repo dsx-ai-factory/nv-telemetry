@@ -325,12 +325,16 @@ pub struct LogRecord {
     pub message: ::core::option::Option<::prost::alloc::string::String>,
     /// The resource the record is about, when the source names one — a Redfish
     /// OriginOfCondition — as opposed to the service it was collected from,
-    /// which is provenance and lives on the batch.
+    /// which is provenance and lives on the batch as `Coverage.scope`.
     #[prost(message, optional, tag = "4")]
     pub subject: ::core::option::Option<Subject>,
     /// The source's identifier for this entry, when it has one, so incremental
-    /// collection can resume and consumers can deduplicate. Deliberately no
-    /// uniqueness constraint on the records list: sources that do not stamp
+    /// collection can resume and consumers can deduplicate. Its namespace is the
+    /// batch's `Coverage.scope` — the log service — so the deduplication key is
+    /// (endpoint_id, coverage.scope, entry_id): two services on one endpoint both
+    /// number their entries from 1. A service that is cleared reuses its ids; a
+    /// consumer that must survive that also compares `occurred_at`. Deliberately
+    /// no uniqueness constraint on the records list: sources that do not stamp
     /// entries leave this absent, and a key that can be absent cannot decide
     /// duplicates.
     #[prost(string, optional, tag = "5")]
@@ -426,8 +430,10 @@ pub struct SignalDescriptor {
     /// reading types are open sets; projection maps and validates them.
     #[prost(string, optional, tag = "2")]
     pub kind: ::core::option::Option<::prost::alloc::string::String>,
-    /// Unit of every sample under this key, in UCUM. Absent for dimensionless
-    /// signals — which is the encoding for that, rather than the empty string.
+    /// Unit of every sample under this key, in UCUM. Absent means the unit is not
+    /// known — the source stated none — never that the signal is dimensionless:
+    /// a count or a ratio carries UCUM's unity, "1". A consumer may combine two
+    /// "1" signals and must not combine two whose units it does not know.
     #[prost(string, optional, tag = "3")]
     pub unit: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]
@@ -497,11 +503,27 @@ pub struct States {
     /// down and back up — is reporting a series, and each observation carries its
     /// own timestamp to say so. Rejecting the pair would discard a real
     /// transition to enforce a snapshot shape only some sources have.
+    ///
+    /// List position carries no order. When a (subject, name) occurs more than
+    /// once, every observation must carry observed_at and the timestamps must
+    /// be distinct. A single observation of a facet may omit its timestamp.
+    /// Consumers may order device timestamps only within a comparable clock
+    /// domain. Never compare device time with the collector's window.start as a
+    /// fallback. The embedder fences obsolete endpoint/plan generations before
+    /// delivery and defines provider authority; neither is encoded in this batch.
     #[prost(message, repeated, tag = "1")]
     pub observations: ::prost::alloc::vec::Vec<StateObservation>,
 }
 /// What the batch covers and how completely. Absence can only be inferred
-/// inside the declared scope of a complete batch.
+/// inside the declared scope of a complete batch, and what "absent" ranges over
+/// is the domain's population: signal descriptors (never samples — a descriptor
+/// without a sample is a signal with no value right now), state facets,
+/// inventory subjects, resources in a fully enumerated graph scope. Graph
+/// reconciliation compares against the previous snapshot for the same scope
+/// and collection definition; removed nodes need not be reachable in the new
+/// graph. Walks with unresolved collection branches must be partial. A
+/// logs batch is never complete; its scope names the service walked, which is
+/// the namespace of its records' entry ids.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Coverage {
     /// A batch that does not know its own completeness cannot be used to reason
@@ -510,7 +532,8 @@ pub struct Coverage {
     #[prost(enumeration = "Completeness", optional, tag = "1")]
     pub completeness: ::core::option::Option<i32>,
     /// The subtree observed; absent means the whole endpoint. On a graph
-    /// payload, scope means reachability from this subject.
+    /// payload, scope means reachability from this subject. On a logs payload,
+    /// the service the entries belong to.
     #[prost(message, optional, tag = "2")]
     pub scope: ::core::option::Option<Subject>,
 }
