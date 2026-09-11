@@ -1126,6 +1126,7 @@ name = "nv-telemetry-redfish"
 version = "0.1.0"
 dependencies = [
  "futures-timer",
+ "futures-util",
  "nv-redfish",
  "nv-redfish-bmc-mock",
  "nv-telemetry-model",

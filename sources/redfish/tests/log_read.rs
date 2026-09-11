@@ -38,6 +38,7 @@ use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::ProjectionIssue;
 
+const ROOT: &str = "/redfish/v1";
 const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
 const ENTRIES: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries";
 const ENTRY_1: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries/1";
@@ -222,14 +223,16 @@ async fn a_read_remembers_where_its_last_walk_ended() {
         .expect("the device answered");
     assert_eq!(first.batches(), [batch(two_records())]);
 
-    // The next poll reads the newest member, finds it shipped, and asks for
-    // nothing older: no batch, no issue, and the same clone-shared position
-    // whichever clone the dispatcher polls through.
+    // The next poll asks the root, once, whether the device filters — this
+    // one does not — then reads the newest member, finds it shipped, and
+    // asks for nothing older: no batch, no issue, and the same clone-shared
+    // position whichever clone the dispatcher polls through.
     let repeat = [
         (SERVICE, include_str!("fixtures/logs/service.json")),
         (ENTRIES, include_str!("fixtures/logs/entries-two.json")),
         (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
     ];
+    prime(&[(ROOT, include_str!("fixtures/logs/service-root.json"))]);
     prime(&repeat);
     let second = run_acquisition(&read.clone(), at())
         .await
@@ -249,6 +252,45 @@ async fn a_read_remembers_where_its_last_walk_ended() {
         .await
         .expect("the device answered");
     assert_eq!(after_failure.batches(), &[]);
+}
+
+#[tokio::test]
+async fn a_filtering_device_is_asked_only_for_the_cursors_second_onward() {
+    // The root advertises `FilterQuery`, so from the second poll on the walk
+    // asks for the entries stamped at or after the cursor's — entry 2's
+    // instant — and reads one member: the cursor's own, which ends the walk.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let prime = |answers: &[(&str, &str)]| {
+        for (uri, body) in answers {
+            bmc.expect(Expect::get(uri, body));
+        }
+    };
+    let read = LogRead::new(endpoint(), SERVICE.to_string().into(), Arc::clone(&bmc));
+    prime(&two_entries());
+    run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+
+    let filtered = format!("{ENTRIES}?$filter=Created ge '2026-03-01T10:05:00Z'");
+    let filtered_page = format!(
+        r##"{{ "@odata.id": "{filtered}", "@odata.type": "#LogEntryCollection.LogEntryCollection",
+             "Name": "Entries", "Members@odata.count": 1,
+             "Members": [ {{ "@odata.id": "{ENTRY_2}" }} ] }}"##
+    );
+    prime(&[
+        (
+            ROOT,
+            include_str!("fixtures/logs/service-root-filtering.json"),
+        ),
+        (SERVICE, include_str!("fixtures/logs/service.json")),
+        (filtered.as_str(), filtered_page.as_str()),
+        (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
+    ]);
+    let second = run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+    assert_eq!(second.batches(), &[]);
+    assert_eq!(second.issues(), &[]);
 }
 
 #[tokio::test]

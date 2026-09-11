@@ -41,4 +41,6 @@ pub use provider::ReadKind;
 pub use provider::SensorKind;
 pub use provider::SensorRead;
 pub use provider::WalkBudget;
+pub use provider::FILTER_REFUSED_LOCATOR;
+pub use provider::IN_FLIGHT_WALK_LOCATOR;
 pub use provider::TRUNCATED_WALK_LOCATOR;

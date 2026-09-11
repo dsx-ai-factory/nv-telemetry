@@ -23,6 +23,7 @@ use nv_redfish::schema::chassis::Chassis;
 use nv_redfish::schema::log_entry::LogEntry;
 use nv_redfish::schema::log_service::LogService;
 use nv_redfish::schema::sensor::Sensor;
+use nv_redfish::schema::service_root::ServiceRoot;
 use nv_redfish::Bmc;
 use nv_telemetry_model::limits::LOGS_RECORDS_MAX_ITEMS;
 use nv_telemetry_model::Completeness;
@@ -57,6 +58,15 @@ use crate::uri;
 /// The locator of the issue a log walk records when its budget stops it
 /// short: a fact about the walk, not about any source field.
 pub const TRUNCATED_WALK_LOCATOR: &str = "@truncated";
+
+/// Locator of the issue a log poll raises when it finds a walk of the same
+/// read still in flight and ships nothing rather than queue behind it.
+pub const IN_FLIGHT_WALK_LOCATOR: &str = "@in-flight";
+
+/// The locator of the issue a log walk records, once, when the device
+/// refuses the `$filter` its service root advertises and the read falls
+/// back to reading the collection by `$skip`.
+pub const FILTER_REFUSED_LOCATOR: &str = "@filter";
 
 mod sealed {
     pub trait Sealed {}
@@ -363,12 +373,13 @@ fn assemble_chassis(parts: ChassisParts) -> Result<AcquisitionParts, Invalid> {
 ///
 /// The walk is budgeted ([`WalkBudget`]): it holds the endpoint's admission
 /// slot and buffers projected records for its duration, and the dispatcher
-/// meters it as one unit of cost. **The budget keeps the newest entries.** A
-/// log lists its entries oldest first, so a walk that spent its budget from
+/// meters it as one unit of cost. **The budget keeps the newest entries.**
+/// Most logs list entries oldest first, so a walk that spent its budget from
 /// the head would never show a consumer the records that arrived since the
-/// last poll; instead the walk visits the newest members first, and when the
-/// collection is paged it jumps to the tail with `$skip` before following
-/// `Members@odata.nextLink` to the end. What the budget cuts off is the
+/// last poll; instead the walk reads the order off the member ids, visits the
+/// newest members first, and when an oldest-first collection is paged jumps
+/// to the tail with `$skip` before following `Members@odata.nextLink` to the
+/// end. What the budget cuts off is the
 /// oldest, reported once at [`TRUNCATED_WALK_LOCATOR`]. The deadline cancels
 /// pending I/O and fails the acquisition with Timeout, discarding its output.
 /// Neither bound covers the collection response the transport decodes; that
@@ -394,6 +405,9 @@ impl sealed::Sealed for LogKind {}
 /// members bound also bounds buffering, since every visited member holds at
 /// most one record and a few issues until the walk ends, and it bounds the
 /// page GETs a paged collection costs, one page being at least one member.
+/// See [`WalkBudget::deadline`].
+const WALK_DEADLINE_HEADROOM: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalkBudget {
     members: usize,
@@ -411,20 +425,38 @@ impl WalkBudget {
         Self { members, elapsed }
     }
 
-    /// How many ids the cursor keeps at one instant: four walks' worth, so a
-    /// frozen device clock cannot grow the cursor for the life of the process.
-    fn retained_ids(self) -> usize {
-        self.members.saturating_mul(4)
+    /// The acquisition's deadline: the time budget plus headroom for the
+    /// service GET, the member in flight, and assembly, so a walk that spends
+    /// its time budget stops, ships, and advances the cursor instead of being
+    /// cut off wholesale and repeating identically next poll.
+    fn deadline(self) -> Duration {
+        self.elapsed.saturating_add(WALK_DEADLINE_HEADROOM)
     }
 
     /// Why the walk stops before its next member, if it does.
-    fn exhausted(self, visited: usize, elapsed: Duration) -> Option<&'static str> {
+    fn exhausted(self, visited: usize, elapsed: Duration) -> Option<Stop> {
         if visited >= self.members {
-            Some("member budget spent")
+            Some(Stop::Members)
         } else if elapsed >= self.elapsed {
-            Some("time budget spent")
+            Some(Stop::Time)
         } else {
             None
+        }
+    }
+}
+
+/// Which budget stopped a walk before its next member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Members,
+    Time,
+}
+
+impl Stop {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Members => "member budget spent",
+            Self::Time => "time budget spent",
         }
     }
 }
@@ -438,7 +470,11 @@ impl WalkBudget {
 struct EntryPage {
     #[serde(rename = "@odata.id")]
     odata_id: ODataId,
-    #[serde(rename = "Members", default)]
+    /// Kept so the transport's cache can revalidate the page with
+    /// `If-None-Match`, as it did for the typed collection.
+    #[serde(rename = "@odata.etag")]
+    etag: Option<ODataETag>,
+    #[serde(rename = "Members")]
     members: Vec<NavProperty<LogEntry>>,
     #[serde(rename = "Members@odata.count")]
     count: Option<u64>,
@@ -452,84 +488,332 @@ impl EntityTypeRef for EntryPage {
     }
 
     fn etag(&self) -> Option<&ODataETag> {
-        None
+        self.etag.as_ref()
     }
 }
 
-/// The pages a walk read, in collection order, the first of them starting
-/// at `offset` in a collection of `total` members. Pages stay shared with
-/// the transport's cache; the walk borrows members from them.
-struct EntryWindow {
-    pages: Vec<Arc<EntryPage>>,
-    offset: usize,
-    total: usize,
+/// How a collection lists its members. Redfish leaves the order to the
+/// device; most append the newest last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    OldestFirst,
+    NewestFirst,
 }
 
-impl EntryWindow {
-    fn new(pages: Vec<Arc<EntryPage>>, offset: usize, count: usize) -> Self {
-        let read: usize = pages.iter().map(|page| page.members.len()).sum();
-        Self {
-            pages,
-            offset,
-            total: count.max(offset + read),
+impl Order {
+    fn flipped(self) -> Self {
+        match self {
+            Self::OldestFirst => Self::NewestFirst,
+            Self::NewestFirst => Self::OldestFirst,
         }
     }
 
-    /// The newest `budget` members read, each with its position in the
-    /// whole collection.
-    fn newest_first(&self, budget: WalkBudget) -> Vec<(usize, &NavProperty<LogEntry>)> {
-        let members: Vec<&NavProperty<LogEntry>> = self
+    /// The order a page's member ids imply: devices number entries as they
+    /// arrive, so ids that rise along the page put the oldest first. The
+    /// first run of digits in each id's last segment is compared with the
+    /// next, which reads `12`, `1701234567_1`, and `Sel.12` alike, and the
+    /// direction most neighbours agree on wins, so a numbering that wraps
+    /// once still reads right. Ids without digits, a tie, and a single
+    /// member say nothing.
+    fn hinted_by(page: &EntryPage) -> Option<Self> {
+        let sequence = |member: &NavProperty<LogEntry>| -> Option<u64> {
+            let digits: String = member
+                .id()
+                .last_segment()?
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        };
+        let numbers: Vec<u64> = page.members.iter().map(sequence).collect::<Option<_>>()?;
+        let (rising, falling) =
+            numbers
+                .windows(2)
+                .fold((0usize, 0usize), |(rising, falling), pair| {
+                    match pair[0].cmp(&pair[1]) {
+                        std::cmp::Ordering::Less => (rising + 1, falling),
+                        std::cmp::Ordering::Greater => (rising, falling + 1),
+                        std::cmp::Ordering::Equal => (rising, falling),
+                    }
+                });
+        match rising.cmp(&falling) {
+            std::cmp::Ordering::Greater => Some(Self::OldestFirst),
+            std::cmp::Ordering::Less => Some(Self::NewestFirst),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
+/// How a walk settles the collection's order before reading it.
+#[derive(Clone, Copy, Debug)]
+enum OrderChoice {
+    /// From the ids when they number the entries; else what the cursor
+    /// remembers, which a probe may have established and which then
+    /// outranks the ids; else oldest first.
+    Detect {
+        remembered: Option<Order>,
+        probed: bool,
+    },
+    /// A probe just showed the other end is the newer one.
+    Force(Order),
+}
+
+/// The pages a walk read, in collection order, the first of them starting
+/// at `offset` in a collection of `total` members listed in `order`. Pages
+/// stay shared with the transport's cache; the walk borrows members from
+/// them. `incomplete` says why the pages stopped before the collection's
+/// last one, if they did. The first page is kept for the order probe, which
+/// needs the collection's head whatever the walk jumped to.
+struct EntryWindow {
+    pages: Vec<Arc<EntryPage>>,
+    first_page: Arc<EntryPage>,
+    offset: usize,
+    total: usize,
+    order: Order,
+    /// The order was established by a probe rather than read or assumed.
+    probed: bool,
+    incomplete: Option<&'static str>,
+    /// `offset` is where the cursor's member was expected, not what the
+    /// budget left: the members before it are presumed shipped, and a walk
+    /// that does not find the cursor there reads them after all.
+    cursor_jump: bool,
+    /// The pages are the device's answer to `$filter`, not the collection:
+    /// `total` counts the members that matched, and nothing about the
+    /// collection's size can be read off them.
+    filtered: bool,
+}
+
+/// Which request opened the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Start {
+    /// The collection itself, from its head.
+    Head,
+    /// The collection's `$filter` page, by this id.
+    Filtered(ODataId),
+}
+
+/// Why a walk's pages stopped before the collection's last one.
+const PAGES_PAST_BUDGET: &str = "member budget spent before the last page";
+const PAGES_PAST_BUDGET_FROM_START: &str =
+    "member budget spent before the last page; the members kept are the collection's first, not its newest";
+const NEXT_LINK_UNRESOLVED: &str = "the collection's nextLink could not be resolved";
+const NEXT_LINK_LOOPS: &str = "the collection's nextLink returned to a page already read";
+const EMPTY_PAGE: &str = "the collection answered an empty page";
+
+impl EntryWindow {
+    fn members_read(&self) -> usize {
+        self.pages.iter().map(|page| page.members.len()).sum()
+    }
+
+    /// The members read, newest first, each with its position in the whole
+    /// collection.
+    fn newest_first(&self) -> Vec<(usize, &NavProperty<LogEntry>)> {
+        let members: Vec<(usize, &NavProperty<LogEntry>)> = self
             .pages
             .iter()
             .flat_map(|page| page.members.iter())
-            .collect();
-        members
-            .into_iter()
             .enumerate()
             .map(|(position, member)| (self.offset + position, member))
-            .rev()
-            .take(budget.members)
-            .collect()
+            .collect();
+        match self.order {
+            Order::OldestFirst => members.into_iter().rev().collect(),
+            Order::NewestFirst => members,
+        }
+    }
+
+    /// The member at the end the walk did not treat as newest, with its
+    /// position, when the window reaches that end.
+    fn other_end(&self) -> Option<(usize, &NavProperty<LogEntry>)> {
+        match self.order {
+            Order::OldestFirst => self.first_page.members.first().map(|member| (0, member)),
+            Order::NewestFirst if self.incomplete.is_none() => self
+                .pages
+                .last()
+                .and_then(|page| page.members.last())
+                .map(|member| (self.offset + self.members_read() - 1, member)),
+            Order::NewestFirst => None,
+        }
     }
 }
 
 /// A `Members@odata.nextLink` as the id the transport resolves against the
-/// endpoint. Devices write it as a path; one that writes an absolute URL is
-/// reduced to its path and query, and the transport's same-origin rule keeps
-/// it from naming another host.
-fn next_page_id(link: &str) -> Option<ODataId> {
-    if link.starts_with('/') {
-        return Some(ODataId::from(link.to_owned()));
-    }
-    let after_scheme = link.split_once("://")?.1;
-    let path = &after_scheme[after_scheme.find('/')?..];
-    Some(ODataId::from(path.to_owned()))
+/// endpoint. Devices write it as an absolute path; a URL, absolute or
+/// protocol-relative, is reduced to its path and query, since the transport
+/// only ever addresses the endpoint; and a relative reference is resolved
+/// against the collection's own path as RFC 3986 does, so `Entries?$skip=50`
+/// and `?$skip=50` both name the next page.
+fn next_page_id(entries: &ODataId, link: &str) -> Option<ODataId> {
+    let resolved = if let Some((_, rest)) = link.split_once("://") {
+        rest[rest.find('/')?..].to_owned()
+    } else if let Some(rest) = link.strip_prefix("//") {
+        rest[rest.find('/')?..].to_owned()
+    } else if link.starts_with('/') {
+        link.to_owned()
+    } else if link.is_empty() {
+        return None;
+    } else {
+        let base = entries.to_string();
+        let path = base.split_once('?').map_or(base.as_str(), |(path, _)| path);
+        if link.starts_with('?') {
+            format!("{path}{link}")
+        } else {
+            format!("{}{link}", &path[..=path.rfind('/')?])
+        }
+    };
+    Some(ODataId::from(resolved))
 }
 
-/// Reads the collection's pages and chooses the members to visit.
+/// The `$skip` page of `entries`, joined onto any query the id already carries.
+fn skip_page_id(entries: &ODataId, skip: usize) -> ODataId {
+    with_query_option(entries, &format!("$skip={skip}"))
+}
+
+/// The `$filter` page of `entries`: the members stamped at or after `since`,
+/// the cursor's own second included so its member is there to anchor the
+/// walk. The instant is rendered to the second, as devices stamp, and quoted,
+/// as nv-redfish's filter builder quotes every string literal; a device that
+/// wants the bare `OData` form refuses with 400 and is remembered as not
+/// filtering.
+fn filter_page_id(entries: &ODataId, since: Timestamp) -> ODataId {
+    with_query_option(
+        entries,
+        &format!("$filter=Created ge '{}'", rfc3339_second(since)),
+    )
+}
+
+fn with_query_option(entries: &ODataId, option: &str) -> ODataId {
+    let base = entries.to_string();
+    let separator = if base.contains('?') { '&' } else { '?' };
+    ODataId::from(format!("{base}{separator}{option}"))
+}
+
+/// `at` as the UTC `Created` literal a device compares against, to the second.
+fn rfc3339_second(at: Timestamp) -> String {
+    let instant = time::OffsetDateTime::from_unix_timestamp(at.seconds())
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        instant.year(),
+        u8::from(instant.month()),
+        instant.day(),
+        instant.hour(),
+        instant.minute(),
+        instant.second()
+    )
+}
+
+/// A status the device chose to answer a query option with, as opposed to a
+/// failure to answer at all: `Unsupported` or `Protocol`, and not retryable.
+/// The option is dropped and the request made without it.
+fn refused(failure: &AcquisitionFailure) -> bool {
+    matches!(
+        failure.class(),
+        AcquisitionFailureClass::Unsupported | AcquisitionFailureClass::Protocol
+    ) && failure.retryable() != Some(true)
+}
+
+/// The tail an oldest-first collection larger than the budget serves for
+/// `$skip`, when the device honors it. A device may ignore `$skip` and answer
+/// its first page again, refuse it with a status it chose, or report a count
+/// past the members it holds and answer an empty page; each is `None`, and
+/// the walk follows the pages from the start instead. A retryable status, or
+/// a failure to reach the device, is the poll's failure, since falling back
+/// would ship the log's head as new and anchor the cursor there.
+async fn skipped_tail<B>(
+    bmc: &B,
+    entries: &ODataId,
+    skip: usize,
+    first: &EntryPage,
+) -> Result<Option<Arc<EntryPage>>, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    match bmc.get::<EntryPage>(&skip_page_id(entries, skip)).await {
+        Ok(tail) => {
+            let honored = tail.members.first().is_some_and(|member| {
+                Some(member.id()) != first.members.first().map(NavProperty::id)
+            });
+            Ok(honored.then_some(tail))
+        }
+        Err(error) => {
+            let failure = error.classify();
+            if refused(&failure) {
+                Ok(None)
+            } else {
+                Err(failure)
+            }
+        }
+    }
+}
+
+/// Reads the collection's pages from `first`, its answer to `start`, and
+/// chooses the members to visit.
 ///
 /// A collection that fits in one document is the common case. A paged one
-/// reports its count, and when the count exceeds the budget the walk asks
-/// for the tail with `$skip`, which every Redfish service must honor; one
-/// that ignores it answers with its first page again, which the walk
-/// recognizes and falls back to following the pages from the start. Pages
-/// are followed until the last, bounded by the member budget, since a page
-/// holds at least one member.
+/// listing oldest first reports its count, and the walk asks for its tail
+/// with `$skip` (see [`skipped_tail`]) rather than reading every page: from
+/// where the cursor's member sat when the cursor was stored — `cursor_index`,
+/// the collection's count then less one — so an idle poll costs the first
+/// page, the tail page, and one member whatever the log's size; or from the
+/// budget's worth before the end when the count exceeds the budget, whichever
+/// is later. A collection listing newest first is read from its head and
+/// needs no jump. A `$filter` answer is the tail already and its count is
+/// the filter's, so the cursor's index means nothing in it, but one larger
+/// than the budget takes the budget's jump like the collection would. Pages
+/// are followed until the last or until a budget's worth of members has
+/// been read, which bounds the page GETs and the members buffered; a walk
+/// whose pages stop short says so in its issue.
 async fn collect_entries<B>(
     bmc: &B,
     entries: &ODataId,
     budget: WalkBudget,
+    preference: OrderChoice,
+    cursor_index: Option<usize>,
+    first: Arc<EntryPage>,
+    start: Start,
 ) -> Result<EntryWindow, AcquisitionFailure>
 where
     B: Bmc,
     B::Error: ClassifyError,
 {
-    let first = bmc
-        .get::<EntryPage>(entries)
-        .await
-        .map_err(|error| error.classify())?;
+    let filtered = matches!(start, Start::Filtered(_));
+    let (order, probed) = match preference {
+        OrderChoice::Force(order)
+        | OrderChoice::Detect {
+            remembered: Some(order),
+            probed: true,
+        } => (order, true),
+        OrderChoice::Detect { remembered, .. } => (
+            Order::hinted_by(&first)
+                .or(remembered)
+                .unwrap_or(Order::OldestFirst),
+            false,
+        ),
+    };
+    let first_page = Arc::clone(&first);
+    let mut cursor_jump = false;
+    let window = |pages: Vec<Arc<EntryPage>>,
+                  offset: usize,
+                  count: usize,
+                  incomplete: Option<&'static str>,
+                  cursor_jump: bool| {
+        let read: usize = pages.iter().map(|page| page.members.len()).sum();
+        EntryWindow {
+            pages,
+            first_page,
+            offset,
+            total: count.max(offset + read),
+            order,
+            probed,
+            incomplete,
+            cursor_jump,
+            filtered,
+        }
+    };
     if first.next_link.is_none() {
-        return Ok(EntryWindow::new(vec![first], 0, 0));
+        return Ok(window(vec![first], 0, 0, None, false));
     }
     let count = first
         .count
@@ -537,39 +821,63 @@ where
         .unwrap_or(0);
     let mut offset = 0;
     let mut page = first;
-    if count > budget.members {
-        let skip = count - budget.members;
-        let tail = bmc
-            .get::<EntryPage>(&ODataId::from(format!("{entries}?$skip={skip}")))
-            .await
-            .map_err(|error| error.classify())?;
-        let honored =
-            tail.members.first().map(NavProperty::id) != page.members.first().map(NavProperty::id);
-        if honored {
-            offset = skip;
-            page = tail;
+    let opened = match start {
+        Start::Head => entries.clone(),
+        Start::Filtered(id) => id,
+    };
+    let mut seen = std::collections::HashSet::from([opened.clone()]);
+    if order == Order::OldestFirst {
+        let budget_skip = (count > budget.members).then(|| count - budget.members);
+        // A cursor on the first page needs no jump; one at or past the
+        // count is gone, and the pages tell what replaced it.
+        let cursor_skip = cursor_index.filter(|index| (page.members.len()..count).contains(index));
+        let skip = match (budget_skip, cursor_skip) {
+            (Some(budget_skip), Some(cursor_skip)) => Some(budget_skip.max(cursor_skip)),
+            (budget_skip, cursor_skip) => budget_skip.or(cursor_skip),
+        };
+        if let Some(skip) = skip {
+            if let Some(tail) = skipped_tail(bmc, &opened, skip, &page).await? {
+                offset = skip;
+                page = tail;
+                seen.insert(skip_page_id(&opened, skip));
+                cursor_jump = cursor_skip == Some(skip);
+            }
         }
     }
+    let mut read = page.members.len();
     let mut next = page.next_link.clone();
     let mut pages = vec![page];
+    let mut incomplete = None;
     while let Some(link) = next.take() {
-        if pages.len() >= budget.members {
+        if read >= budget.members {
+            incomplete = Some(if order == Order::OldestFirst && offset == 0 {
+                PAGES_PAST_BUDGET_FROM_START
+            } else {
+                PAGES_PAST_BUDGET
+            });
             break;
         }
-        let Some(id) = next_page_id(&link) else {
+        let Some(id) = next_page_id(entries, &link) else {
+            incomplete = Some(NEXT_LINK_UNRESOLVED);
             break;
         };
+        if !seen.insert(id.clone()) {
+            incomplete = Some(NEXT_LINK_LOOPS);
+            break;
+        }
         let page = bmc
             .get::<EntryPage>(&id)
             .await
             .map_err(|error| error.classify())?;
         if page.members.is_empty() {
+            incomplete = Some(EMPTY_PAGE);
             break;
         }
+        read += page.members.len();
         next.clone_from(&page.next_link);
         pages.push(page);
     }
-    Ok(EntryWindow::new(pages, offset, count))
+    Ok(window(pages, offset, count, incomplete, cursor_jump))
 }
 
 impl ReadKind for LogKind {
@@ -587,7 +895,29 @@ impl ReadKind for LogKind {
         B: Bmc,
         B::Error: ClassifyError,
     {
-        with_deadline(WalkBudget::DEFAULT.elapsed, async {
+        let started = Instant::now();
+        // One walk of this read at a time. A poll that finds one in flight
+        // does not queue behind it, holding the endpoint's admission slot
+        // for the other walk's duration: it ships nothing, says so, and the
+        // next tick starts from what the in-flight walk stores.
+        let Some(mut position) = cursor.position.try_lock() else {
+            return Ok(AcquisitionParts::new(
+                Vec::new(),
+                vec![ProjectionIssue::invalid(
+                    IN_FLIGHT_WALK_LOCATOR,
+                    "a walk of this log is still in flight; nothing shipped this poll",
+                )],
+            ));
+        };
+        with_deadline(WalkBudget::DEFAULT.deadline(), async {
+            // Whether the device filters is worth asking only once there is
+            // a stamp to filter by: the first walk reads the whole window
+            // regardless.
+            let filter = if position.is_some() {
+                cursor.filter_support(bmc).await?
+            } else {
+                FilterSupport::Unknown
+            };
             let service = bmc
                 .get::<LogService>(target)
                 .await
@@ -603,133 +933,226 @@ impl ReadKind for LogKind {
                 );
             };
             let scope = service_scope(location, &service.base.id)?;
-            let walk = walk_entries(bmc, entries.id(), WalkBudget::DEFAULT, cursor).await?;
+            // A filter by stamp presumes the device's clock has not moved
+            // back past the cursor's second. A service whose own clock reads
+            // earlier says it has, and this poll walks the head, which
+            // places by position; the cursor then follows what shipped, so
+            // the next filter asks from the stepped-back time.
+            let filter = if clock_behind(&service, position.as_ref()) {
+                FilterSupport::Absent
+            } else {
+                filter
+            };
+            let mut walk = walk_entries(
+                bmc,
+                entries.id(),
+                WalkBudget::DEFAULT,
+                started,
+                position.as_ref(),
+                filter,
+            )
+            .await?;
+            if walk.filter_refused {
+                // Said once, on the poll that learned it: the read stops
+                // asking, and an operator can tell the fallback from a
+                // device that never advertised.
+                cursor.refuse_filter();
+                walk.issues.push(ProjectionIssue::invalid(
+                    FILTER_REFUSED_LOCATOR,
+                    "the device refused the $filter its service root advertises; this log is \
+                     read by $skip from now on",
+                ));
+            }
             let parts = assemble_logs(walk.records, walk.issues, scope)
                 .map_err(|error| internal_bug(&error))?;
             // The acquisition is now certain to ship; a walk that failed or
             // was cancelled before this point leaves the cursor where the
             // last shipped walk put it.
-            cursor.store(walk.position);
+            *position = walk.position;
             Ok(parts)
         })
         .await
     }
 }
 
+/// Whether the service's own clock, when it reports one, reads earlier than
+/// the cursor's stamp: the clock stepped back since the cursor's member was
+/// written, and entries written since may be stamped before it.
+fn clock_behind(service: &LogService, position: Option<&Position>) -> bool {
+    let (Some(now), Some(at)) = (
+        service.date_time.flatten(),
+        position.and_then(|position| position.at),
+    ) else {
+        return false;
+    };
+    crate::instant::timestamp(now).is_ok_and(|now| now < at)
+}
+
 /// Where the previous shipped walk of a log service ended: the newest
-/// `occurred_at` it emitted and every `entry_id` emitted at that instant.
+/// member it shipped, by `@odata.id`, with that member's stamp, plus how the
+/// collection listed its members and how many it held.
 ///
-/// The next walk, reading newest first, stops at the first record the
-/// cursor already covers, so a poll costs the new entries plus one member
-/// rather than the whole window, and a consumer stops seeing every record
-/// repeated each poll. Devices stamp to the second and a burst lands many
-/// records on one instant, which is why the instant alone cannot place a
-/// record and the ids emitted at that instant ride along.
+/// The next walk, reading newest first, stops at that member, so a poll
+/// costs the new entries plus one member rather than the whole window, and a
+/// consumer stops seeing every record repeated each poll. Position, not
+/// time, places a record: an entry stamped before the cursor's member is
+/// simply a newer member — a device whose clock stepped back, or an event
+/// from another clock, ships once and moves the cursor on — and an entry
+/// the device does not stamp is placed like any other. The cursor's member
+/// ends the walk whatever it answers: one that cannot be read this poll is
+/// reported and still stops the walk, rather than letting it overshoot into
+/// entries already shipped.
 ///
-/// The ids kept at one instant are bounded to four walks' worth. A device
-/// whose clock is frozen stamps every entry on one second, which would
-/// otherwise grow the cursor for the life of the process; past the bound
-/// only the latest walk's ids are kept, which is where a newest-first walk
-/// stops anyway. A device whose member order is not chronological may then
-/// re-ship a few same-second entries after an overflow.
+/// The stamp tells a refilled log apart from the same entry. A log cleared
+/// and refilled reuses its ids; meeting the cursor's id under another stamp
+/// means nothing present was shipped, so the cursor is discarded and the
+/// whole window ships once. A refill that lands the same id on the same
+/// second is invisible, which the second's resolution makes unavoidable. A
+/// cursor whose member has left the log — rotated out, or cleared without a
+/// refill reaching its id — is never met, and the window ships as new, which
+/// on an append-only log it is.
 ///
-/// Two things move the cursor backwards. A log that was wiped and refilled,
-/// or a device clock stepped back, makes the newest entry present *older*
-/// than the cursor; the walk then discards the cursor and emits the whole
-/// window. A wipe refilled within the cursor's own second under the same
-/// ids is invisible, which the second's resolution makes unavoidable.
+/// Entries that projected no record are never shipped and never anchor the
+/// cursor: a faulty entry is reported each time it is met.
 ///
-/// Records the cursor cannot place are emitted every poll: entries the
-/// device does not stamp, and entries that projected no record at all — a
-/// faulty entry is reported each time it is met, since it was never shipped.
+/// The order the collection lists members in is read off numbered ids and
+/// otherwise assumed oldest first. A wrong assumption shows itself in one of
+/// two ways: the log grows, yet the end taken for newest holds only the
+/// cursor's member; or the cursor's member is gone while the log did not
+/// grow, which on the true order takes a whole log's worth of new entries
+/// but on the wrong order takes one. Either way the walk reads the member at
+/// the other end, and only if it is stamped after the one taken for newest
+/// flips the order and walks again — once re-shipping what the first walk
+/// anchored behind. An insertion elsewhere in an oldest-first log fails that
+/// check and flips nothing. An order a probe established outranks the ids
+/// from then on.
+///
+/// Where the next walk starts depends on what the device offers. A device
+/// whose service root advertises `ProtocolFeaturesSupported.FilterQuery` is
+/// asked for the members stamped at or after the cursor's — `$filter` on
+/// `Created`, the cursor's own second included so its member anchors the
+/// walk — and an idle poll is one collection request and one member. The
+/// cursor's own test still decides what ships, so a device that advertises
+/// the filter and answers with everything costs pages, never duplicates; a
+/// device that refuses the filtered request is remembered as not filtering,
+/// and the poll that learned it says so once at [`FILTER_REFUSED_LOCATOR`].
+/// Support is learned once per read: a device that starts advertising later
+/// is asked again only when the read is recreated. A filtered answer places
+/// by stamp where the walk places by position: an entry written after the
+/// cursor's member but stamped before its second — a clock stepped back, an
+/// event stamped by another clock — is not in it. Two signs of that send a
+/// poll to the head instead. A service whose own `DateTime` reads earlier
+/// than the cursor's stamp has stepped back; and an honored filter answers
+/// the cursor's own member at least, so an empty answer means the log was
+/// cleared, refilled at earlier stamps, or the device answered nothing to a
+/// filter it did not parse. An entry stamped behind the cursor by a clock the
+/// service does not report stays out of view while the filter is honored. A
+/// filtered answer wider than the cursor's member yet walked to it first has
+/// the order checked as a head walk stalled on growth would, and one larger
+/// than the budget is entered at its tail with `$skip` as the collection
+/// would be.
+/// Otherwise the count the collection held when the position was stored is
+/// where an oldest-first paged log is entered: `$skip` to that index less
+/// one, the cursor's member if nothing rotated, so an idle poll reads the
+/// first page, the tail page, and one member whatever the log's size. A walk
+/// that does not meet the cursor's member there, or meets its id under
+/// another stamp, reads the collection from its head instead. Filtered
+/// polls leave that count as it was: their count is the filter's, and the
+/// index only matters once the filter stops being honored.
 ///
 /// One per [`Read`], shared by its clones; not persisted, so a restart
-/// replays one window, bounded by [`WalkBudget`].
+/// replays one window, bounded by [`WalkBudget`]. When the endpoint policy
+/// admits more than one poll at a time, a slow walk can overlap the next
+/// tick; the cursor is held for the whole load–walk–store, and the
+/// overlapping poll ships nothing rather than queue behind it.
 #[derive(Debug, Default)]
 pub struct LogCursor {
-    position: std::sync::Mutex<Option<Position>>,
+    position: futures_util::lock::Mutex<Option<Position>>,
+    /// Device knowledge rather than walk progress, so it has its own lock:
+    /// learned inside a walk, never held across one.
+    filter: std::sync::Mutex<FilterSupport>,
+}
+
+/// Whether the device honors `$filter` on its collections, as its service
+/// root advertises with `ProtocolFeaturesSupported.FilterQuery`. Learned once
+/// per read, on the first poll that has a stamp to filter by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FilterSupport {
+    #[default]
+    Unknown,
+    Advertised,
+    /// Not advertised, or advertised and then refused.
+    Absent,
+}
+
+impl LogCursor {
+    async fn filter_support<B>(&self, bmc: &B) -> Result<FilterSupport, AcquisitionFailure>
+    where
+        B: Bmc,
+        B::Error: ClassifyError,
+    {
+        let known = *self.filter.lock().expect("filter support poisoned");
+        if known != FilterSupport::Unknown {
+            return Ok(known);
+        }
+        let root = bmc
+            .get::<ServiceRoot>(&ODataId::service_root())
+            .await
+            .map_err(|error| error.classify())?;
+        let advertised = root
+            .protocol_features_supported
+            .as_ref()
+            .and_then(|features| features.filter_query)
+            .unwrap_or(false);
+        let support = if advertised {
+            FilterSupport::Advertised
+        } else {
+            FilterSupport::Absent
+        };
+        *self.filter.lock().expect("filter support poisoned") = support;
+        Ok(support)
+    }
+
+    fn refuse_filter(&self) {
+        *self.filter.lock().expect("filter support poisoned") = FilterSupport::Absent;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Position {
-    at: Timestamp,
-    ids: std::collections::BTreeSet<String>,
+    /// The newest member shipped.
+    member: ODataId,
+    /// Its `occurred_at`, if the device stamped it.
+    at: Option<Timestamp>,
+    /// How the collection listed its members when this position was taken.
+    order: Order,
+    /// That order was established by a probe, not read or assumed.
+    probed: bool,
+    /// Members the collection held then.
+    count: usize,
 }
 
-/// Where one record stands relative to a [`Position`].
+/// Where one member stands relative to a [`Position`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Placement {
-    /// After the position: not yet shipped.
+    /// Not the cursor's member: not yet shipped.
     Newer,
-    /// At or before the position: shipped by an earlier walk.
+    /// The cursor's member, as shipped.
     Covered,
-    /// Before the position's instant while being the newest entry present:
-    /// the log no longer holds what the position described.
-    Older,
+    /// The cursor's id under another stamp: the log was cleared and refilled.
+    Refilled,
 }
 
 impl Position {
-    fn place(&self, record: &LogRecord) -> Option<Placement> {
-        let at = record.occurred_at()?;
-        Some(match at.cmp(&self.at) {
-            std::cmp::Ordering::Greater => Placement::Newer,
-            std::cmp::Ordering::Less => Placement::Older,
-            std::cmp::Ordering::Equal => {
-                if record.entry_id().is_some_and(|id| self.ids.contains(id)) {
-                    Placement::Covered
-                } else {
-                    Placement::Newer
-                }
-            }
-        })
-    }
-
-    /// The position after shipping `records` on top of `previous`: the
-    /// newest instant among them, with the ids at that instant — merged
-    /// with the previous ids when the instant did not move, up to
-    /// `retained` ids.
-    fn after(previous: Option<&Self>, records: &[LogRecord], retained: usize) -> Option<Self> {
-        let at = records
-            .iter()
-            .filter_map(LogRecord::occurred_at)
-            .max()
-            .copied();
-        let Some(at) = at else {
-            return previous.cloned();
-        };
-        let ids = Self::ids_at(records, &at);
-        match previous {
-            Some(previous) if previous.at == at => {
-                let mut merged = previous.ids.clone();
-                merged.extend(ids.iter().cloned());
-                // Past the bound, keep this walk's ids alone: read newest
-                // first, they are what the next walk meets before any older
-                // shipped entry.
-                let ids = if merged.len() > retained { ids } else { merged };
-                Some(Self { at, ids })
-            }
-            Some(previous) if previous.at > at => Some(previous.clone()),
-            _ => Some(Self { at, ids }),
+    fn place(&self, member: &ODataId, record: Option<&LogRecord>) -> Placement {
+        if *member != self.member {
+            return Placement::Newer;
         }
-    }
-
-    /// The entry ids among `records` stamped exactly at `at`.
-    fn ids_at(records: &[LogRecord], at: &Timestamp) -> std::collections::BTreeSet<String> {
-        records
-            .iter()
-            .filter(|record| record.occurred_at() == Some(at))
-            .filter_map(|record| record.entry_id().map(str::to_owned))
-            .collect()
-    }
-}
-
-impl LogCursor {
-    fn load(&self) -> Option<Position> {
-        self.position.lock().expect("log cursor poisoned").clone()
-    }
-
-    fn store(&self, position: Option<Position>) {
-        *self.position.lock().expect("log cursor poisoned") = position;
+        if record.and_then(LogRecord::occurred_at) == self.at.as_ref() {
+            Placement::Covered
+        } else {
+            Placement::Refilled
+        }
     }
 }
 
@@ -739,23 +1162,254 @@ struct Walk {
     records: Vec<LogRecord>,
     issues: Vec<ProjectionIssue>,
     position: Option<Position>,
+    /// The device refused the `$filter` it advertised; the read stops asking.
+    filter_refused: bool,
+}
+
+/// One pass over the window, before its order is judged.
+struct Visit {
+    walk: Walk,
+    window: EntryWindow,
+    /// The first member visited was the cursor's: nothing new at the end
+    /// taken for newest.
+    stalled: bool,
+    reached_cursor: bool,
+    /// The cursor's id was met under another stamp: a refill, not a
+    /// question of order.
+    refilled: bool,
+    /// The stamp of the newest member that shipped.
+    newest_stamp: Option<Timestamp>,
+    /// The budget ended the walk before its members ran out.
+    stopped: Option<Stop>,
 }
 
 /// Visits the newest members, newest first, until the budget is spent or
-/// the cursor's position is reached, and projects each.
+/// the cursor's member is reached, and projects each. A walk that casts
+/// doubt on the collection's order has it checked at the other end and, if
+/// wrong, is walked again the right way round.
 async fn walk_entries<B>(
     bmc: &B,
     entries: &ODataId,
     budget: WalkBudget,
-    cursor: &LogCursor,
+    started: Instant,
+    previous: Option<&Position>,
+    filter: FilterSupport,
 ) -> Result<Walk, AcquisitionFailure>
 where
     B: Bmc,
     B::Error: ClassifyError,
 {
-    let started = Instant::now();
-    let window = collect_entries(bmc, entries, budget).await?;
-    let mut previous = cursor.load();
+    let preference = OrderChoice::Detect {
+        remembered: previous.map(|position| position.order),
+        probed: previous.is_some_and(|position| position.probed),
+    };
+    let mut visit = visit_entries(
+        bmc, entries, budget, started, previous, preference, true, filter,
+    )
+    .await?;
+    let filter_refused = visit.walk.filter_refused;
+    let unfiltered = FilterSupport::Absent;
+    // The jump presumed the cursor's member where the collection last held
+    // it. Not meeting it there — rotated on, or cleared and refilled past
+    // that index — means the members before the jump were not shipped after
+    // all, so the walk reads the collection from its head this once. A walk
+    // the budget stopped short is not that case: the head holds nothing the
+    // same budget would reach.
+    if visit.window.cursor_jump
+        && visit.stopped.is_none()
+        && (!visit.reached_cursor || visit.refilled)
+    {
+        visit = visit_entries(
+            bmc, entries, budget, started, previous, preference, false, unfiltered,
+        )
+        .await?;
+    }
+    if let Some(position) = previous {
+        let doubted = if visit.window.filtered {
+            // A filtered answer counts what matched, not what the collection
+            // holds, so growth cannot be read off it. What can is an answer
+            // wider than the cursor's member alone yet walked to the cursor
+            // first: on the right order the rest is older and shares the
+            // cursor's second, on the wrong one it is newer.
+            visit.stalled && visit.window.members_read() > 1
+        } else {
+            let total = visit.window.total;
+            let stalled_growth = visit.stalled && total > position.count;
+            let rotated =
+                !visit.reached_cursor && !visit.refilled && total > 0 && total == position.count;
+            stalled_growth || rotated
+        };
+        if doubted {
+            let reference = visit.newest_stamp.or(position.at);
+            if newer_at_other_end(bmc, &visit.window, reference).await? {
+                let forced = OrderChoice::Force(visit.window.order.flipped());
+                visit = visit_entries(
+                    bmc, entries, budget, started, previous, forced, false, unfiltered,
+                )
+                .await?;
+            }
+        }
+    }
+    visit.walk.filter_refused |= filter_refused;
+    Ok(visit.walk)
+}
+
+/// Whether the member at the end the walk did not treat as newest is
+/// stamped after `reference`. A member absent or without a stamp is no
+/// evidence; one the device refuses is reported like any member, and one
+/// that cannot be reached fails the poll like any member.
+async fn newer_at_other_end<B>(
+    bmc: &B,
+    window: &EntryWindow,
+    reference: Option<Timestamp>,
+) -> Result<bool, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    let (Some((index, member)), Some(reference)) = (window.other_end(), reference) else {
+        return Ok(false);
+    };
+    let entry = match member.get(bmc).await {
+        Ok(entry) => entry,
+        Err(error) => {
+            member_disposition(index, error.classify())?;
+            return Ok(false);
+        }
+    };
+    let parts = project_log_entry(&entry, &member.id().to_string())
+        .map_err(|error| internal_bug(&error))?;
+    Ok(parts
+        .log_records
+        .first()
+        .and_then(|record| record.occurred_at().copied())
+        .is_some_and(|stamp| stamp > reference))
+}
+
+/// The issue for members a walk left unread: pages the window never
+/// reached, members a tail jump skipped, or members the budget cut — unless
+/// the cursor was met, when everything before it had shipped already. Time
+/// running out is the story whatever the pages did; pages stopping short
+/// says more than a member budget that would have been spent on them anyway.
+fn truncation(
+    window: &EntryWindow,
+    visited: usize,
+    reached_cursor: bool,
+    stopped: Option<Stop>,
+) -> Option<ProjectionIssue> {
+    let truncated = window.incomplete.is_some()
+        || (!reached_cursor && (window.offset > 0 || visited < window.members_read()));
+    truncated.then(|| {
+        let reason = match (stopped, window.incomplete) {
+            (Some(Stop::Time), _) => Stop::Time.as_str(),
+            (_, Some(incomplete)) => incomplete,
+            _ => Stop::Members.as_str(),
+        };
+        ProjectionIssue::invalid(
+            TRUNCATED_WALK_LOCATOR,
+            format!(
+                "walk kept the newest {visited} of {} members: {reason}",
+                window.total
+            ),
+        )
+    })
+}
+
+/// The collection's first answer and how it was asked for.
+struct Opened {
+    first: Arc<EntryPage>,
+    start: Start,
+    /// The device refused the `$filter` its root advertises; `first` is the
+    /// head instead.
+    filter_refused: bool,
+}
+
+/// Opens the collection: its `$filter` page when the device advertises
+/// filtering and the cursor has a stamp to filter by, else its head. A
+/// refused filter is reported through [`Opened::filter_refused`] and the
+/// head read instead; an empty filtered answer is read from the head too,
+/// unreported; any other failure is the poll's.
+async fn open_collection<B>(
+    bmc: &B,
+    entries: &ODataId,
+    previous: Option<&Position>,
+    filter: FilterSupport,
+) -> Result<Opened, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    let head = |filter_refused: bool| async move {
+        let first = bmc
+            .get::<EntryPage>(entries)
+            .await
+            .map_err(|error| error.classify())?;
+        Ok(Opened {
+            first,
+            start: Start::Head,
+            filter_refused,
+        })
+    };
+    let since = match filter {
+        FilterSupport::Advertised => previous.and_then(|position| position.at),
+        FilterSupport::Unknown | FilterSupport::Absent => None,
+    };
+    let Some(since) = since else {
+        return head(false).await;
+    };
+    let id = filter_page_id(entries, since);
+    match bmc.get::<EntryPage>(&id).await {
+        // An honored filter answers the cursor's own member at least. An
+        // empty answer means that member is gone with nothing at or after
+        // its second — the log cleared, refilled at earlier stamps, or a
+        // device answering nothing to a filter it did not parse — and each
+        // of those is read from the head.
+        Ok(first) if first.members.is_empty() => head(false).await,
+        Ok(first) => Ok(Opened {
+            first,
+            start: Start::Filtered(id),
+            filter_refused: false,
+        }),
+        Err(error) => {
+            let failure = error.classify();
+            if !refused(&failure) {
+                return Err(failure);
+            }
+            head(true).await
+        }
+    }
+}
+
+/// One pass: open the window — with `$filter` when the device advertises it
+/// and the cursor has a stamp, else from the collection's head, jumping to
+/// the cursor's last known index when `jump_to_cursor` allows and the order
+/// is oldest first — and visit its members newest first.
+#[allow(clippy::too_many_arguments)]
+async fn visit_entries<B>(
+    bmc: &B,
+    entries: &ODataId,
+    budget: WalkBudget,
+    started: Instant,
+    previous: Option<&Position>,
+    preference: OrderChoice,
+    jump_to_cursor: bool,
+    filter: FilterSupport,
+) -> Result<Visit, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    let Opened {
+        first,
+        start,
+        filter_refused,
+    } = open_collection(bmc, entries, previous, filter).await?;
+    let cursor_index = previous
+        .filter(|_| jump_to_cursor && start == Start::Head)
+        .and_then(|position| position.count.checked_sub(1));
+    let window =
+        collect_entries(bmc, entries, budget, preference, cursor_index, first, start).await?;
+    let mut previous = previous;
     let mut records = Vec::new();
     // Issues are keyed by member so they read in collection order whatever
     // order the walk visited members in.
@@ -763,35 +1417,51 @@ where
     let mut visited = 0;
     let mut stopped = None;
     let mut reached_cursor = false;
-    let mut placed_newest = false;
-    for (index, member) in window.newest_first(budget) {
+    let mut stalled = false;
+    let mut refilled = false;
+    let mut newest_shipped: Option<(ODataId, Option<Timestamp>)> = None;
+    for (index, member) in window.newest_first() {
         if let Some(reason) = budget.exhausted(visited, started.elapsed()) {
             stopped = Some(reason);
             break;
         }
         visited += 1;
+        let is_cursor = previous.is_some_and(|position| position.member == *member.id());
         let entry = match member.get(bmc).await {
             Ok(entry) => entry,
             Err(error) => {
                 member_issues.push((index, member_disposition(index, error.classify())?));
+                if is_cursor {
+                    // The cursor's member, unreadable this poll: everything
+                    // past it was shipped, so the walk stops here as if it
+                    // had been read.
+                    reached_cursor = true;
+                    stalled = visited == 1;
+                    break;
+                }
                 continue;
             }
         };
         let location = member.id().to_string();
         let parts = project_log_entry(&entry, &location).map_err(|error| internal_bug(&error))?;
-        let placement = previous
-            .as_ref()
-            .zip(parts.log_records.first())
-            .and_then(|(position, record)| position.place(record));
-        match placement {
-            Some(Placement::Older) if !placed_newest => previous = None,
-            Some(Placement::Covered | Placement::Older) => {
+        match previous.map(|position| position.place(member.id(), parts.log_records.first())) {
+            Some(Placement::Covered) => {
                 reached_cursor = true;
+                stalled = visited == 1;
                 break;
+            }
+            Some(Placement::Refilled) => {
+                refilled = true;
+                previous = None;
             }
             Some(Placement::Newer) | None => {}
         }
-        placed_newest |= placement.is_some();
+        if newest_shipped.is_none() {
+            newest_shipped = parts
+                .log_records
+                .first()
+                .map(|record| (member.id().clone(), record.occurred_at().copied()));
+        }
         records.extend(parts.log_records);
         member_issues.extend(
             parts
@@ -803,22 +1473,57 @@ where
     member_issues.sort_by_key(|(index, _)| *index);
     let mut issues: Vec<ProjectionIssue> =
         member_issues.into_iter().map(|(_, issue)| issue).collect();
-    if !reached_cursor && visited < window.total {
-        issues.push(ProjectionIssue::invalid(
-            TRUNCATED_WALK_LOCATOR,
-            format!(
-                "walk kept the newest {visited} of {} members: {}",
-                window.total,
-                stopped.unwrap_or("member budget spent")
-            ),
-        ));
+    if let Some(issue) = truncation(&window, visited, reached_cursor, stopped) {
+        issues.push(issue);
     }
-    let position = Position::after(previous.as_ref(), &records, budget.retained_ids());
-    Ok(Walk {
-        records,
-        issues,
-        position,
+    let newest_stamp = newest_shipped.as_ref().and_then(|(_, at)| *at);
+    let position = Position::after(&window, previous, newest_shipped);
+    Ok(Visit {
+        walk: Walk {
+            records,
+            issues,
+            position,
+            filter_refused,
+        },
+        window,
+        stalled,
+        reached_cursor,
+        refilled,
+        newest_stamp,
+        stopped,
     })
+}
+
+impl Position {
+    /// The position after a walk over `window` that shipped `newest_shipped`
+    /// as its newest member, or nothing new on top of `previous`. A filtered
+    /// answer counts what matched, not what the collection holds, so the
+    /// collection's count stays what the last unfiltered walk saw.
+    fn after(
+        window: &EntryWindow,
+        previous: Option<&Self>,
+        newest_shipped: Option<(ODataId, Option<Timestamp>)>,
+    ) -> Option<Self> {
+        let count = match (window.filtered, previous) {
+            (true, Some(position)) => position.count,
+            _ => window.total,
+        };
+        match newest_shipped {
+            Some((member, at)) => Some(Self {
+                member,
+                at,
+                order: window.order,
+                probed: window.probed,
+                count,
+            }),
+            None => previous.map(|position| Self {
+                order: window.order,
+                probed: window.probed,
+                count,
+                ..position.clone()
+            }),
+        }
+    }
 }
 
 /// Cancels the whole acquisition, including initial GETs, when its deadline
@@ -1062,11 +1767,11 @@ mod tests {
         assert_eq!(budget.exhausted(2, Duration::from_secs(1)), None);
         assert_eq!(
             budget.exhausted(3, Duration::from_secs(1)),
-            Some("member budget spent")
+            Some(super::Stop::Members)
         );
         assert_eq!(
             budget.exhausted(0, Duration::from_secs(10)),
-            Some("time budget spent")
+            Some(super::Stop::Time)
         );
     }
 
@@ -1075,8 +1780,19 @@ mod tests {
     /// One page of a six-entry collection: members `range`, the device's
     /// count, and the link onward if any.
     fn page(range: std::ops::Range<usize>, count: usize, next: Option<&str>) -> String {
-        let members: Vec<String> = range
-            .map(|index| format!(r#"{{ "@odata.id": "{ENTRIES}/{index}" }}"#))
+        let ids: Vec<String> = range.map(|index| index.to_string()).collect();
+        page_of(
+            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            count,
+            next,
+        )
+    }
+
+    /// One page listing `ids` in that order.
+    fn page_of(ids: &[&str], count: usize, next: Option<&str>) -> String {
+        let members: Vec<String> = ids
+            .iter()
+            .map(|id| format!(r#"{{ "@odata.id": "{ENTRIES}/{id}" }}"#))
             .collect();
         let next = next.map_or_else(String::new, |link| {
             format!(r#", "Members@odata.nextLink": "{link}""#)
@@ -1095,12 +1811,16 @@ mod tests {
     }
 
     fn entry_at(index: usize, created: &str) -> (String, String) {
+        entry_named(&index.to_string(), created)
+    }
+
+    fn entry_named(id: &str, created: &str) -> (String, String) {
         (
-            format!("{ENTRIES}/{index}"),
+            format!("{ENTRIES}/{id}"),
             format!(
-                r##"{{ "@odata.id": "{ENTRIES}/{index}", "@odata.type": "#LogEntry.v1_21_0.LogEntry",
-                     "Id": "{index}", "Name": "Entry", "EntryType": "Event",
-                     "Created": "{created}", "Message": "m{index}" }}"##
+                r##"{{ "@odata.id": "{ENTRIES}/{id}", "@odata.type": "#LogEntry.v1_21_0.LogEntry",
+                     "Id": "{id}", "Name": "Entry", "EntryType": "Event",
+                     "Created": "{created}", "Message": "m{id}" }}"##
             ),
         )
     }
@@ -1137,22 +1857,57 @@ mod tests {
     /// One walk under `budget` from `cursor`, shipped: the position is stored
     /// as `acquire` stores it once the batch is certain. Returns the entry
     /// ids projected and the issues raised.
+    /// One walk of `cursor` under `budget`, its records' `entry_id`s in walk
+    /// order and its issues; the position is stored as `acquire` stores it.
+    async fn walk_shipping(
+        bmc: &MockBmc,
+        cursor: &super::LogCursor,
+        budget: WalkBudget,
+    ) -> (Vec<String>, Vec<nv_telemetry_source::ProjectionIssue>) {
+        walk_shipping_with(bmc, cursor, budget, super::FilterSupport::Absent).await
+    }
+
+    /// `walk_shipping` under the given `$filter` support, as `acquire` would
+    /// have learned it from the service root.
+    async fn walk_shipping_with(
+        bmc: &MockBmc,
+        cursor: &super::LogCursor,
+        budget: WalkBudget,
+        filter: super::FilterSupport,
+    ) -> (Vec<String>, Vec<nv_telemetry_source::ProjectionIssue>) {
+        let mut position = cursor.position.lock().await;
+        let walk = super::walk_entries(
+            bmc,
+            &ENTRIES.to_owned().into(),
+            budget,
+            std::time::Instant::now(),
+            position.as_ref(),
+            filter,
+        )
+        .await
+        .expect("the walk completes");
+        *position = walk.position;
+        let ids = walk
+            .records
+            .iter()
+            .filter_map(|record| record.entry_id().map(str::to_owned))
+            .collect();
+        (ids, walk.issues)
+    }
+
+    async fn position(cursor: &super::LogCursor) -> super::Position {
+        cursor.position.lock().await.clone().expect("a position")
+    }
+
     async fn walk_with(
         bmc: &MockBmc,
         cursor: &super::LogCursor,
         budget: WalkBudget,
     ) -> (Vec<usize>, Vec<nv_telemetry_source::ProjectionIssue>) {
-        let walk = super::walk_entries(bmc, &ENTRIES.to_owned().into(), budget, cursor)
-            .await
-            .expect("the walk completes");
-        cursor.store(walk.position);
-        let mut ids: Vec<usize> = walk
-            .records
-            .iter()
-            .filter_map(|record| record.entry_id()?.parse().ok())
-            .collect();
+        let (shipped, issues) = walk_shipping(bmc, cursor, budget).await;
+        let mut ids: Vec<usize> = shipped.iter().filter_map(|id| id.parse().ok()).collect();
         ids.sort_unstable();
-        (ids, walk.issues)
+        (ids, issues)
     }
 
     /// A first walk over a fresh mock and a fresh cursor.
@@ -1185,6 +1940,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overlapping_poll_ships_nothing_and_says_so() {
+        const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        let target = SERVICE.to_owned().into();
+        // A poll in flight holds the cursor for its whole load–walk–store. A
+        // poll that finds it held asks the device nothing — the strict mock
+        // would fail it — and reports the overlap instead.
+        let in_flight = cursor.position.lock().await;
+        let skipped = <LogKind as ReadKind>::acquire(&bmc, &target, SERVICE, &cursor)
+            .await
+            .expect("an overlapping poll is not a failure");
+        assert!(skipped.payloads().is_empty());
+        assert_eq!(skipped.issues().len(), 1);
+        assert_eq!(skipped.issues()[0].path(), super::IN_FLIGHT_WALK_LOCATOR);
+        drop(in_flight);
+
+        prime(
+            &bmc,
+            &[(
+                SERVICE.to_owned(),
+                include_str!("../tests/fixtures/logs/service.json").to_owned(),
+            )],
+        );
+        prime(&bmc, &whole_log(0..2));
+        <LogKind as ReadKind>::acquire(&bmc, &target, SERVICE, &cursor)
+            .await
+            .expect("the next poll walks");
+        assert!(
+            cursor.position.lock().await.is_some(),
+            "and stores where it ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cursor_member_still_ends_the_walk() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // The device refuses the cursor's own member this poll: it is
+        // reported, and the walk stops there rather than overshooting into
+        // the shipped entries behind it. The cursor moves forward, never back.
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..4, 4, None)), entry(3)]);
+        bmc.expect(nv_redfish_bmc_mock::Expect {
+            request: nv_redfish_bmc_mock::ExpectedRequest::Get {
+                id: format!("{ENTRIES}/2").into(),
+            },
+            response: Err(nv_redfish_bmc_mock::Error::NotSupported),
+        });
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [3]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path(), "Members[2]");
+        assert_eq!(
+            position(&cursor).await.member.to_string(),
+            format!("{ENTRIES}/3")
+        );
+    }
+
+    #[tokio::test]
     async fn only_entries_past_the_cursor_ship_and_the_cursor_follows_them() {
         let bmc = MockBmc::default();
         let cursor = super::LogCursor::default();
@@ -1202,7 +2019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_burst_within_the_cursors_second_is_told_apart_by_id() {
+    async fn a_burst_within_the_cursors_second_is_told_apart_by_member() {
         let same_second = "2026-03-01T10:00:02Z";
         let bmc = MockBmc::default();
         let cursor = super::LogCursor::default();
@@ -1210,8 +2027,9 @@ mod tests {
         prime(&bmc, &[entry_at(2, same_second), entry(1), entry(0)]);
         walk_with(&bmc, &cursor, generous()).await;
 
-        // Two more entries stamped on the cursor's own second: new ids at a
-        // known instant are new records; the known id ends the walk.
+        // Two more entries stamped on the cursor's own second: position, not
+        // time, places them, so they are new and the cursor's member ends
+        // the walk.
         prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None))]);
         prime(
             &bmc,
@@ -1223,64 +2041,47 @@ mod tests {
         );
         assert_eq!(walk_with(&bmc, &cursor, generous()).await.0, [3, 4]);
 
-        // The ids at that instant accumulate, so the burst is not re-shipped.
+        // The cursor moved to the newest of them, so the burst is not re-shipped.
         prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None))]);
         prime(&bmc, &[entry_at(4, same_second)]);
         assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
     }
 
     #[tokio::test]
-    async fn a_frozen_clock_does_not_grow_the_cursor_without_bound() {
-        // Two members per walk, so the cursor keeps at most eight ids at one
-        // instant. Every entry carries the same stamp, as from a device whose
-        // clock never advances.
-        let frozen = "2026-03-01T10:00:00Z";
-        let budget = WalkBudget::new(2, Duration::from_secs(10));
-        let bmc = MockBmc::default();
-        let cursor = super::LogCursor::default();
-        let retained = |cursor: &super::LogCursor| cursor.load().expect("a position").ids.len();
-
-        // Two new entries per poll: the ids accumulate up to the bound.
-        for end in [2, 4, 6, 8] {
-            prime(&bmc, &[(ENTRIES.to_owned(), page(0..end, end, None))]);
-            prime(
-                &bmc,
-                &[entry_at(end - 1, frozen), entry_at(end - 2, frozen)],
-            );
-            assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [end - 2, end - 1]);
-            assert_eq!(retained(&cursor), end);
-        }
-
-        // One more poll would exceed the bound, so only its own ids remain.
-        prime(&bmc, &[(ENTRIES.to_owned(), page(0..10, 10, None))]);
-        prime(&bmc, &[entry_at(9, frozen), entry_at(8, frozen)]);
-        assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [8, 9]);
-        assert_eq!(retained(&cursor), 2);
-
-        // Those ids are the newest shipped, so they still end the next walk.
-        prime(
-            &bmc,
-            &[
-                (ENTRIES.to_owned(), page(0..10, 10, None)),
-                entry_at(9, frozen),
-            ],
-        );
-        assert!(walk_with(&bmc, &cursor, budget).await.0.is_empty());
-        prime(&bmc, &[(ENTRIES.to_owned(), page(0..11, 11, None))]);
-        prime(&bmc, &[entry_at(10, frozen), entry_at(9, frozen)]);
-        assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [10]);
-    }
-
-    #[tokio::test]
-    async fn a_log_whose_newest_entry_predates_the_cursor_is_read_again() {
+    async fn an_entry_stamped_before_the_cursor_ships_once_and_moves_the_cursor_on() {
         let bmc = MockBmc::default();
         let cursor = super::LogCursor::default();
         prime(&bmc, &whole_log(0..3));
         walk_with(&bmc, &cursor, generous()).await;
 
-        // Wiped and refilled with older stamps, or the device clock stepped
-        // back: the newest entry is older than the cursor, so the cursor is
-        // discarded and the whole log ships.
+        // The device clock stepped back, or the event came from another
+        // clock: the new entry is simply the newest member. It ships once,
+        // the cursor moves to it, and the next poll ships nothing.
+        let earlier = "2026-03-01T09:00:00Z";
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..4, 4, None))]);
+        prime(&bmc, &[entry_at(3, earlier), entry(2)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [3]);
+        assert!(issues.is_empty());
+        prime(
+            &bmc,
+            &[
+                (ENTRIES.to_owned(), page(0..4, 4, None)),
+                entry_at(3, earlier),
+            ],
+        );
+        assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_log_whose_cursor_member_is_gone_is_read_again() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Wiped and refilled with fewer entries: the cursor's member is never
+        // met, so everything present is new and the whole log ships.
         prime(&bmc, &whole_log(0..2));
         let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
         assert_eq!(ids, [0, 1]);
@@ -1288,6 +2089,278 @@ mod tests {
 
         prime(&bmc, &[(ENTRIES.to_owned(), page(0..2, 2, None)), entry(1)]);
         assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_log_refilled_under_reused_ids_is_read_again() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Cleared and refilled to the same size: the cursor's id is back
+        // under a new stamp, which is a new entry, so nothing present was
+        // shipped and the whole log ships.
+        let later = |index: usize| entry_at(index, &format!("2026-03-01T11:00:{index:02}Z"));
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..3, 3, None))]);
+        prime(&bmc, &[later(2), later(1), later(0)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [0, 1, 2]);
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_newest_first_collection_is_read_from_its_head() {
+        // Ids fall along the page, so the head is the newest end: the walk
+        // starts there, and a paged log needs no `$skip` jump.
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["2", "1", "0"], 3, None))],
+        );
+        prime(&bmc, &[entry(2), entry(1), entry(0)]);
+        assert_eq!(walk_with(&bmc, &cursor, generous()).await.0, [0, 1, 2]);
+
+        prime(
+            &bmc,
+            &[(
+                ENTRIES.to_owned(),
+                page_of(&["4", "3", "2", "1", "0"], 5, None),
+            )],
+        );
+        prime(&bmc, &[entry(4), entry(3), entry(2)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [3, 4]);
+        assert!(issues.is_empty());
+
+        let budget = WalkBudget::new(2, Duration::from_secs(10));
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["6", "5"], 7, Some(&skip2)))],
+        );
+        prime(&bmc, &[entry(6), entry(5)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, budget).await;
+        assert_eq!(ids, [5, 6]);
+        assert_eq!(issues, [truncated(2, 7, super::PAGES_PAST_BUDGET)]);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_order_guess_is_caught_by_probing_the_other_end() {
+        // Ids without digits give no hint, so the first walk assumes oldest
+        // first on a device that lists newest first.
+        async fn shipped(bmc: &MockBmc, cursor: &super::LogCursor) -> Vec<String> {
+            walk_shipping(bmc, cursor, generous()).await.0
+        }
+        let stamp = |second: usize| format!("2026-03-01T10:00:{second:02}Z");
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["c", "b", "a"], 3, None))],
+        );
+        prime(
+            &bmc,
+            &[
+                entry_named("a", &stamp(0)),
+                entry_named("b", &stamp(1)),
+                entry_named("c", &stamp(2)),
+            ],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["a", "b", "c"]);
+        assert_eq!(position(&cursor).await.order, super::Order::OldestFirst);
+
+        // The log grew, yet the tail — taken for newest — holds only the
+        // cursor's member. The head is stamped after it, so the order flips
+        // and the walk runs again from the head, re-shipping once what the
+        // first walk anchored behind.
+        let grown = || page_of(&["d", "c", "b", "a"], 4, None);
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), grown()), entry_named("a", &stamp(0))],
+        );
+        prime(&bmc, &[entry_named("d", &stamp(3))]);
+        prime(&bmc, &[(ENTRIES.to_owned(), grown())]);
+        prime(
+            &bmc,
+            &[
+                entry_named("d", &stamp(3)),
+                entry_named("c", &stamp(2)),
+                entry_named("b", &stamp(1)),
+                entry_named("a", &stamp(0)),
+            ],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["d", "c", "b"]);
+        let after = position(&cursor).await;
+        assert_eq!(after.order, super::Order::NewestFirst);
+        assert!(after.probed, "a probed order outranks the ids from now on");
+        assert_eq!(after.member.to_string(), format!("{ENTRIES}/d"));
+
+        // Read the right way round from now on: the head is the cursor.
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), grown()), entry_named("d", &stamp(3))],
+        );
+        assert!(shipped(&bmc, &cursor).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_log_that_rotates_the_cursor_out_has_its_order_checked() {
+        // A newest-first device with a full, fixed-size log and no numbering:
+        // read as oldest first, the cursor anchors on the true oldest member,
+        // which one new entry rotates out. The log did not grow yet the
+        // cursor is gone, so the other end is checked and found newer.
+        async fn shipped(bmc: &MockBmc, cursor: &super::LogCursor) -> Vec<String> {
+            walk_shipping(bmc, cursor, generous()).await.0
+        }
+        let stamp = |second: usize| format!("2026-03-01T10:00:{second:02}Z");
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["c", "b", "a"], 3, None))],
+        );
+        prime(
+            &bmc,
+            &[
+                entry_named("a", &stamp(0)),
+                entry_named("b", &stamp(1)),
+                entry_named("c", &stamp(2)),
+            ],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["a", "b", "c"]);
+
+        let rotated = || page_of(&["d", "c", "b"], 3, None);
+        prime(&bmc, &[(ENTRIES.to_owned(), rotated())]);
+        prime(
+            &bmc,
+            &[
+                entry_named("b", &stamp(1)),
+                entry_named("c", &stamp(2)),
+                entry_named("d", &stamp(3)),
+            ],
+        );
+        prime(&bmc, &[entry_named("d", &stamp(3))]);
+        prime(&bmc, &[(ENTRIES.to_owned(), rotated())]);
+        prime(
+            &bmc,
+            &[
+                entry_named("d", &stamp(3)),
+                entry_named("c", &stamp(2)),
+                entry_named("b", &stamp(1)),
+            ],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["d", "c", "b"]);
+        assert_eq!(position(&cursor).await.order, super::Order::NewestFirst);
+
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["e", "d", "c"], 3, None))],
+        );
+        prime(
+            &bmc,
+            &[entry_named("e", &stamp(4)), entry_named("d", &stamp(3))],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["e"]);
+    }
+
+    #[tokio::test]
+    async fn a_head_only_window_keeps_reporting_what_it_cannot_reach() {
+        // A device that ignores `$skip` shows the walk only its first pages.
+        // Once the cursor sits inside them, every poll meets it at once, and
+        // must still say the newest entries lie beyond the window.
+        let budget = WalkBudget::new(3, Duration::from_secs(10));
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip3 = format!("{ENTRIES}?$skip=3");
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        let skip5 = format!("{ENTRIES}?$skip=5");
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        // The first poll jumps for the budget (`$skip=3`); the second for the
+        // cursor's last index (`$skip=5`). The device answers both with its
+        // first page.
+        let head_only = |bmc: &MockBmc, ignored_skip: &str| {
+            prime(
+                bmc,
+                &[
+                    (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
+                    (ignored_skip.to_owned(), page(0..2, 6, Some(&skip2))),
+                    (skip2.clone(), page(2..4, 6, Some(&skip4))),
+                ],
+            );
+        };
+        head_only(&bmc, &skip3);
+        prime(&bmc, &[entry(3), entry(2), entry(1)]);
+        assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [1, 2, 3]);
+
+        head_only(&bmc, &skip5);
+        prime(&bmc, &[entry(3)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, budget).await;
+        assert!(ids.is_empty());
+        assert_eq!(
+            issues,
+            [truncated(1, 6, super::PAGES_PAST_BUDGET_FROM_START)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_count_is_not_a_truncation_once_the_cursor_is_met() {
+        // The device reports six members but its tail holds fewer: the walk
+        // meets the cursor in the tail, so nothing unread lies before it.
+        let budget = WalkBudget::new(3, Duration::from_secs(10));
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..5));
+        walk_with(&bmc, &cursor, generous()).await;
+
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        // The cursor was stored with five members, so the walk asks for
+        // index four, which the device serves as its last member.
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        prime(
+            &bmc,
+            &[
+                (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
+                (skip4, page(4..5, 6, None)),
+                entry(4),
+                // The count grew while the tail showed nothing new, so the
+                // head is probed and found older: the order stands.
+                entry(0),
+            ],
+        );
+        let (ids, issues) = walk_with(&bmc, &cursor, budget).await;
+        assert!(ids.is_empty());
+        assert!(issues.is_empty());
+    }
+    #[tokio::test]
+    async fn an_insertion_below_the_newest_end_does_not_flip_the_order() {
+        // An oldest-first log that grew, yet whose tail is still the cursor's
+        // member: the head is older than the cursor, so the order stands and
+        // nothing is re-shipped.
+        async fn shipped(bmc: &MockBmc, cursor: &super::LogCursor) -> Vec<String> {
+            walk_shipping(bmc, cursor, generous()).await.0
+        }
+        let stamp = |second: usize| format!("2026-03-01T10:00:{second:02}Z");
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &[(ENTRIES.to_owned(), page_of(&["a", "b"], 2, None))]);
+        prime(
+            &bmc,
+            &[entry_named("b", &stamp(1)), entry_named("a", &stamp(0))],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["b", "a"]);
+
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["a", "x", "b"], 3, None))],
+        );
+        prime(
+            &bmc,
+            &[entry_named("b", &stamp(1)), entry_named("a", &stamp(0))],
+        );
+        assert!(shipped(&bmc, &cursor).await.is_empty());
+        assert_eq!(position(&cursor).await.order, super::Order::OldestFirst);
     }
 
     #[tokio::test]
@@ -1313,6 +2386,596 @@ mod tests {
         assert!(ids.is_empty());
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].path(), "Members[1].LogEntry.Message");
+    }
+
+    /// A paged log of `ids`, `per_page` members a page, as its pages answer
+    /// from the head: the first page under `ENTRIES`, the rest under `$skip`.
+    fn paged_log(ids: &[&str], per_page: usize) -> Vec<(String, String)> {
+        let count = ids.len();
+        let skip_uri = |skip: usize| format!("{ENTRIES}?$skip={skip}");
+        (0..count)
+            .step_by(per_page)
+            .map(|start| {
+                let end = (start + per_page).min(count);
+                let next = (end < count).then(|| skip_uri(end));
+                let uri = if start == 0 {
+                    ENTRIES.to_owned()
+                } else {
+                    skip_uri(start)
+                };
+                (uri, page_of(&ids[start..end], count, next.as_deref()))
+            })
+            .collect()
+    }
+
+    /// The tail of a paged log from index `skip`, as the device answers
+    /// `$skip` with `per_page` members a page.
+    fn tail_pages(ids: &[&str], per_page: usize, skip: usize) -> Vec<(String, String)> {
+        let count = ids.len();
+        (skip..count)
+            .step_by(per_page)
+            .map(|start| {
+                let end = (start + per_page).min(count);
+                let next = (end < count).then(|| format!("{ENTRIES}?$skip={end}"));
+                (
+                    format!("{ENTRIES}?$skip={start}"),
+                    page_of(&ids[start..end], count, next.as_deref()),
+                )
+            })
+            .collect()
+    }
+
+    const SIX: [&str; 6] = ["0", "1", "2", "3", "4", "5"];
+
+    #[tokio::test]
+    async fn an_idle_poll_of_a_paged_log_reads_its_tail_page_and_one_member() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &paged_log(&SIX, 2));
+        prime(&bmc, &(0..6).rev().map(entry).collect::<Vec<_>>());
+        assert_eq!(
+            walk_with(&bmc, &cursor, generous()).await.0,
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(position(&cursor).await.count, 6);
+
+        // The first page says six members; the jump lands on the cursor's
+        // member at index five; nothing else is asked for.
+        prime(&bmc, &paged_log(&SIX, 2)[..1]);
+        prime(&bmc, &tail_pages(&SIX, 2, 5));
+        prime(&bmc, &[entry(5)]);
+        let (shipped, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert!(shipped.is_empty());
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_poll_after_growth_reads_only_the_pages_past_the_cursor() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &paged_log(&SIX, 2));
+        prime(&bmc, &(0..6).rev().map(entry).collect::<Vec<_>>());
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Two more entries: the jump to index five reads the cursor's page
+        // and the page after it, never the four pages before.
+        let eight = ["0", "1", "2", "3", "4", "5", "6", "7"];
+        prime(&bmc, &paged_log(&eight, 2)[..1]);
+        prime(&bmc, &tail_pages(&eight, 2, 5));
+        prime(&bmc, &[entry(7), entry(6), entry(5)]);
+        let (shipped, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(shipped, [6, 7]);
+        assert!(issues.is_empty());
+        assert_eq!(position(&cursor).await.count, 8);
+    }
+
+    #[tokio::test]
+    async fn a_rotated_log_is_read_from_its_head_when_the_jump_misses_the_cursor() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &paged_log(&SIX, 2));
+        prime(&bmc, &(0..6).rev().map(entry).collect::<Vec<_>>());
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Four entries rotated in and four out: the count is unchanged, but
+        // index five now holds entry 9, not the cursor's 5. The jump misses,
+        // so the walk starts over from the head and stops at 5 where it is.
+        let rotated = ["4", "5", "6", "7", "8", "9"];
+        prime(&bmc, &paged_log(&rotated, 2)[..1]);
+        prime(&bmc, &tail_pages(&rotated, 2, 5));
+        prime(&bmc, &[entry(9)]);
+        prime(&bmc, &paged_log(&rotated, 2));
+        prime(&bmc, &[entry(9), entry(8), entry(7), entry(6), entry(5)]);
+        let (shipped, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(shipped, [6, 7, 8, 9]);
+        assert!(issues.is_empty());
+        assert_eq!(
+            position(&cursor).await.member.to_string(),
+            format!("{ENTRIES}/9")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refill_past_the_cursors_index_is_read_from_its_head() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &paged_log(&SIX, 2));
+        prime(&bmc, &(0..6).rev().map(entry).collect::<Vec<_>>());
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Cleared and refilled with eight entries under the same ids and
+        // later stamps: the jump finds id 5 under another stamp, which says
+        // nothing before it was shipped either, so the walk reads the head.
+        let eight = ["0", "1", "2", "3", "4", "5", "6", "7"];
+        let refilled = |index: usize| entry_at(index, &format!("2026-03-01T11:00:{index:02}Z"));
+        prime(&bmc, &paged_log(&eight, 2)[..1]);
+        prime(&bmc, &tail_pages(&eight, 2, 5));
+        prime(&bmc, &[refilled(7), refilled(6), refilled(5)]);
+        prime(&bmc, &paged_log(&eight, 2));
+        prime(&bmc, &(0..8).rev().map(refilled).collect::<Vec<_>>());
+        let (shipped, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(shipped, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(issues.is_empty());
+        assert_eq!(position(&cursor).await.count, 8);
+    }
+
+    fn filtered_uri(since: &str) -> String {
+        format!("{ENTRIES}?$filter=Created ge '{since}'")
+    }
+
+    async fn walk_filtered(
+        bmc: &MockBmc,
+        cursor: &super::LogCursor,
+    ) -> (Vec<usize>, Vec<nv_telemetry_source::ProjectionIssue>) {
+        let (shipped, issues) =
+            walk_shipping_with(bmc, cursor, generous(), super::FilterSupport::Advertised).await;
+        let mut ids: Vec<usize> = shipped.iter().filter_map(|id| id.parse().ok()).collect();
+        ids.sort_unstable();
+        (ids, issues)
+    }
+
+    #[tokio::test]
+    async fn a_filtering_device_is_asked_only_for_what_came_after_the_cursor() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        // No stamp to filter by yet: the first walk reads the head.
+        prime(&bmc, &whole_log(0..3));
+        assert_eq!(walk_filtered(&bmc, &cursor).await.0, [0, 1, 2]);
+
+        // Idle: one request for the cursor's second onward, one member.
+        prime(
+            &bmc,
+            &[
+                (
+                    filtered_uri("2026-03-01T10:00:02Z"),
+                    page_of(&["2"], 1, None),
+                ),
+                entry(2),
+            ],
+        );
+        let (ids, issues) = walk_filtered(&bmc, &cursor).await;
+        assert!(ids.is_empty());
+        assert!(issues.is_empty());
+        assert_eq!(
+            position(&cursor).await.count,
+            3,
+            "a filter's count is not the collection's"
+        );
+
+        // Growth: the answer runs from the cursor's second; the two new
+        // entries ship and the cursor follows.
+        prime(
+            &bmc,
+            &[(
+                filtered_uri("2026-03-01T10:00:02Z"),
+                page_of(&["2", "3", "4"], 3, None),
+            )],
+        );
+        prime(&bmc, &[entry(4), entry(3), entry(2)]);
+        let (ids, issues) = walk_filtered(&bmc, &cursor).await;
+        assert_eq!(ids, [3, 4]);
+        assert!(issues.is_empty());
+        assert_eq!(position(&cursor).await.count, 3);
+
+        prime(
+            &bmc,
+            &[
+                (
+                    filtered_uri("2026-03-01T10:00:04Z"),
+                    page_of(&["4"], 1, None),
+                ),
+                entry(4),
+            ],
+        );
+        assert!(walk_filtered(&bmc, &cursor).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_filtered_answer_without_the_cursors_member_ships_all_of_it() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_filtered(&bmc, &cursor).await;
+
+        // The cursor's member rotated out; everything the filter returns is
+        // newer, and an answer walked to its end is not a truncation.
+        prime(
+            &bmc,
+            &[(
+                filtered_uri("2026-03-01T10:00:02Z"),
+                page_of(&["5", "6"], 2, None),
+            )],
+        );
+        prime(&bmc, &[entry(6), entry(5)]);
+        let (ids, issues) = walk_filtered(&bmc, &cursor).await;
+        assert_eq!(ids, [5, 6]);
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_filtered_answer_is_read_from_the_head() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_filtered(&bmc, &cursor).await;
+
+        // Cleared and refilled with entries stamped before the cursor's
+        // second: the filter answers nothing, which an honored filter never
+        // does while the cursor's member is present, so the head is read
+        // and the refill ships.
+        prime(
+            &bmc,
+            &[(filtered_uri("2026-03-01T10:00:02Z"), page_of(&[], 0, None))],
+        );
+        prime(&bmc, &whole_log(0..2));
+        let (ids, issues) = walk_filtered(&bmc, &cursor).await;
+        assert_eq!(ids, [0, 1]);
+        assert!(issues.is_empty());
+        assert_eq!(
+            position(&cursor).await.member.to_string(),
+            format!("{ENTRIES}/1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filtered_walk_that_stalls_on_a_wider_answer_has_its_order_checked() {
+        // Ids without digits give no hint, so the walk assumes oldest first
+        // on a device that lists newest first, and the cursor anchors on the
+        // true oldest member.
+        async fn shipped(bmc: &MockBmc, cursor: &super::LogCursor) -> Vec<String> {
+            walk_shipping_with(bmc, cursor, generous(), super::FilterSupport::Advertised)
+                .await
+                .0
+        }
+        let stamp = |second: usize| format!("2026-03-01T10:00:{second:02}Z");
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(
+            &bmc,
+            &[(ENTRIES.to_owned(), page_of(&["c", "b", "a"], 3, None))],
+        );
+        prime(
+            &bmc,
+            &[
+                entry_named("a", &stamp(0)),
+                entry_named("b", &stamp(1)),
+                entry_named("c", &stamp(2)),
+            ],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["a", "b", "c"]);
+
+        // The filter from the cursor's second answers the whole log, walked
+        // to the cursor first. The answer holds more than the cursor's
+        // member, so the other end is checked, found newer, and the walk
+        // runs again from the head the right way round.
+        let grown = || page_of(&["d", "c", "b", "a"], 4, None);
+        prime(
+            &bmc,
+            &[
+                (filtered_uri(&stamp(0)), grown()),
+                entry_named("a", &stamp(0)),
+            ],
+        );
+        prime(&bmc, &[entry_named("d", &stamp(3))]);
+        prime(&bmc, &[(ENTRIES.to_owned(), grown())]);
+        prime(
+            &bmc,
+            &[
+                entry_named("d", &stamp(3)),
+                entry_named("c", &stamp(2)),
+                entry_named("b", &stamp(1)),
+                entry_named("a", &stamp(0)),
+            ],
+        );
+        assert_eq!(shipped(&bmc, &cursor).await, ["d", "c", "b"]);
+        let after = position(&cursor).await;
+        assert_eq!(after.order, super::Order::NewestFirst);
+        assert!(after.probed);
+
+        // An idle filtered poll answers the cursor's member alone: nothing
+        // to doubt.
+        prime(
+            &bmc,
+            &[
+                (filtered_uri(&stamp(3)), page_of(&["d"], 1, None)),
+                entry_named("d", &stamp(3)),
+            ],
+        );
+        assert!(shipped(&bmc, &cursor).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_filtered_backlog_larger_than_the_budget_is_read_from_its_tail() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..2));
+        walk_filtered(&bmc, &cursor).await;
+
+        // Eight matches under a budget of three: the walk jumps to `$skip=5`
+        // on the filtered request and never reads the pages between.
+        let filtered = filtered_uri("2026-03-01T10:00:01Z");
+        let filtered_skip2 = format!("{filtered}&$skip=2");
+        let filtered_skip5 = format!("{filtered}&$skip=5");
+        prime(
+            &bmc,
+            &[
+                (
+                    filtered.clone(),
+                    page_of(&["1", "2"], 8, Some(&filtered_skip2)),
+                ),
+                (filtered_skip5, page_of(&["6", "7", "8"], 8, None)),
+            ],
+        );
+        prime(&bmc, &[entry(8), entry(7), entry(6)]);
+        let budget = WalkBudget::new(3, Duration::from_secs(10));
+        let (shipped, issues) =
+            walk_shipping_with(&bmc, &cursor, budget, super::FilterSupport::Advertised).await;
+        assert_eq!(shipped, ["8", "7", "6"]);
+        assert_eq!(issues, [truncated(3, 8, "member budget spent")]);
+        let after = position(&cursor).await;
+        assert_eq!(after.member.to_string(), format!("{ENTRIES}/8"));
+        assert_eq!(after.count, 2, "a filter's count is not the collection's");
+    }
+
+    fn service_root(filters: bool) -> String {
+        let features = if filters {
+            r#", "ProtocolFeaturesSupported": { "FilterQuery": true }"#
+        } else {
+            ""
+        };
+        format!(
+            r##"{{ "@odata.id": "/redfish/v1", "@odata.type": "#ServiceRoot.v1_10_0.ServiceRoot",
+                 "Id": "RootService", "Name": "Root Service", "RedfishVersion": "1.10.0",
+                 "Links": {{ "Sessions": {{ "@odata.id": "/redfish/v1/SessionService/Sessions" }} }}{features} }}"##
+        )
+    }
+
+    /// One `LogKind::acquire` of the corpus service over `bmc`.
+    async fn acquire_parts(
+        bmc: &MockBmc,
+        cursor: &super::LogCursor,
+    ) -> nv_telemetry_source::AcquisitionParts {
+        const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
+        <LogKind as ReadKind>::acquire(bmc, &SERVICE.to_owned().into(), SERVICE, cursor)
+            .await
+            .expect("the poll completes")
+    }
+
+    /// `acquire_parts`, as how many payloads shipped.
+    async fn acquire_service(bmc: &MockBmc, cursor: &super::LogCursor) -> usize {
+        acquire_parts(bmc, cursor).await.payloads().len()
+    }
+
+    /// The corpus service, its clock reading `clock`.
+    fn service_with_clock(clock: &str) -> String {
+        format!(
+            r##"{{ "@odata.id": "/redfish/v1/Systems/1/LogServices/SEL", "@odata.type": "#LogService.v1_8_0.LogService",
+                 "Id": "SEL", "Name": "System Event Log", "LogEntryType": "SEL", "DateTime": "{clock}",
+                 "Entries": {{ "@odata.id": "{ENTRIES}" }} }}"##
+        )
+    }
+
+    #[tokio::test]
+    async fn filter_support_is_read_off_the_root_once_there_is_a_stamp_to_filter_by() {
+        const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
+        let service = include_str!("../tests/fixtures/logs/service.json").to_owned();
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        // The first poll never asks: nothing to filter by.
+        prime(&bmc, &[(SERVICE.to_owned(), service.clone())]);
+        prime(&bmc, &whole_log(0..2));
+        assert_eq!(acquire_service(&bmc, &cursor).await, 1);
+
+        // The second asks the root once and, told yes, filters from then on.
+        prime(
+            &bmc,
+            &[
+                ("/redfish/v1".to_owned(), service_root(true)),
+                (SERVICE.to_owned(), service.clone()),
+                (
+                    filtered_uri("2026-03-01T10:00:01Z"),
+                    page_of(&["1"], 1, None),
+                ),
+                entry(1),
+            ],
+        );
+        assert_eq!(acquire_service(&bmc, &cursor).await, 0);
+        prime(
+            &bmc,
+            &[
+                (SERVICE.to_owned(), service),
+                (
+                    filtered_uri("2026-03-01T10:00:01Z"),
+                    page_of(&["1"], 1, None),
+                ),
+                entry(1),
+            ],
+        );
+        assert_eq!(acquire_service(&bmc, &cursor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_root_that_does_not_advertise_filtering_keeps_the_head_walk() {
+        const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
+        let service = include_str!("../tests/fixtures/logs/service.json").to_owned();
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &[(SERVICE.to_owned(), service.clone())]);
+        prime(&bmc, &whole_log(0..2));
+        acquire_service(&bmc, &cursor).await;
+
+        prime(
+            &bmc,
+            &[
+                ("/redfish/v1".to_owned(), service_root(false)),
+                (SERVICE.to_owned(), service),
+                (ENTRIES.to_owned(), page(0..2, 2, None)),
+                entry(1),
+            ],
+        );
+        assert_eq!(acquire_service(&bmc, &cursor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_filter_is_said_once_and_not_asked_again() {
+        const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
+        let service = include_str!("../tests/fixtures/logs/service.json").to_owned();
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &[(SERVICE.to_owned(), service.clone())]);
+        prime(&bmc, &whole_log(0..2));
+        acquire_service(&bmc, &cursor).await;
+
+        // The root advertises filtering and the collection refuses it: the
+        // head is read this poll, and the refusal is the poll's one issue.
+        prime(
+            &bmc,
+            &[
+                ("/redfish/v1".to_owned(), service_root(true)),
+                (SERVICE.to_owned(), service.clone()),
+            ],
+        );
+        bmc.expect(nv_redfish_bmc_mock::Expect {
+            request: nv_redfish_bmc_mock::ExpectedRequest::Get {
+                id: filtered_uri("2026-03-01T10:00:01Z").into(),
+            },
+            response: Err(nv_redfish_bmc_mock::Error::NotSupported),
+        });
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..2, 2, None)), entry(1)]);
+        let parts = acquire_parts(&bmc, &cursor).await;
+        assert!(parts.payloads().is_empty());
+        assert_eq!(
+            parts.issues(),
+            [nv_telemetry_source::ProjectionIssue::invalid(
+                super::FILTER_REFUSED_LOCATOR,
+                "the device refused the $filter its service root advertises; this log is read \
+                 by $skip from now on",
+            )]
+        );
+
+        // From then on the head is read without asking the root or the
+        // collection's filter again, and nothing more is said.
+        prime(
+            &bmc,
+            &[
+                (SERVICE.to_owned(), service),
+                (ENTRIES.to_owned(), page(0..2, 2, None)),
+                entry(1),
+            ],
+        );
+        let parts = acquire_parts(&bmc, &cursor).await;
+        assert!(parts.payloads().is_empty());
+        assert!(parts.issues().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_service_whose_clock_stepped_back_is_walked_from_its_head_that_poll() {
+        const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(
+            &bmc,
+            &[(
+                SERVICE.to_owned(),
+                service_with_clock("2026-03-01T10:00:05Z"),
+            )],
+        );
+        prime(&bmc, &whole_log(0..2));
+        acquire_service(&bmc, &cursor).await;
+
+        // The service's clock now reads before the cursor's stamp, so an
+        // entry written since may be stamped before it, which the filter
+        // would hide: the head is walked, and the entry ships.
+        prime(
+            &bmc,
+            &[
+                ("/redfish/v1".to_owned(), service_root(true)),
+                (
+                    SERVICE.to_owned(),
+                    service_with_clock("2026-03-01T09:59:00Z"),
+                ),
+                (ENTRIES.to_owned(), page(0..3, 3, None)),
+                entry_at(2, "2026-03-01T09:59:30Z"),
+                entry(1),
+            ],
+        );
+        assert_eq!(acquire_service(&bmc, &cursor).await, 1);
+
+        // The clock ahead of the cursor again, the filter resumes from the
+        // cursor's stepped-back stamp.
+        prime(
+            &bmc,
+            &[
+                (
+                    SERVICE.to_owned(),
+                    service_with_clock("2026-03-01T10:01:00Z"),
+                ),
+                (
+                    filtered_uri("2026-03-01T09:59:30Z"),
+                    page_of(&["2"], 1, None),
+                ),
+                entry_at(2, "2026-03-01T09:59:30Z"),
+            ],
+        );
+        assert_eq!(acquire_service(&bmc, &cursor).await, 0);
+    }
+
+    #[test]
+    fn a_refusal_is_a_status_the_device_chose() {
+        let status = |class, retryable| AcquisitionFailure::new(class).with_retryable(retryable);
+        assert!(super::refused(&status(
+            AcquisitionFailureClass::Unsupported,
+            false
+        )));
+        assert!(super::refused(&status(
+            AcquisitionFailureClass::Protocol,
+            false
+        )));
+        assert!(!super::refused(&status(
+            AcquisitionFailureClass::Protocol,
+            true
+        )));
+        assert!(!super::refused(&status(
+            AcquisitionFailureClass::Device,
+            false
+        )));
+        assert!(!super::refused(&status(
+            AcquisitionFailureClass::Connectivity,
+            true
+        )));
+    }
+
+    #[test]
+    fn the_filter_names_the_cursors_second_in_utc() {
+        let at = nv_telemetry_model::Timestamp::new(1_772_359_205, 7).expect("a valid instant");
+        assert_eq!(
+            super::filter_page_id(&"/x/Entries".to_owned().into(), at).to_string(),
+            "/x/Entries?$filter=Created ge '2026-03-01T10:00:05Z'"
+        );
+        assert_eq!(
+            super::filter_page_id(&"/x/Entries?$top=5".to_owned().into(), at).to_string(),
+            "/x/Entries?$top=5&$filter=Created ge '2026-03-01T10:00:05Z'"
+        );
     }
 
     #[tokio::test]
@@ -1380,7 +3043,8 @@ mod tests {
     #[tokio::test]
     async fn a_device_that_ignores_skip_is_read_from_the_start() {
         // The `$skip` answer is the first page again, so the walk follows
-        // the pages from the start and still keeps the newest three.
+        // the pages from the start, stops once a budget's worth is read, and
+        // says the members it kept are the collection's first.
         let skip2 = format!("{ENTRIES}?$skip=2");
         let skip3 = format!("{ENTRIES}?$skip=3");
         let skip4 = format!("{ENTRIES}?$skip=4");
@@ -1388,12 +3052,90 @@ mod tests {
             (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
             (skip3, page(0..2, 6, Some(&skip2))),
             (skip2, page(2..4, 6, Some(&skip4))),
-            (skip4, page(4..6, 6, None)),
         ];
-        answers.extend((3..6).rev().map(entry));
+        answers.extend((1..4).rev().map(entry));
         let (ids, issues) = walk(&answers, WalkBudget::new(3, Duration::from_secs(10))).await;
-        assert_eq!(ids, [3, 4, 5]);
-        assert_eq!(issues, [truncated(3, 6, "member budget spent")]);
+        assert_eq!(ids, [1, 2, 3]);
+        assert_eq!(
+            issues,
+            [truncated(3, 6, super::PAGES_PAST_BUDGET_FROM_START)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_that_refuses_skip_is_read_from_the_start() {
+        // `$skip` answered with a status the device chose: not this poll's
+        // failure, but a device without `$skip`, read from its first page.
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        let bmc = MockBmc::default();
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..2, 6, Some(&skip2)))]);
+        bmc.expect(nv_redfish_bmc_mock::Expect {
+            request: nv_redfish_bmc_mock::ExpectedRequest::Get {
+                id: format!("{ENTRIES}?$skip=3").into(),
+            },
+            response: Err(nv_redfish_bmc_mock::Error::NotSupported),
+        });
+        prime(&bmc, &[(skip2, page(2..4, 6, Some(&skip4)))]);
+        prime(&bmc, &[entry(3), entry(2), entry(1)]);
+        let budget = WalkBudget::new(3, Duration::from_secs(10));
+        let (ids, issues) = walk_with(&bmc, &super::LogCursor::default(), budget).await;
+        assert_eq!(ids, [1, 2, 3]);
+        assert_eq!(
+            issues,
+            [truncated(3, 6, super::PAGES_PAST_BUDGET_FROM_START)]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_skip_tail_is_not_honored() {
+        // The device reports six members but serves fewer, so the tail is
+        // empty: the walk follows the pages from the start instead of
+        // treating the empty page as the whole window.
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip3 = format!("{ENTRIES}?$skip=3");
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        let mut answers = vec![
+            (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
+            (skip3, page(3..3, 6, None)),
+            (skip2, page(2..4, 6, Some(&skip4))),
+        ];
+        answers.extend((1..4).rev().map(entry));
+        let (ids, issues) = walk(&answers, WalkBudget::new(3, Duration::from_secs(10))).await;
+        assert_eq!(ids, [1, 2, 3]);
+        assert_eq!(
+            issues,
+            [truncated(3, 6, super::PAGES_PAST_BUDGET_FROM_START)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_next_link_is_followed() {
+        let mut answers = vec![
+            (ENTRIES.to_owned(), page(0..3, 5, Some("Entries?$skip=3"))),
+            (format!("{ENTRIES}?$skip=3"), page(3..5, 5, None)),
+        ];
+        answers.extend((0..5).rev().map(entry));
+        let (ids, issues) = walk(&answers, WalkBudget::new(10, Duration::from_secs(10))).await;
+        assert_eq!(ids, [0, 1, 2, 3, 4]);
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_next_link_is_reported_even_without_a_count() {
+        // No `Members@odata.count` and a nextLink naming only a host: the
+        // pages stop after the first, and the walk says so rather than
+        // passing the first page off as the whole log.
+        let first = format!(
+            r##"{{ "@odata.id": "{ENTRIES}", "@odata.type": "#LogEntryCollection.LogEntryCollection",
+                 "Name": "Entries",
+                 "Members": [{{ "@odata.id": "{ENTRIES}/0" }}, {{ "@odata.id": "{ENTRIES}/1" }}],
+                 "Members@odata.nextLink": "https://bmc.example" }}"##
+        );
+        let answers = vec![(ENTRIES.to_owned(), first), entry(1), entry(0)];
+        let (ids, issues) = walk(&answers, generous()).await;
+        assert_eq!(ids, [0, 1]);
+        assert_eq!(issues, [truncated(2, 2, super::NEXT_LINK_UNRESOLVED)]);
     }
 
     #[tokio::test]
@@ -1406,7 +3148,8 @@ mod tests {
 
     #[test]
     fn a_next_link_is_the_path_the_transport_resolves() {
-        let id = |link: &str| super::next_page_id(link).map(|id| id.to_string());
+        let entries = ENTRIES.to_owned().into();
+        let id = |link: &str| super::next_page_id(&entries, link).map(|id| id.to_string());
         assert_eq!(
             id("/redfish/v1/x?$skip=1"),
             Some("/redfish/v1/x?$skip=1".into())
@@ -1415,7 +3158,21 @@ mod tests {
             id("https://bmc.example/redfish/v1/x?$skip=2"),
             Some("/redfish/v1/x?$skip=2".into())
         );
-        assert_eq!(id("nonsense"), None);
+        assert_eq!(
+            id("//bmc.example/redfish/v1/x?$skip=2"),
+            Some("/redfish/v1/x?$skip=2".into())
+        );
+        // Relative references resolve against the collection, per RFC 3986.
+        assert_eq!(id("Entries?$skip=3"), Some(format!("{ENTRIES}?$skip=3")));
+        assert_eq!(id("?$skip=3"), Some(format!("{ENTRIES}?$skip=3")));
+        assert_eq!(id("https://bmc.example"), None);
+        assert_eq!(id(""), None);
+        // A `$skip` request joins any query the collection id already carries.
+        let tokened: super::ODataId = format!("{ENTRIES}?token=x").into();
+        assert_eq!(
+            super::skip_page_id(&tokened, 5).to_string(),
+            format!("{ENTRIES}?token=x&$skip=5")
+        );
     }
 
     #[test]

@@ -235,12 +235,14 @@ async fn run(args: &Args) -> Result<(), String> {
             let log_service_fixture = include_str!("../fixtures/log-service.json");
             let log_entries_fixture = include_str!("../fixtures/log-entries.json");
             let log_entry_fixture = include_str!("../fixtures/log-entry.json");
+            let service_root_fixture = include_str!("../fixtures/service-root.json");
             // Mock expectations are one-shot AND strict-FIFO, so priming
             // follows dispatch order: the ring visits targets in needs
             // order each round, and a log read asks three times — the
-            // service, its entries collection, then each member. The
-            // collection and entry URIs are the fixture's own.
-            for _ in 0..args.count {
+            // service, its entries collection, then each member — plus the
+            // service root on its second round, to learn whether the device
+            // filters. The collection and entry URIs are the fixture's own.
+            for round in 0..args.count {
                 for sensor in &args.sensors {
                     bmc.expect(Expect::get(sensor, sensor_fixture));
                 }
@@ -248,6 +250,9 @@ async fn run(args: &Args) -> Result<(), String> {
                     bmc.expect(Expect::get(chassis, chassis_fixture));
                 }
                 for service in &args.log_services {
+                    if round == 1 {
+                        bmc.expect(Expect::get("/redfish/v1", service_root_fixture));
+                    }
                     bmc.expect(Expect::get(service, log_service_fixture));
                     bmc.expect(Expect::get(LOG_ENTRIES, log_entries_fixture));
                     bmc.expect(Expect::get(LOG_ENTRY, log_entry_fixture));

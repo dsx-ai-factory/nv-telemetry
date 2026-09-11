@@ -82,8 +82,11 @@ async fn standalone_http_boundary() {
             json!({"Latency": {"mean": "35s", "jitter": "0ms"}}),
         )])
         .await;
+    // The walk's deadline is its 30 s time budget plus the headroom for the
+    // request in flight; the injected 35 s latency outlasts both, and the
+    // harness waits a little beyond the deadline for the classified failure.
     let started = Instant::now();
-    let failure = tokio::time::timeout(Duration::from_secs(34), logs(&server, &resources))
+    let failure = tokio::time::timeout(Duration::from_secs(40), logs(&server, &resources))
         .await
         .expect("walk must stop before the injected response")
         .unwrap_err();

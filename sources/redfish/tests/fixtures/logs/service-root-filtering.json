@@ -1,0 +1,11 @@
+{
+  "@odata.id": "/redfish/v1",
+  "@odata.type": "#ServiceRoot.v1_10_0.ServiceRoot",
+  "Id": "RootService",
+  "Name": "Root Service",
+  "RedfishVersion": "1.10.0",
+  "ProtocolFeaturesSupported": { "FilterQuery": true },
+  "Links": {
+    "Sessions": { "@odata.id": "/redfish/v1/SessionService/Sessions" }
+  }
+}

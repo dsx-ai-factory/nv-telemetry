@@ -94,8 +94,8 @@ codegen:
 check-codegen:
 	cargo run $(cargo-locked) -p nv-telemetry-codegen -- --check
 
-# Optional cross-repository HTTP test; first build the sibling bmc-mock.
-# Setup and the injected scenarios live in docs/BMC-MOCK-TESTING.md.
+# Optional cross-repository HTTP test; first build the sibling bmc-mock and
+# point BMC_MOCK_ROOT at its target directory.
 test-bmc-mock:
 	cargo test $(cargo-locked) -p nv-telemetry-probe --test e2e_http -- --ignored --nocapture
 

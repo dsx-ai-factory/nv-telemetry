@@ -19,6 +19,7 @@ nv-redfish-bmc-mock = { workspace = true, optional = true }
 serde.workspace = true
 time.workspace = true
 futures-timer.workspace = true
+futures-util.workspace = true
 
 [features]
 # The HTTP transport is the default consumer path; without it this crate is

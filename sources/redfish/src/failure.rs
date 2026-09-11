@@ -176,8 +176,20 @@ mod mock {
     use super::ClassifyError;
 
     impl ClassifyError for nv_redfish_bmc_mock::Error {
-        /// A mock error is a test-harness failure, honestly `Internal`.
+        /// A mock error is a test-harness failure, honestly `Internal`, except
+        /// a response a test scripted as `NotSupported`, which stands for the
+        /// device answering 501.
         fn classify(&self) -> AcquisitionFailure {
+            if let nv_redfish_bmc_mock::Error::ErrorResponse(inner) = self {
+                let refused = inner
+                    .downcast_ref::<nv_redfish_bmc_mock::Error>()
+                    .is_some_and(|error| matches!(error, nv_redfish_bmc_mock::Error::NotSupported));
+                if refused {
+                    return AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
+                        .with_retryable(false)
+                        .with_detail("Redfish mock answered not supported");
+                }
+            }
             AcquisitionFailure::new(AcquisitionFailureClass::Internal)
                 .with_retryable(false)
                 .with_detail("Redfish mock transport failed")

@@ -686,21 +686,37 @@ descriptor holds a number it cannot yet interpret.
 
 **Logs are never complete, and a walk is bounded.** A log read ships the
 entries that arrived since its last shipped walk: the read keeps a cursor —
-the newest `occurred_at` shipped and the ids shipped at that instant — reads
-newest first, and stops where the cursor was reached. The member and time
-budget then caps how many *new* entries one poll carries, and a burst larger
-than the budget loses its oldest entries from view, not its newest. A log
-whose newest entry is older than the cursor (wiped and refilled, or a device
-clock stepped back) is read again in full; a wipe refilled within the
-cursor's own second under the same ids is invisible, and entries the device
-does not stamp are shipped every poll. The cursor is not persisted, so a
-restart replays one window. Records that share an `occurred_at` — devices
-stamp to the second, and a burst lands many on one instant — carry no order
-but `entry_id`, which is the device's own spelling and compares numerically
-only when the device numbers its entries. The ids kept at one instant are
-bounded to a few walks' worth, so a frozen device clock cannot grow the
-cursor without limit; past that bound the cursor keeps only the latest walk's
-ids, which a newest-first walk meets first.
+the newest member it shipped, by `@odata.id`, with that member's stamp —
+reads newest first, and stops where it meets that member. Position, not time,
+places an entry: one stamped before the cursor's member is simply newer, ships
+once, and moves the cursor on, and an unstamped entry is placed like any
+other. The member and time budget then caps how many *new* entries one poll
+carries, and a burst larger than the budget loses its oldest entries from
+view, not its newest. Most devices list oldest first; the walk reads the order
+off numbered entry ids, and when a log grows yet the end taken for newest
+holds only the cursor's member, it checks the other end and, if that end is
+stamped after the cursor, flips the order and walks again, once re-shipping
+what it had anchored behind. A device that ignores or refuses `$skip` is read
+from its first page instead, and when that reading reaches the member budget
+before the last page the walk has seen the collection's first members rather
+than its newest; the truncation issue says which. A log cleared and refilled
+reuses its ids: meeting the cursor's id under another stamp discards the
+cursor and ships the whole log once, while a refill landing the same id on the
+same second is invisible. A cursor whose member has left the log is never met,
+and the log ships as new. A device that advertises `$filter` is asked for the
+cursor's second onward, and that answer places by stamp where the walk places
+by position: an entry written later but stamped earlier is not in it. A
+service clock reading earlier than the cursor's stamp, or an empty answer,
+sends that poll to the head; an entry stamped behind the cursor by a clock the
+service does not report stays out of view while the filter is honored. The
+cursor is not persisted, so a restart replays
+one window. Records that share an `occurred_at` — devices stamp to the second,
+and a burst lands many on one instant — carry no order but `entry_id`, which
+is the device's own spelling and compares numerically only when the device
+numbers its entries. Polls of one read run one at a time: a poll that finds one
+in flight ships nothing and says so at `@in-flight`, and the next poll starts
+from the position the in-flight walk stored, so overlapping polls neither
+duplicate records nor move the cursor backwards.
 
 ---
 
