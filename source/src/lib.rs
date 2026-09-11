@@ -15,7 +15,11 @@
 //! - [`AcquisitionFailure`] — the classified facts a failure yields;
 //! - [`Capability`] — what a probe (itself just an `Acquire`) learns;
 //! - [`ProviderDeclaration`] — what one provider offers, as the plain data
-//!   the planner plans against.
+//!   the planner plans against;
+//! - [`SubscriptionItem`] and [`stamp_item`] - a subscription's connect
+//!   attempt is an [`Acquire`] whose output is a stream; [`stamp_item`]
+//!   applies to one stream item the same identity-and-instant rule
+//!   [`acquire()`] applies once to a whole polled request.
 //!
 //! A failed request emits no batch at all, and the outcome type makes the
 //! alternative unrepresentable. Missing and invalid source fields are
@@ -28,13 +32,17 @@
 //! produce a status for a unit that never ran, timing is only observable
 //! where the future is polled, and a source that cannot author its own
 //! status cannot misreport one. Sources contribute exactly what the trait
-//! exposes: identity, and the classified outcome.
+//! exposes: identity, and the classified outcome. This holds per stream item
+//! too: [`stamp_item`] takes its instant from the caller and never the
+//! device's own reported timestamp.
 //!
-//! Reserved here for later milestones, in the order they are expected: the
-//! stage trait and artifact plumbing for multi-step acquisitions such as
-//! catalogs; streamed subscription types, whose admission gNMI settles (a
-//! subscription's connect attempt is an [`Acquire`] whose output is a
-//! stream — an addition to this contract, not a change); and the projection
+//! Streamed subscription types carry no dependency on the stage trait and
+//! artifact plumbing reserved below for multi-step acquisitions such as
+//! catalogs: a subscription replaces the catalog-then-poll expansion
+//! entirely rather than composing with it.
+//!
+//! Reserved here for a later milestone: the stage trait and artifact
+//! plumbing for multi-step acquisitions such as catalogs, and the projection
 //! driver machinery that returns with the manifest compiler, for which
 //! [`ProjectionIssue`] is the fixed anchor.
 
@@ -42,6 +50,7 @@ mod acquire;
 mod declare;
 mod issue;
 mod result;
+mod stream;
 
 pub use acquire::acquire;
 pub use acquire::Acquire;
@@ -55,3 +64,5 @@ pub use result::AcquisitionFailure;
 pub use result::AcquisitionFailureClass;
 pub use result::AcquisitionParts;
 pub use result::OMITTED_ISSUES_LOCATOR;
+pub use stream::stamp_item;
+pub use stream::SubscriptionItem;

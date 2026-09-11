@@ -31,6 +31,10 @@ use crate::AcquisitionParts;
 /// future is polled. Sources contribute identity and the classified outcome;
 /// orchestration stamps the status.
 ///
+/// The endpoint and origin must remain stable for the admitted unit's entire
+/// lifetime. Streamed callers read the same identity for every notification
+/// and terminal failure in one stream instance.
+///
 /// Deliberately not object-safe: the planner plans against declarations,
 /// which are plain data, and a caller needing uniform task leaves writes its
 /// own erasure adapter — trivial to add outside the contract, impossible to
@@ -79,7 +83,24 @@ where
     let endpoint = acquisition.endpoint().clone();
     let origin = acquisition.origin().clone();
     let parts = acquisition.perform().await?;
-    Acquired::from_parts(&endpoint, &origin, at, parts).map_err(|error| envelope_bug(&error))
+    stamp(&endpoint, &origin, at, parts)
+}
+
+/// Stamps envelope-free parts with the identity and instant that own them.
+/// The non-overridable boundary shared by [`acquire`] (once per polled
+/// request) and [`crate::stamp_item`] (once per streamed item).
+///
+/// # Errors
+///
+/// Returns `Internal` if already validated acquisition parts cannot form
+/// their model envelopes.
+pub(crate) fn stamp(
+    endpoint: &EndpointContext,
+    origin: &Origin,
+    at: Timestamp,
+    parts: AcquisitionParts,
+) -> Result<Acquired, AcquisitionFailure> {
+    Acquired::from_parts(endpoint, origin, at, parts).map_err(|error| envelope_bug(&error))
 }
 
 fn envelope_bug(error: &Invalid) -> AcquisitionFailure {

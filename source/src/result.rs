@@ -418,6 +418,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_envelope_that_cannot_form_a_batch_is_an_internal_failure() {
+        // `stream::tests::unreachable_graph_item` builds the one envelope
+        // `Acquired::from_parts` refuses. This exercises that shared
+        // boundary through `acquire`; `stream::tests` proves it again
+        // through `stamp_item`, since both stand on `stamp`.
+        struct FixtureAcquisitionWithUnreachableGraph {
+            endpoint: EndpointContext,
+            origin: Origin,
+        }
+
+        impl Acquire for FixtureAcquisitionWithUnreachableGraph {
+            type Output = AcquisitionParts;
+
+            fn endpoint(&self) -> &EndpointContext {
+                &self.endpoint
+            }
+
+            fn origin(&self) -> &Origin {
+                &self.origin
+            }
+
+            async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+                Ok(crate::stream::tests::unreachable_graph_item())
+            }
+        }
+
+        let acquisition = FixtureAcquisitionWithUnreachableGraph {
+            endpoint: EndpointContext::builder()
+                .endpoint_id("endpoint-a")
+                .build()
+                .expect("a valid endpoint"),
+            origin: Origin::builder()
+                .provider("provider-a")
+                .request_class("request-a")
+                .build()
+                .expect("a valid origin"),
+        };
+
+        let at = Timestamp::new(0, 0).expect("a valid instant");
+
+        let Err(error) = acquire(&acquisition, at).await else {
+            panic!("an unreachable scoped graph cannot form a batch envelope");
+        };
+
+        assert_eq!(error.class(), AcquisitionFailureClass::Internal);
+    }
+
     #[test]
     fn an_empty_detail_is_no_detail() {
         // The status wire type rejects present-but-empty detail, so the

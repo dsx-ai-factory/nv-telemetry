@@ -92,6 +92,11 @@ serde_json = "1"
 tempfile = { version = "3", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
+# Dev-only: `tokio_stream::iter` builds a test fixture's streamed
+# `Acquire::Output` without a real transport. A streamed provider's crate
+# supplies its own `Stream` bound.
+tokio-stream = "0.1"
+
 # Benchmarks measure instruction counts under Valgrind, so numbers are
 # machine-load independent and comparable across runs. Dev-only; running
 # needs valgrind and a gungraun-runner of the same version.
