@@ -684,10 +684,20 @@ to the unit of the `SignalDescriptor` for the exact `(subject, facet)` key, whic
 travels in a different batch. A consumer that has the threshold and not the
 descriptor holds a number it cannot yet interpret.
 
-**Logs are never complete, and a walk is bounded.** A log read reports at most
-the provider's member and time budget of entries per poll and starts over next
-poll, so a log that grows faster than it is polled is sampled, not followed. A
-resumable walk keyed on `entry_id` is the recorded follow-up.
+**Logs are never complete, and a walk is bounded.** A log read ships the
+entries that arrived since its last shipped walk: the read keeps a cursor —
+the newest `occurred_at` shipped and the ids shipped at that instant — reads
+newest first, and stops where the cursor was reached. The member and time
+budget then caps how many *new* entries one poll carries, and a burst larger
+than the budget loses its oldest entries from view, not its newest. A log
+whose newest entry is older than the cursor (wiped and refilled, or a device
+clock stepped back) is read again in full; a wipe refilled within the
+cursor's own second under the same ids is invisible, and entries the device
+does not stamp are shipped every poll. The cursor is not persisted, so a
+restart replays one window. Records that share an `occurred_at` — devices
+stamp to the second, and a burst lands many on one instant — carry no order
+but `entry_id`, which is the device's own spelling and compares numerically
+only when the device numbers its entries.
 
 ---
 

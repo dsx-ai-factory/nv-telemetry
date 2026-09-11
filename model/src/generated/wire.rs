@@ -337,6 +337,13 @@ pub struct LogRecord {
     /// no uniqueness constraint on the records list: sources that do not stamp
     /// entries leave this absent, and a key that can be absent cannot decide
     /// duplicates.
+    ///
+    /// It is also the only order among records that share an `occurred_at`:
+    /// devices stamp entries to the second, and a burst lands many records on
+    /// one instant, which canonical order then sorts by severity and message.
+    /// The device's sequence survives only here, as the device spells it — a
+    /// string, so a consumer restoring order compares numerically when the
+    /// source numbers its entries and treats the ids as opaque otherwise.
     #[prost(string, optional, tag = "5")]
     pub entry_id: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "6")]

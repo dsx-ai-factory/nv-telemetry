@@ -16,6 +16,7 @@ nv-redfish = { workspace = true, features = ["sensors", "chassis", "log-services
 # Optional so the `bmc-mock` feature can gate a `ClassifyError` impl for the
 # mock's error type; tests pull it unconditionally through dev-dependencies.
 nv-redfish-bmc-mock = { workspace = true, optional = true }
+serde.workspace = true
 time.workspace = true
 futures-timer.workspace = true
 

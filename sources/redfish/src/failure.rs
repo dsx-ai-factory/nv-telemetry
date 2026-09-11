@@ -136,13 +136,32 @@ mod http {
                     true,
                     "Redfish cache entry was unavailable",
                 ),
-                // Unreachable for a polled provider; classified defensively.
-                BmcError::SseStreamError(_)
-                | BmcError::SseEventTooLarge { .. }
-                | BmcError::SseIdleTimeout { .. } => with(
-                    AcquisitionFailureClass::Internal,
+                // Event-stream rows, reachable once a stream provider exists
+                // and pinned now against the mock's SSE service. None is
+                // endpoint-scoped: a stream that misbehaves says nothing
+                // about the endpoint's other request classes, so none may
+                // trip the endpoint breaker. A frame or transfer the decoder
+                // could not finish is retried by reopening; a frame above
+                // the client's own bound comes back identical on resume, so
+                // a retry cannot succeed until the bound changes.
+                BmcError::SseStreamError(_) => with(
+                    AcquisitionFailureClass::Protocol,
+                    true,
+                    "Redfish event stream could not be decoded",
+                ),
+                BmcError::SseEventTooLarge { .. } => with(
+                    AcquisitionFailureClass::Protocol,
                     false,
-                    "Unexpected Redfish event-stream failure",
+                    "Redfish event exceeded the client's frame bound",
+                ),
+                // The device went quiet for longer than the client allows.
+                // Heartbeat comments do not reset that clock, so an alive but
+                // idle stream ends here too; the window is the client's
+                // policy, not the endpoint's health.
+                BmcError::SseIdleTimeout { .. } => with(
+                    AcquisitionFailureClass::Protocol,
+                    true,
+                    "Redfish event stream idle beyond the client's window",
                 ),
             }
         }
@@ -205,5 +224,33 @@ mod tests {
     fn detail_never_copies_an_untrusted_response_body() {
         let failure = classify_status(503);
         assert_eq!(failure.detail(), Some("HTTP 503"));
+    }
+
+    #[cfg(feature = "bmc-http")]
+    #[test]
+    fn event_stream_failures_scope_to_their_request_class() {
+        use std::time::Duration;
+
+        use nv_redfish::bmc_http::reqwest::BmcError;
+
+        use super::ClassifyError;
+
+        // A stream that ends, overflows, or idles out is not an unreachable
+        // endpoint: none of these may sample the endpoint breaker.
+        let idle = BmcError::SseIdleTimeout {
+            idle: Duration::from_secs(20),
+        }
+        .classify();
+        assert_eq!(idle.class(), AcquisitionFailureClass::Protocol);
+        assert_eq!(idle.retryable(), Some(true));
+        assert!(!idle.class().is_endpoint_scoped());
+
+        let oversized = BmcError::SseEventTooLarge { limit: 4096 }.classify();
+        assert_eq!(oversized.class(), AcquisitionFailureClass::Protocol);
+        assert_eq!(
+            oversized.retryable(),
+            Some(false),
+            "the same frame comes back on resume"
+        );
     }
 }

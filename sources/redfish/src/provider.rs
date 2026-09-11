@@ -15,8 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use nv_redfish::core::EntityTypeRef;
+use nv_redfish::core::NavProperty;
+use nv_redfish::core::ODataETag;
 use nv_redfish::core::ODataId;
 use nv_redfish::schema::chassis::Chassis;
+use nv_redfish::schema::log_entry::LogEntry;
 use nv_redfish::schema::log_service::LogService;
 use nv_redfish::schema::sensor::Sensor;
 use nv_redfish::Bmc;
@@ -33,12 +37,14 @@ use nv_telemetry_model::Payload;
 use nv_telemetry_model::Readings;
 use nv_telemetry_model::States;
 use nv_telemetry_model::Subject;
+use nv_telemetry_model::Timestamp;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProjectionIssue;
 use nv_telemetry_source::ProviderDeclaration;
+use serde::Deserialize;
 
 use crate::failure::ClassifyError;
 use crate::projection::project_chassis;
@@ -72,11 +78,18 @@ pub trait ReadKind: sealed::Sealed + Send + Sync + 'static {
     /// Request class, as dispatcher lanes and breakers key it.
     const REQUEST_CLASS: &'static str;
 
+    /// What one read keeps between its acquisitions. `()` for a read whose
+    /// every acquisition stands alone; a log walk keeps [`LogCursor`], where
+    /// its previous walk ended. Shared by every clone of one [`Read`], so the
+    /// dispatcher's per-tick clones see one position.
+    type State: Default + Send + Sync + 'static;
+
     /// Performs the read: fetch, project, assemble.
     fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         location: &str,
+        state: &Self::State,
     ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send
     where
         B: Bmc,
@@ -87,13 +100,14 @@ pub trait ReadKind: sealed::Sealed + Send + Sync + 'static {
 /// when this runs, and the kind knows how. Generic over the transport so the
 /// same provider runs against HTTP and against the mock the corpus replays
 /// through.
-pub struct Read<B, K> {
+pub struct Read<B, K: ReadKind> {
     endpoint: EndpointContext,
     origin: Origin,
     target: ODataId,
     /// The requested location string, as the kind's projection expects it.
     location: String,
     bmc: Arc<B>,
+    state: Arc<K::State>,
     kind: PhantomData<fn() -> K>,
 }
 
@@ -121,8 +135,9 @@ impl<B, K: ReadKind> fmt::Debug for Read<B, K> {
     }
 }
 
-// Sharing a read must not require the transport to be `Clone`.
-impl<B, K> Clone for Read<B, K> {
+// Sharing a read must not require the transport to be `Clone`, and every
+// clone shares the kind's state: one position per read, not per clone.
+impl<B, K: ReadKind> Clone for Read<B, K> {
     fn clone(&self) -> Self {
         Self {
             endpoint: self.endpoint.clone(),
@@ -130,6 +145,7 @@ impl<B, K> Clone for Read<B, K> {
             target: self.target.clone(),
             location: self.location.clone(),
             bmc: Arc::clone(&self.bmc),
+            state: Arc::clone(&self.state),
             kind: PhantomData,
         }
     }
@@ -171,6 +187,7 @@ impl<B, K: ReadKind> Read<B, K> {
             target,
             location,
             bmc,
+            state: Arc::new(K::State::default()),
             kind: PhantomData,
         }
     }
@@ -193,7 +210,13 @@ where
     }
 
     async fn perform(&self) -> Result<AcquisitionParts, AcquisitionFailure> {
-        K::acquire(self.bmc.as_ref(), &self.target, &self.location).await
+        K::acquire(
+            self.bmc.as_ref(),
+            &self.target,
+            &self.location,
+            self.state.as_ref(),
+        )
+        .await
     }
 }
 
@@ -223,11 +246,13 @@ impl sealed::Sealed for SensorKind {}
 impl ReadKind for SensorKind {
     const PROVIDER: &'static str = "redfish.sensor.odata";
     const REQUEST_CLASS: &'static str = "sensor-read";
+    type State = ();
 
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         location: &str,
+        (): &(),
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
@@ -280,11 +305,13 @@ impl sealed::Sealed for ChassisKind {}
 impl ReadKind for ChassisKind {
     const PROVIDER: &'static str = "redfish.chassis.odata";
     const REQUEST_CLASS: &'static str = "chassis-read";
+    type State = ();
 
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         location: &str,
+        (): &(),
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
@@ -317,43 +344,46 @@ fn assemble_chassis(parts: ChassisParts) -> Result<AcquisitionParts, Invalid> {
     Ok(AcquisitionParts::new(payloads, parts.issues))
 }
 
-/// Walk a log service: GET the service, its entries collection, and each
-/// member the collection did not carry expanded inline — a `NavProperty`
-/// already expanded resolves without I/O — and project every entry to at
-/// most one record.
+/// Walk a log service: GET the service, its entries collection page by page,
+/// and each member the collection did not carry expanded inline — a
+/// `NavProperty` already expanded resolves without I/O — and project every
+/// entry to at most one record.
 ///
 /// A walk has element semantics a single document does not. Each entry's
-/// issues are prefixed `Members[i]`, so two entries with one fault stay two
-/// facts, and each entry projects at its own location. A member the device
-/// answered for but would not serve — rotated out between the collection
-/// and the member GET, say — is recorded against `Members[i]` and the walk
-/// continues. Anything else ends the walk and discards what it had
-/// projected: an endpoint-scoped failure indicts the endpoint rather than one
-/// entry, and the collector's own fault is never device data. The
-/// acquisition contract is all-or-nothing for the unit, so a recurring
-/// per-member timeout on a long log means the log never ships and the
-/// endpoint breaker samples the timeout.
+/// issues are prefixed `Members[i]`, `i` being the member's position in the
+/// whole collection, so two entries with one fault stay two facts, and each
+/// entry projects at its own location. A member the device answered for but
+/// would not serve — rotated out between the collection and the member GET,
+/// say — is recorded against `Members[i]` and the walk continues. Anything
+/// else ends the walk and discards what it had projected: an endpoint-scoped
+/// failure indicts the endpoint rather than one entry, and the collector's
+/// own fault is never device data. The acquisition contract is all-or-nothing
+/// for the unit, so a recurring per-member timeout on a long log means the
+/// log never ships and the endpoint breaker samples the timeout.
 ///
 /// The walk is budgeted ([`WalkBudget`]): it holds the endpoint's admission
-/// slot and buffers projected records for its duration. The dispatcher meters
-/// it as one unit of cost. A deadline cancels pending I/O, and the member cap
-/// bounds projected records; neither bounds the collection response decoded
-/// by the transport. The Bmc implementation must provide response-size limits;
-/// nv-redfish 0.16's typed API exposes no such limit here. What the
-/// member cap cuts off is reported at [`TRUNCATED_WALK_LOCATOR`]; deadline
-/// expiry fails the acquisition with Timeout and discards its output. A
-/// successful batch is `PARTIAL`, and the next poll starts over. Records ride
-/// one `Logs` batch per bound's worth; the issues envelope's own bound is kept by
+/// slot and buffers projected records for its duration, and the dispatcher
+/// meters it as one unit of cost. **The budget keeps the newest entries.** A
+/// log lists its entries oldest first, so a walk that spent its budget from
+/// the head would never show a consumer the records that arrived since the
+/// last poll; instead the walk visits the newest members first, and when the
+/// collection is paged it jumps to the tail with `$skip` before following
+/// `Members@odata.nextLink` to the end. What the budget cuts off is the
+/// oldest, reported once at [`TRUNCATED_WALK_LOCATOR`]. The deadline cancels
+/// pending I/O and fails the acquisition with Timeout, discarding its output.
+/// Neither bound covers the collection response the transport decodes; that
+/// is the transport's response-size limit, which nv-redfish 0.16's typed API
+/// does not expose here. A successful batch is `PARTIAL`, and the next poll
+/// starts where this one ended: the read keeps a [`LogCursor`], so a poll
+/// ships the entries that arrived since the last one shipped, and the budget
+/// caps how many new entries one poll may carry. Records ride one `Logs`
+/// batch per bound's worth; the issues envelope's own bound is kept by
 /// `AcquisitionParts`.
 ///
 /// The batch's `Coverage.scope` names the service — kind `log-service`,
 /// scoped by the resource that owns it, identified by its `Id` — which is
 /// the namespace of every record's `entry_id`: two services on one endpoint
 /// both number their entries from 1.
-///
-/// Only the collection's first page is walked: nv-redfish 0.16 surfaces no
-/// `Members@odata.nextLink`, so a paged log is truncated silently. Recorded
-/// in the plan as the upstream follow-up it is.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LogKind;
@@ -362,7 +392,8 @@ impl sealed::Sealed for LogKind {}
 
 /// What one log walk may spend: members visited and wall-clock time. The
 /// members bound also bounds buffering, since every visited member holds at
-/// most one record and a few issues until the walk ends.
+/// most one record and a few issues until the walk ends, and it bounds the
+/// page GETs a paged collection costs, one page being at least one member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalkBudget {
     members: usize,
@@ -392,21 +423,165 @@ impl WalkBudget {
     }
 }
 
+/// One page of an entries collection, read raw: nv-redfish 0.16's typed
+/// collection drops `Members@odata.count` and `Members@odata.nextLink`, and
+/// without them a paged log is silently its first page. Members keep their
+/// `NavProperty` form, so an entry the device expanded inline still resolves
+/// without I/O.
+#[derive(Debug, Deserialize)]
+struct EntryPage {
+    #[serde(rename = "@odata.id")]
+    odata_id: ODataId,
+    #[serde(rename = "Members", default)]
+    members: Vec<NavProperty<LogEntry>>,
+    #[serde(rename = "Members@odata.count")]
+    count: Option<u64>,
+    #[serde(rename = "Members@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+impl EntityTypeRef for EntryPage {
+    fn odata_id(&self) -> &ODataId {
+        &self.odata_id
+    }
+
+    fn etag(&self) -> Option<&ODataETag> {
+        None
+    }
+}
+
+/// The pages a walk read, in collection order, the first of them starting
+/// at `offset` in a collection of `total` members. Pages stay shared with
+/// the transport's cache; the walk borrows members from them.
+struct EntryWindow {
+    pages: Vec<Arc<EntryPage>>,
+    offset: usize,
+    total: usize,
+}
+
+impl EntryWindow {
+    fn new(pages: Vec<Arc<EntryPage>>, offset: usize, count: usize) -> Self {
+        let read: usize = pages.iter().map(|page| page.members.len()).sum();
+        Self {
+            pages,
+            offset,
+            total: count.max(offset + read),
+        }
+    }
+
+    /// The newest `budget` members read, each with its position in the
+    /// whole collection.
+    fn newest_first(&self, budget: WalkBudget) -> Vec<(usize, &NavProperty<LogEntry>)> {
+        let members: Vec<&NavProperty<LogEntry>> = self
+            .pages
+            .iter()
+            .flat_map(|page| page.members.iter())
+            .collect();
+        members
+            .into_iter()
+            .enumerate()
+            .map(|(position, member)| (self.offset + position, member))
+            .rev()
+            .take(budget.members)
+            .collect()
+    }
+}
+
+/// A `Members@odata.nextLink` as the id the transport resolves against the
+/// endpoint. Devices write it as a path; one that writes an absolute URL is
+/// reduced to its path and query, and the transport's same-origin rule keeps
+/// it from naming another host.
+fn next_page_id(link: &str) -> Option<ODataId> {
+    if link.starts_with('/') {
+        return Some(ODataId::from(link.to_owned()));
+    }
+    let after_scheme = link.split_once("://")?.1;
+    let path = &after_scheme[after_scheme.find('/')?..];
+    Some(ODataId::from(path.to_owned()))
+}
+
+/// Reads the collection's pages and chooses the members to visit.
+///
+/// A collection that fits in one document is the common case. A paged one
+/// reports its count, and when the count exceeds the budget the walk asks
+/// for the tail with `$skip`, which every Redfish service must honor; one
+/// that ignores it answers with its first page again, which the walk
+/// recognizes and falls back to following the pages from the start. Pages
+/// are followed until the last, bounded by the member budget, since a page
+/// holds at least one member.
+async fn collect_entries<B>(
+    bmc: &B,
+    entries: &ODataId,
+    budget: WalkBudget,
+) -> Result<EntryWindow, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    let first = bmc
+        .get::<EntryPage>(entries)
+        .await
+        .map_err(|error| error.classify())?;
+    if first.next_link.is_none() {
+        return Ok(EntryWindow::new(vec![first], 0, 0));
+    }
+    let count = first
+        .count
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    let mut offset = 0;
+    let mut page = first;
+    if count > budget.members {
+        let skip = count - budget.members;
+        let tail = bmc
+            .get::<EntryPage>(&ODataId::from(format!("{entries}?$skip={skip}")))
+            .await
+            .map_err(|error| error.classify())?;
+        let honored =
+            tail.members.first().map(NavProperty::id) != page.members.first().map(NavProperty::id);
+        if honored {
+            offset = skip;
+            page = tail;
+        }
+    }
+    let mut next = page.next_link.clone();
+    let mut pages = vec![page];
+    while let Some(link) = next.take() {
+        if pages.len() >= budget.members {
+            break;
+        }
+        let Some(id) = next_page_id(&link) else {
+            break;
+        };
+        let page = bmc
+            .get::<EntryPage>(&id)
+            .await
+            .map_err(|error| error.classify())?;
+        if page.members.is_empty() {
+            break;
+        }
+        next.clone_from(&page.next_link);
+        pages.push(page);
+    }
+    Ok(EntryWindow::new(pages, offset, count))
+}
+
 impl ReadKind for LogKind {
     const PROVIDER: &'static str = "redfish.log-service.odata";
     const REQUEST_CLASS: &'static str = "log-read";
+    type State = LogCursor;
 
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         location: &str,
+        cursor: &LogCursor,
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
         B::Error: ClassifyError,
     {
         with_deadline(WalkBudget::DEFAULT.elapsed, async {
-            let started = Instant::now();
             let service = bmc
                 .get::<LogService>(target)
                 .await
@@ -422,42 +597,204 @@ impl ReadKind for LogKind {
                 );
             };
             let scope = service_scope(location, &service.base.id)?;
-            let collection = entries.get(bmc).await.map_err(|error| error.classify())?;
-            let mut records = Vec::new();
-            let mut issues = Vec::new();
-            for (index, member) in collection.members.iter().enumerate() {
-                if let Some(reason) = WalkBudget::DEFAULT.exhausted(index, started.elapsed()) {
-                    issues.push(ProjectionIssue::invalid(
-                        TRUNCATED_WALK_LOCATOR,
-                        format!(
-                            "walk stopped at member {index} of {}: {reason}",
-                            collection.members.len()
-                        ),
-                    ));
-                    break;
-                }
-                let entry = match member.get(bmc).await {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        issues.push(member_disposition(index, error.classify())?);
-                        continue;
-                    }
-                };
-                let location = member.id().to_string();
-                let parts =
-                    project_log_entry(&entry, &location).map_err(|error| internal_bug(&error))?;
-                records.extend(parts.log_records);
-                issues.extend(
-                    parts
-                        .issues
-                        .into_iter()
-                        .map(|issue| issue.at_index("Members", index)),
-                );
-            }
-            assemble_logs(records, issues, scope).map_err(|error| internal_bug(&error))
+            let walk = walk_entries(bmc, entries.id(), WalkBudget::DEFAULT, cursor).await?;
+            let parts = assemble_logs(walk.records, walk.issues, scope)
+                .map_err(|error| internal_bug(&error))?;
+            // The acquisition is now certain to ship; a walk that failed or
+            // was cancelled before this point leaves the cursor where the
+            // last shipped walk put it.
+            cursor.store(walk.position);
+            Ok(parts)
         })
         .await
     }
+}
+
+/// Where the previous shipped walk of a log service ended: the newest
+/// `occurred_at` it emitted and every `entry_id` emitted at that instant.
+///
+/// The next walk, reading newest first, stops at the first record the
+/// cursor already covers, so a poll costs the new entries plus one member
+/// rather than the whole window, and a consumer stops seeing every record
+/// repeated each poll. Devices stamp to the second and a burst lands many
+/// records on one instant, which is why the instant alone cannot place a
+/// record and the ids emitted at that instant ride along.
+///
+/// Two things move the cursor backwards. A log that was wiped and refilled,
+/// or a device clock stepped back, makes the newest entry present *older*
+/// than the cursor; the walk then discards the cursor and emits the whole
+/// window. A wipe refilled within the cursor's own second under the same
+/// ids is invisible, which the second's resolution makes unavoidable.
+///
+/// Records the cursor cannot place are emitted every poll: entries the
+/// device does not stamp, and entries that projected no record at all — a
+/// faulty entry is reported each time it is met, since it was never shipped.
+///
+/// One per [`Read`], shared by its clones; not persisted, so a restart
+/// replays one window, bounded by [`WalkBudget`].
+#[derive(Debug, Default)]
+pub struct LogCursor {
+    position: std::sync::Mutex<Option<Position>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Position {
+    at: Timestamp,
+    ids: std::collections::BTreeSet<String>,
+}
+
+/// Where one record stands relative to a [`Position`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    /// After the position: not yet shipped.
+    Newer,
+    /// At or before the position: shipped by an earlier walk.
+    Covered,
+    /// Before the position's instant while being the newest entry present:
+    /// the log no longer holds what the position described.
+    Older,
+}
+
+impl Position {
+    fn place(&self, record: &LogRecord) -> Option<Placement> {
+        let at = record.occurred_at()?;
+        Some(match at.cmp(&self.at) {
+            std::cmp::Ordering::Greater => Placement::Newer,
+            std::cmp::Ordering::Less => Placement::Older,
+            std::cmp::Ordering::Equal => {
+                if record.entry_id().is_some_and(|id| self.ids.contains(id)) {
+                    Placement::Covered
+                } else {
+                    Placement::Newer
+                }
+            }
+        })
+    }
+
+    /// The position after shipping `records` on top of `previous`: the
+    /// newest instant among them, with the ids at that instant — merged
+    /// with the previous ids when the instant did not move.
+    fn after(previous: Option<&Self>, records: &[LogRecord]) -> Option<Self> {
+        let at = records
+            .iter()
+            .filter_map(LogRecord::occurred_at)
+            .max()
+            .copied();
+        let Some(at) = at else {
+            return previous.cloned();
+        };
+        let mut ids: std::collections::BTreeSet<String> = records
+            .iter()
+            .filter(|record| record.occurred_at() == Some(&at))
+            .filter_map(|record| record.entry_id().map(str::to_owned))
+            .collect();
+        match previous {
+            Some(previous) if previous.at == at => {
+                ids.extend(previous.ids.iter().cloned());
+                Some(Self { at, ids })
+            }
+            Some(previous) if previous.at > at => Some(previous.clone()),
+            _ => Some(Self { at, ids }),
+        }
+    }
+}
+
+impl LogCursor {
+    fn load(&self) -> Option<Position> {
+        self.position.lock().expect("log cursor poisoned").clone()
+    }
+
+    fn store(&self, position: Option<Position>) {
+        *self.position.lock().expect("log cursor poisoned") = position;
+    }
+}
+
+/// What a walk projected: records, the issues against their members, and
+/// the position to store once the records have shipped.
+struct Walk {
+    records: Vec<LogRecord>,
+    issues: Vec<ProjectionIssue>,
+    position: Option<Position>,
+}
+
+/// Visits the newest members, newest first, until the budget is spent or
+/// the cursor's position is reached, and projects each.
+async fn walk_entries<B>(
+    bmc: &B,
+    entries: &ODataId,
+    budget: WalkBudget,
+    cursor: &LogCursor,
+) -> Result<Walk, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    let started = Instant::now();
+    let window = collect_entries(bmc, entries, budget).await?;
+    let mut previous = cursor.load();
+    let mut records = Vec::new();
+    // Issues are keyed by member so they read in collection order whatever
+    // order the walk visited members in.
+    let mut member_issues: Vec<(usize, ProjectionIssue)> = Vec::new();
+    let mut visited = 0;
+    let mut stopped = None;
+    let mut reached_cursor = false;
+    let mut placed_newest = false;
+    for (index, member) in window.newest_first(budget) {
+        if let Some(reason) = budget.exhausted(visited, started.elapsed()) {
+            stopped = Some(reason);
+            break;
+        }
+        visited += 1;
+        let entry = match member.get(bmc).await {
+            Ok(entry) => entry,
+            Err(error) => {
+                member_issues.push((index, member_disposition(index, error.classify())?));
+                continue;
+            }
+        };
+        let location = member.id().to_string();
+        let parts = project_log_entry(&entry, &location).map_err(|error| internal_bug(&error))?;
+        let placement = previous
+            .as_ref()
+            .zip(parts.log_records.first())
+            .and_then(|(position, record)| position.place(record));
+        match placement {
+            Some(Placement::Older) if !placed_newest => previous = None,
+            Some(Placement::Covered | Placement::Older) => {
+                reached_cursor = true;
+                break;
+            }
+            Some(Placement::Newer) | None => {}
+        }
+        placed_newest |= placement.is_some();
+        records.extend(parts.log_records);
+        member_issues.extend(
+            parts
+                .issues
+                .into_iter()
+                .map(|issue| (index, issue.at_index("Members", index))),
+        );
+    }
+    member_issues.sort_by_key(|(index, _)| *index);
+    let mut issues: Vec<ProjectionIssue> =
+        member_issues.into_iter().map(|(_, issue)| issue).collect();
+    if !reached_cursor && visited < window.total {
+        issues.push(ProjectionIssue::invalid(
+            TRUNCATED_WALK_LOCATOR,
+            format!(
+                "walk kept the newest {visited} of {} members: {}",
+                window.total,
+                stopped.unwrap_or("member budget spent")
+            ),
+        ));
+    }
+    let position = Position::after(previous.as_ref(), &records);
+    Ok(Walk {
+        records,
+        issues,
+        position,
+    })
 }
 
 /// Cancels the whole acquisition, including initial GETs, when its deadline
@@ -707,6 +1044,312 @@ mod tests {
             budget.exhausted(0, Duration::from_secs(10)),
             Some("time budget spent")
         );
+    }
+
+    const ENTRIES: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries";
+
+    /// One page of a six-entry collection: members `range`, the device's
+    /// count, and the link onward if any.
+    fn page(range: std::ops::Range<usize>, count: usize, next: Option<&str>) -> String {
+        let members: Vec<String> = range
+            .map(|index| format!(r#"{{ "@odata.id": "{ENTRIES}/{index}" }}"#))
+            .collect();
+        let next = next.map_or_else(String::new, |link| {
+            format!(r#", "Members@odata.nextLink": "{link}""#)
+        });
+        format!(
+            r##"{{ "@odata.id": "{ENTRIES}", "@odata.type": "#LogEntryCollection.LogEntryCollection",
+                 "Name": "Entries", "Members@odata.count": {count}, "Members": [{}]{next} }}"##,
+            members.join(",")
+        )
+    }
+
+    /// Entry `index`, stamped at second `index` of one minute so instants
+    /// follow ids.
+    fn entry(index: usize) -> (String, String) {
+        entry_at(index, &format!("2026-03-01T10:00:{index:02}Z"))
+    }
+
+    fn entry_at(index: usize, created: &str) -> (String, String) {
+        (
+            format!("{ENTRIES}/{index}"),
+            format!(
+                r##"{{ "@odata.id": "{ENTRIES}/{index}", "@odata.type": "#LogEntry.v1_21_0.LogEntry",
+                     "Id": "{index}", "Name": "Entry", "EntryType": "Event",
+                     "Created": "{created}", "Message": "m{index}" }}"##
+            ),
+        )
+    }
+
+    /// An entry without the required `Message`: an issue, never a record.
+    fn faulty_entry(index: usize) -> (String, String) {
+        (
+            format!("{ENTRIES}/{index}"),
+            format!(
+                r##"{{ "@odata.id": "{ENTRIES}/{index}", "@odata.type": "#LogEntry.v1_21_0.LogEntry",
+                     "Id": "{index}", "Name": "Entry", "EntryType": "Event",
+                     "Created": "2026-03-01T10:00:{index:02}Z" }}"##
+            ),
+        )
+    }
+
+    type MockBmc = nv_redfish_bmc_mock::Bmc<nv_redfish_bmc_mock::Error>;
+
+    /// Primes the strict-FIFO mock in the walk's request order.
+    fn prime(bmc: &MockBmc, answers: &[(String, String)]) {
+        for (uri, body) in answers {
+            bmc.expect(nv_redfish_bmc_mock::Expect::get(uri, body));
+        }
+    }
+
+    /// The single-page collection of `members`, with the entries the walk
+    /// will ask for, newest first.
+    fn whole_log(members: std::ops::Range<usize>) -> Vec<(String, String)> {
+        let mut answers = vec![(ENTRIES.to_owned(), page(members.clone(), members.end, None))];
+        answers.extend(members.rev().map(entry));
+        answers
+    }
+
+    /// One walk under `budget` from `cursor`, shipped: the position is stored
+    /// as `acquire` stores it once the batch is certain. Returns the entry
+    /// ids projected and the issues raised.
+    async fn walk_with(
+        bmc: &MockBmc,
+        cursor: &super::LogCursor,
+        budget: WalkBudget,
+    ) -> (Vec<usize>, Vec<nv_telemetry_source::ProjectionIssue>) {
+        let walk = super::walk_entries(bmc, &ENTRIES.to_owned().into(), budget, cursor)
+            .await
+            .expect("the walk completes");
+        cursor.store(walk.position);
+        let mut ids: Vec<usize> = walk
+            .records
+            .iter()
+            .filter_map(|record| record.entry_id()?.parse().ok())
+            .collect();
+        ids.sort_unstable();
+        (ids, walk.issues)
+    }
+
+    /// A first walk over a fresh mock and a fresh cursor.
+    async fn walk(
+        answers: &[(String, String)],
+        budget: WalkBudget,
+    ) -> (Vec<usize>, Vec<nv_telemetry_source::ProjectionIssue>) {
+        let bmc = MockBmc::default();
+        prime(&bmc, answers);
+        walk_with(&bmc, &super::LogCursor::default(), budget).await
+    }
+
+    fn generous() -> WalkBudget {
+        WalkBudget::new(10, Duration::from_secs(10))
+    }
+
+    #[tokio::test]
+    async fn a_second_poll_stops_at_the_cursor_and_ships_nothing() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        assert_eq!(walk_with(&bmc, &cursor, generous()).await.0, [0, 1, 2]);
+
+        // The newest member is read and recognized; nothing older is asked
+        // for, and the collection's size is not a truncation.
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..3, 3, None)), entry(2)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert!(ids.is_empty());
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_entries_past_the_cursor_ship_and_the_cursor_follows_them() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_with(&bmc, &cursor, generous()).await;
+
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None))]);
+        prime(&bmc, &[entry(4), entry(3), entry(2)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [3, 4]);
+        assert!(issues.is_empty());
+
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None)), entry(4)]);
+        assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_burst_within_the_cursors_second_is_told_apart_by_id() {
+        let same_second = "2026-03-01T10:00:02Z";
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..3, 3, None))]);
+        prime(&bmc, &[entry_at(2, same_second), entry(1), entry(0)]);
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Two more entries stamped on the cursor's own second: new ids at a
+        // known instant are new records; the known id ends the walk.
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None))]);
+        prime(
+            &bmc,
+            &[
+                entry_at(4, same_second),
+                entry_at(3, same_second),
+                entry_at(2, same_second),
+            ],
+        );
+        assert_eq!(walk_with(&bmc, &cursor, generous()).await.0, [3, 4]);
+
+        // The ids at that instant accumulate, so the burst is not re-shipped.
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None))]);
+        prime(&bmc, &[entry_at(4, same_second)]);
+        assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_log_whose_newest_entry_predates_the_cursor_is_read_again() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_with(&bmc, &cursor, generous()).await;
+
+        // Wiped and refilled with older stamps, or the device clock stepped
+        // back: the newest entry is older than the cursor, so the cursor is
+        // discarded and the whole log ships.
+        prime(&bmc, &whole_log(0..2));
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [0, 1]);
+        assert!(issues.is_empty());
+
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..2, 2, None)), entry(1)]);
+        assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_faulty_newest_entry_is_reported_on_every_poll() {
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        let faulty = || {
+            let mut answers = vec![(ENTRIES.to_owned(), page(0..2, 2, None))];
+            answers.push(faulty_entry(1));
+            answers.push(entry(0));
+            answers
+        };
+        prime(&bmc, &faulty());
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert_eq!(ids, [0]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path(), "Members[1].LogEntry.Message");
+
+        // Never shipped, so never covered: the fault is met again, and the
+        // record behind it ends the walk.
+        prime(&bmc, &faulty());
+        let (ids, issues) = walk_with(&bmc, &cursor, generous()).await;
+        assert!(ids.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path(), "Members[1].LogEntry.Message");
+    }
+
+    #[tokio::test]
+    async fn the_budget_caps_the_new_entries_one_poll_carries() {
+        let budget = WalkBudget::new(3, Duration::from_secs(10));
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(&bmc, &whole_log(0..3));
+        walk_with(&bmc, &cursor, budget).await;
+
+        // Four new entries behind a three-member budget on a paged log: the
+        // walk jumps to the tail, ships the newest three, and says the
+        // fourth was dropped — the cursor was never reached.
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        prime(
+            &bmc,
+            &[
+                (ENTRIES.to_owned(), page(0..2, 7, Some(&skip2))),
+                (skip4, page(4..7, 7, None)),
+            ],
+        );
+        prime(&bmc, &[entry(6), entry(5), entry(4)]);
+        let (ids, issues) = walk_with(&bmc, &cursor, budget).await;
+        assert_eq!(ids, [4, 5, 6]);
+        assert_eq!(issues, [truncated(3, 7, "member budget spent")]);
+    }
+
+    fn truncated(kept: usize, total: usize, reason: &str) -> nv_telemetry_source::ProjectionIssue {
+        nv_telemetry_source::ProjectionIssue::invalid(
+            super::TRUNCATED_WALK_LOCATOR,
+            format!("walk kept the newest {kept} of {total} members: {reason}"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_paged_collection_within_the_budget_is_read_to_its_end() {
+        let skip3 = format!("{ENTRIES}?$skip=3");
+        let mut answers = vec![
+            (ENTRIES.to_owned(), page(0..3, 5, Some(&skip3))),
+            (skip3.clone(), page(3..5, 5, None)),
+        ];
+        answers.extend((0..5).rev().map(entry));
+        let (ids, issues) = walk(&answers, WalkBudget::new(10, Duration::from_secs(10))).await;
+        assert_eq!(ids, [0, 1, 2, 3, 4]);
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_log_larger_than_the_budget_is_read_from_its_tail() {
+        // Six entries, budget three: the walk jumps to `$skip=3` and never
+        // reads the pages before it.
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip3 = format!("{ENTRIES}?$skip=3");
+        let mut answers = vec![
+            (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
+            (skip3, page(3..6, 6, None)),
+        ];
+        answers.extend((3..6).rev().map(entry));
+        let (ids, issues) = walk(&answers, WalkBudget::new(3, Duration::from_secs(10))).await;
+        assert_eq!(ids, [3, 4, 5]);
+        assert_eq!(issues, [truncated(3, 6, "member budget spent")]);
+    }
+
+    #[tokio::test]
+    async fn a_device_that_ignores_skip_is_read_from_the_start() {
+        // The `$skip` answer is the first page again, so the walk follows
+        // the pages from the start and still keeps the newest three.
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip3 = format!("{ENTRIES}?$skip=3");
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        let mut answers = vec![
+            (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
+            (skip3, page(0..2, 6, Some(&skip2))),
+            (skip2, page(2..4, 6, Some(&skip4))),
+            (skip4, page(4..6, 6, None)),
+        ];
+        answers.extend((3..6).rev().map(entry));
+        let (ids, issues) = walk(&answers, WalkBudget::new(3, Duration::from_secs(10))).await;
+        assert_eq!(ids, [3, 4, 5]);
+        assert_eq!(issues, [truncated(3, 6, "member budget spent")]);
+    }
+
+    #[tokio::test]
+    async fn a_spent_time_budget_stops_before_the_first_member_and_says_so() {
+        let answers = vec![(ENTRIES.to_owned(), page(0..2, 2, None))];
+        let (ids, issues) = walk(&answers, WalkBudget::new(10, Duration::ZERO)).await;
+        assert!(ids.is_empty());
+        assert_eq!(issues, [truncated(0, 2, "time budget spent")]);
+    }
+
+    #[test]
+    fn a_next_link_is_the_path_the_transport_resolves() {
+        let id = |link: &str| super::next_page_id(link).map(|id| id.to_string());
+        assert_eq!(
+            id("/redfish/v1/x?$skip=1"),
+            Some("/redfish/v1/x?$skip=1".into())
+        );
+        assert_eq!(
+            id("https://bmc.example/redfish/v1/x?$skip=2"),
+            Some("/redfish/v1/x?$skip=2".into())
+        );
+        assert_eq!(id("nonsense"), None);
     }
 
     #[test]

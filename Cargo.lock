@@ -1107,6 +1107,8 @@ dependencies = [
  "nv-telemetry-orchestration",
  "nv-telemetry-redfish",
  "nv-telemetry-source",
+ "serde_json",
+ "tempfile",
  "tokio",
  "url",
 ]
@@ -1128,6 +1130,7 @@ dependencies = [
  "nv-redfish-bmc-mock",
  "nv-telemetry-model",
  "nv-telemetry-source",
+ "serde",
  "serde_json",
  "time",
  "tokio",

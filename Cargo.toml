@@ -79,9 +79,14 @@ time = { version = "0.3", default-features = false }
 futures-timer = "3"
 url = "2"
 
+# The one hand-written Redfish document shape: a raw entries page, read for
+# the paging annotations nv-redfish's typed collections drop.
+serde = { version = "1", default-features = false, features = ["derive"] }
+
 # Dev-only: fixture JSON for the acquisition corpus, and the executor
 # bmc-mock's async trait impl needs under test.
 serde_json = "1"
+tempfile = { version = "3", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
 # Benchmarks measure instruction counts under Valgrind, so numbers are

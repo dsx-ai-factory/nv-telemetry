@@ -104,8 +104,10 @@ fn work(runtime: &mut PollRuntime, context: &str) -> AcquisitionReport {
 }
 
 /// One primed round: a sensor report, a chassis report, then a log report —
-/// all four payload kinds under the three providers' identities.
-fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext) {
+/// all four payload kinds under the three providers' identities. The log
+/// read yields its records once: `first` is the round that ships them, and
+/// every later round finds the same entry already shipped.
+fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext, first: bool) {
     let sensor_report = work(runtime, "sensor turn");
     assert_eq!(sensor_report.status().outcome(), Outcome::Succeeded);
     assert!(
@@ -143,13 +145,20 @@ fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext) {
 
     let log_report = work(runtime, "log turn");
     assert_eq!(log_report.status().outcome(), Outcome::Succeeded);
-    assert!(
-        log_report
-            .batches()
-            .iter()
-            .any(|batch| matches!(batch.payload(), Payload::Logs(_))),
-        "the log fixture yields records"
-    );
+    if first {
+        assert!(
+            log_report
+                .batches()
+                .iter()
+                .any(|batch| matches!(batch.payload(), Payload::Logs(_))),
+            "the log fixture yields records"
+        );
+    } else {
+        assert!(
+            log_report.batches().is_empty(),
+            "the log read remembers where its last walk ended: the same entry is not a record twice"
+        );
+    }
     for batch in log_report.batches() {
         assert_eq!(batch.origin().provider(), LogRead::<()>::PROVIDER);
     }
@@ -250,7 +259,7 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
 
     // Three primed rounds; after each, one cadence hint moves the clock.
     for round in 0..3 {
-        assert_mixed_round(&mut runtime, &endpoint);
+        assert_mixed_round(&mut runtime, &endpoint, round == 0);
         match drive(&mut runtime) {
             Some(RuntimeOutput::SleepUntil(deadline)) => manual.advance_to(deadline),
             other => panic!(
