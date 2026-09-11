@@ -697,7 +697,10 @@ does not stamp are shipped every poll. The cursor is not persisted, so a
 restart replays one window. Records that share an `occurred_at` — devices
 stamp to the second, and a burst lands many on one instant — carry no order
 but `entry_id`, which is the device's own spelling and compares numerically
-only when the device numbers its entries.
+only when the device numbers its entries. The ids kept at one instant are
+bounded to a few walks' worth, so a frozen device clock cannot grow the
+cursor without limit; past that bound the cursor keeps only the latest walk's
+ids, which a newest-first walk meets first.
 
 ---
 
