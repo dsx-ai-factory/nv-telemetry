@@ -18,5 +18,9 @@ nv-telemetry-source.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 url.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

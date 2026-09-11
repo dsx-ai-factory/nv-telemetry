@@ -38,6 +38,7 @@ use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::ProjectionIssue;
 
+const ROOT: &str = "/redfish/v1";
 const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
 const ENTRIES: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries";
 const ENTRY_1: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries/1";
@@ -169,16 +170,17 @@ fn attributes_of(entry_type: &str) -> BTreeMap<String, Value> {
     BTreeMap::from([("entry-type".to_owned(), text(entry_type))])
 }
 
-#[tokio::test]
-async fn a_service_projects_every_entry_into_one_batch() {
-    let acquired = acquire(&[
+/// The two-entry log as the walk requests it: newest member first.
+fn two_entries() -> Vec<(&'static str, &'static str)> {
+    vec![
         (SERVICE, include_str!("fixtures/logs/service.json")),
         (ENTRIES, include_str!("fixtures/logs/entries-two.json")),
-        (ENTRY_1, include_str!("fixtures/logs/entry-nominal.json")),
         (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
-    ])
-    .await;
+        (ENTRY_1, include_str!("fixtures/logs/entry-nominal.json")),
+    ]
+}
 
+fn two_records() -> Vec<LogRecord> {
     let minimal = LogRecord::builder()
         .occurred_at(instant(NOMINAL_CREATED + 300))
         .message("System boot complete")
@@ -186,7 +188,14 @@ async fn a_service_projects_every_entry_into_one_batch() {
         .attributes(attributes_of("Event"))
         .build()
         .expect("a valid record");
-    let expected = [batch(vec![nominal_record(), minimal])];
+    vec![nominal_record(), minimal]
+}
+
+#[tokio::test]
+async fn a_service_projects_every_entry_into_one_batch() {
+    let acquired = acquire(&two_entries()).await;
+
+    let expected = [batch(two_records())];
     assert_eq!(acquired.batches(), expected);
     assert_eq!(acquired.issues(), &[]);
 
@@ -196,6 +205,121 @@ async fn a_service_projects_every_entry_into_one_batch() {
         acquired.batches()[0].encode_to_vec(),
         expected[0].encode_to_vec()
     );
+}
+
+#[tokio::test]
+async fn a_read_remembers_where_its_last_walk_ended() {
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let prime = |answers: &[(&str, &str)]| {
+        for (uri, body) in answers {
+            bmc.expect(Expect::get(uri, body));
+        }
+    };
+    let read = LogRead::new(endpoint(), SERVICE.to_string().into(), Arc::clone(&bmc));
+
+    prime(&two_entries());
+    let first = run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+    assert_eq!(first.batches(), [batch(two_records())]);
+
+    // The next poll asks the root, once, whether the device filters — this
+    // one does not — then reads the newest member, finds it shipped, and
+    // asks for nothing older: no batch, no issue, and the same clone-shared
+    // position whichever clone the dispatcher polls through.
+    let repeat = [
+        (SERVICE, include_str!("fixtures/logs/service.json")),
+        (ENTRIES, include_str!("fixtures/logs/entries-two.json")),
+        (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
+    ];
+    prime(&[(ROOT, include_str!("fixtures/logs/service-root.json"))]);
+    prime(&repeat);
+    let second = run_acquisition(&read.clone(), at())
+        .await
+        .expect("the device answered");
+    assert_eq!(second.batches(), &[]);
+    assert_eq!(second.issues(), &[]);
+
+    // A walk that fails ships nothing and moves nothing: the member is left
+    // unprimed, the unit fails, and the poll after still finds the position
+    // where the first walk left it.
+    prime(&repeat[..2]);
+    run_acquisition(&read, at())
+        .await
+        .expect_err("the walk ends as a harness fault");
+    prime(&repeat);
+    let after_failure = run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+    assert_eq!(after_failure.batches(), &[]);
+}
+
+#[tokio::test]
+async fn a_filtering_device_is_asked_only_for_the_cursors_second_onward() {
+    // The root advertises `FilterQuery`, so from the second poll on the walk
+    // asks for the entries stamped at or after the cursor's — entry 2's
+    // instant — and reads one member: the cursor's own, which ends the walk.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let prime = |answers: &[(&str, &str)]| {
+        for (uri, body) in answers {
+            bmc.expect(Expect::get(uri, body));
+        }
+    };
+    let read = LogRead::new(endpoint(), SERVICE.to_string().into(), Arc::clone(&bmc));
+    prime(&two_entries());
+    run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+
+    let filtered = format!("{ENTRIES}?$filter=Created ge '2026-03-01T10:05:00Z'");
+    let filtered_page = format!(
+        r##"{{ "@odata.id": "{filtered}", "@odata.type": "#LogEntryCollection.LogEntryCollection",
+             "Name": "Entries", "Members@odata.count": 1,
+             "Members": [ {{ "@odata.id": "{ENTRY_2}" }} ] }}"##
+    );
+    prime(&[
+        (
+            ROOT,
+            include_str!("fixtures/logs/service-root-filtering.json"),
+        ),
+        (SERVICE, include_str!("fixtures/logs/service.json")),
+        (filtered.as_str(), filtered_page.as_str()),
+        (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
+    ]);
+    let second = run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+    assert_eq!(second.batches(), &[]);
+    assert_eq!(second.issues(), &[]);
+}
+
+#[tokio::test]
+async fn a_paged_collection_is_walked_to_its_end() {
+    // The same two entries served one per page: the walk follows
+    // `Members@odata.nextLink` and reads both, newest first.
+    let first_page = format!(
+        r##"{{ "@odata.id": "{ENTRIES}", "@odata.type": "#LogEntryCollection.LogEntryCollection",
+             "Name": "Entries", "Members@odata.count": 2,
+             "Members": [ {{ "@odata.id": "{ENTRY_1}" }} ],
+             "Members@odata.nextLink": "{ENTRIES}?$skip=1" }}"##
+    );
+    let second_page = format!(
+        r##"{{ "@odata.id": "{ENTRIES}?$skip=1", "@odata.type": "#LogEntryCollection.LogEntryCollection",
+             "Name": "Entries", "Members@odata.count": 2,
+             "Members": [ {{ "@odata.id": "{ENTRY_2}" }} ] }}"##
+    );
+    let second_uri = format!("{ENTRIES}?$skip=1");
+    let acquired = acquire(&[
+        (SERVICE, include_str!("fixtures/logs/service.json")),
+        (ENTRIES, first_page.as_str()),
+        (second_uri.as_str(), second_page.as_str()),
+        (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
+        (ENTRY_1, include_str!("fixtures/logs/entry-nominal.json")),
+    ])
+    .await;
+
+    assert_eq!(acquired.batches(), [batch(two_records())]);
+    assert_eq!(acquired.issues(), &[]);
 }
 
 #[tokio::test]
@@ -211,9 +335,11 @@ async fn the_batch_names_the_service_its_entry_ids_belong_to() {
 }
 
 #[tokio::test]
-async fn a_walk_past_its_member_budget_stops_and_says_so() {
-    // One more member than the budget admits; every member primed, so the
-    // budget — not the device — is what stops the walk.
+async fn a_walk_past_its_member_budget_keeps_the_newest_and_says_so() {
+    // One more member than the budget admits. The device lists entries
+    // oldest first, so the budget must fall on the head: the walk visits
+    // members newest first — the priming order below — and the one entry it
+    // never asks for is the oldest.
     let over = 1025;
     let members: Vec<String> = (0..over)
         .map(|index| format!(r#"{{ "@odata.id": "{ENTRIES}/{index}" }}"#))
@@ -223,7 +349,8 @@ async fn a_walk_past_its_member_budget_stops_and_says_so() {
              "Name": "Entries", "Members@odata.count": {over}, "Members": [{}] }}"##,
         members.join(",")
     );
-    let entries: Vec<(String, String)> = (0..over)
+    let entries: Vec<(String, String)> = (1..over)
+        .rev()
         .map(|index| {
             (
                 format!("{ENTRIES}/{index}"),
@@ -250,6 +377,17 @@ async fn a_walk_past_its_member_budget_stops_and_says_so() {
         panic!("a logs payload");
     };
     assert_eq!(logs.records().len(), 1024, "the budget's worth of members");
+    let mut ids: Vec<usize> = logs
+        .records()
+        .iter()
+        .filter_map(|record| record.entry_id()?.parse().ok())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..over).collect::<Vec<_>>(),
+        "the oldest entry is the one dropped"
+    );
     assert_eq!(
         acquired.batches()[0].coverage().completeness(),
         Completeness::Partial
@@ -258,7 +396,7 @@ async fn a_walk_past_its_member_budget_stops_and_says_so() {
         acquired.issues(),
         &[ProjectionIssue::invalid(
             TRUNCATED_WALK_LOCATOR,
-            "walk stopped at member 1024 of 1025: member budget spent"
+            "walk kept the newest 1024 of 1025 members: member budget spent"
         )]
     );
     // The constant the corpus depends on, pinned where a change would be seen.
@@ -317,12 +455,12 @@ async fn two_entries_with_one_fault_are_two_facts() {
         (SERVICE, include_str!("fixtures/logs/service.json")),
         (ENTRIES, include_str!("fixtures/logs/entries-two.json")),
         (
-            ENTRY_1,
-            include_str!("fixtures/logs/entry-without-message.json"),
-        ),
-        (
             ENTRY_2,
             include_str!("fixtures/logs/entry-without-message-2.json"),
+        ),
+        (
+            ENTRY_1,
+            include_str!("fixtures/logs/entry-without-message.json"),
         ),
     ])
     .await;
@@ -339,17 +477,18 @@ async fn two_entries_with_one_fault_are_two_facts() {
 
 #[tokio::test]
 async fn a_member_failure_that_is_not_the_devices_answer_ends_the_walk() {
-    // The second member is never primed: the mock fails its GET as a
-    // harness fault — Internal, neither an answer the device gave about the
-    // member nor an endpoint fact — so the walk ends as the unit's failure
-    // and the record already projected does not ship. (A device's own
-    // answer about a member — a 404 for a rotated-out entry — is recorded
-    // against `Members[i]` instead; the mock cannot replay one, so that
-    // disposition is pinned in the provider's unit tests.)
+    // The older member is never primed: the walk reads the newest first,
+    // and the mock fails the next GET as a harness fault — Internal,
+    // neither an answer the device gave about the member nor an endpoint
+    // fact — so the walk ends as the unit's failure and the record already
+    // projected does not ship. (A device's own answer about a member — a
+    // 404 for a rotated-out entry — is recorded against `Members[i]`
+    // instead; the mock cannot replay one, so that disposition is pinned in
+    // the provider's unit tests.)
     let failure = run(&[
         (SERVICE, include_str!("fixtures/logs/service.json")),
         (ENTRIES, include_str!("fixtures/logs/entries-two.json")),
-        (ENTRY_1, include_str!("fixtures/logs/entry-nominal.json")),
+        (ENTRY_2, include_str!("fixtures/logs/entry-minimal.json")),
     ])
     .await
     .expect_err("the walk ends");

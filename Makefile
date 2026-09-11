@@ -29,7 +29,7 @@ buf-version ?= 1.72.0
 # the target is up to date, and silently does nothing.
 .PHONY: all ci fmt bench codegen check-codegen proto-lint \
 	check-proto-format check-redfish-features require-buf \
-	rust-install clean
+	rust-install clean test-bmc-mock
 
 # `--locked` throughout: generated output is byte-compared, and its bytes are
 # decided by prost-build and prettyplease. Manifests state semver ranges, and
@@ -93,6 +93,11 @@ codegen:
 
 check-codegen:
 	cargo run $(cargo-locked) -p nv-telemetry-codegen -- --check
+
+# Optional cross-repository HTTP test; first build the sibling bmc-mock and
+# point BMC_MOCK_ROOT at its target directory.
+test-bmc-mock:
+	cargo test $(cargo-locked) -p nv-telemetry-probe --test e2e_http -- --ignored --nocapture
 
 # Every transport row the Redfish crate supports is explicit here. Workspace
 # default/all-feature builds cover only the HTTP and combined rows and

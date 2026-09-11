@@ -1,0 +1,7 @@
+{
+  "profile": "dell_poweredge_r750",
+  "username": "root",
+  "factory_password": "factory_password",
+  "password": "integration-test-password",
+  "reading": 42.5
+}

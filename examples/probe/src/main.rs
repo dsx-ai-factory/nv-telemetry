@@ -30,6 +30,7 @@ use nv_redfish_dispatcher::Runtime;
 use nv_redfish_dispatcher::RuntimeConfig;
 use nv_redfish_dispatcher::RuntimeOutput;
 use nv_telemetry_model::EndpointContext;
+use nv_telemetry_model::Outcome;
 use nv_telemetry_orchestration::endpoint_subtree;
 use nv_telemetry_orchestration::plan;
 use nv_telemetry_orchestration::AcquisitionReport;
@@ -49,6 +50,7 @@ usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
            [--sensor <odata-id> ...] [--chassis <odata-id> ...]
            [--log-service <odata-id> ...]
            [--cadence-ms <ms>] [--count <n>] [--base-url <url>] [--insecure]
+           [--strict]
 
   mock    poll the in-process BMC mock, replaying fixtures/
   http    poll a live Redfish service at --base-url; credentials come
@@ -56,6 +58,9 @@ usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
           self-signed BMC certificates
 
 Prints one tagged line per stream item: batch, issues, status.
+--strict exits 1 after the requested reports if any acquisition failed or
+reported projection issues; requires --count greater than zero. Without it,
+reported acquisition failures and issues do not change the exit status.
 ";
 
 /// The mock log fixture's own entries collection and member: what the
@@ -73,6 +78,7 @@ struct Args {
     count: usize,
     base_url: Option<String>,
     insecure: bool,
+    strict: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -113,6 +119,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut count = 10;
     let mut base_url = None;
     let mut insecure = false;
+    let mut strict = false;
 
     while let Some(flag) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("`{flag}` needs a value"));
@@ -141,6 +148,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--base-url" => base_url = Some(value("--base-url")?),
             "--insecure" => insecure = true,
+            "--strict" => strict = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -148,6 +156,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mode = mode.ok_or("`--mode` is required")?;
     if mode == Mode::Http && base_url.is_none() {
         return Err("http mode needs `--base-url`".to_owned());
+    }
+    if strict && count == 0 {
+        return Err("`--strict` requires `--count` greater than zero".to_owned());
     }
     if sensors.is_empty() && chassis.is_empty() && log_services.is_empty() {
         return Err(
@@ -164,6 +175,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         count,
         base_url,
         insecure,
+        strict,
     })
 }
 
@@ -223,12 +235,14 @@ async fn run(args: &Args) -> Result<(), String> {
             let log_service_fixture = include_str!("../fixtures/log-service.json");
             let log_entries_fixture = include_str!("../fixtures/log-entries.json");
             let log_entry_fixture = include_str!("../fixtures/log-entry.json");
+            let service_root_fixture = include_str!("../fixtures/service-root.json");
             // Mock expectations are one-shot AND strict-FIFO, so priming
             // follows dispatch order: the ring visits targets in needs
             // order each round, and a log read asks three times — the
-            // service, its entries collection, then each member. The
-            // collection and entry URIs are the fixture's own.
-            for _ in 0..args.count {
+            // service, its entries collection, then each member — plus the
+            // service root on its second round, to learn whether the device
+            // filters. The collection and entry URIs are the fixture's own.
+            for round in 0..args.count {
                 for sensor in &args.sensors {
                     bmc.expect(Expect::get(sensor, sensor_fixture));
                 }
@@ -236,6 +250,9 @@ async fn run(args: &Args) -> Result<(), String> {
                     bmc.expect(Expect::get(chassis, chassis_fixture));
                 }
                 for service in &args.log_services {
+                    if round == 1 {
+                        bmc.expect(Expect::get("/redfish/v1", service_root_fixture));
+                    }
                     bmc.expect(Expect::get(service, log_service_fixture));
                     bmc.expect(Expect::get(LOG_ENTRIES, log_entries_fixture));
                     bmc.expect(Expect::get(LOG_ENTRY, log_entry_fixture));
@@ -333,6 +350,8 @@ async fn drive(
     );
 
     let mut remaining = args.count;
+    let mut failures = 0usize;
+    let mut issue_reports = 0usize;
     let mut deadline = None;
     loop {
         let output = if let Some(at) = deadline {
@@ -354,10 +373,12 @@ async fn drive(
                     Ok(reports) => {
                         for report in reports {
                             let (batches, issues, status) = report.into_parts();
+                            failures += usize::from(status.outcome() == Outcome::Failed);
                             for batch in batches {
                                 println!("batch: {batch:?}");
                             }
                             if let Some(issues) = issues {
+                                issue_reports += 1;
                                 println!("issues: {issues:?}");
                             }
                             println!("status: {status:?}");
@@ -365,6 +386,7 @@ async fn drive(
                         }
                     }
                     Err(fault) => {
+                        failures += 1;
                         println!("status: {:?}", fault.into_status());
                         remaining = remaining.saturating_sub(1);
                     }
@@ -376,6 +398,11 @@ async fn drive(
             RuntimeOutput::Shutdown => break,
             RuntimeOutput::Runtime(_) => {}
         }
+    }
+    if args.strict && (failures > 0 || issue_reports > 0) {
+        return Err(format!(
+            "strict check failed: {failures} failed acquisition(s), {issue_reports} report(s) with projection issues"
+        ));
     }
     Ok(())
 }

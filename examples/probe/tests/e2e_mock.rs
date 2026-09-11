@@ -49,6 +49,8 @@ const LOG_ENTRIES: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries";
 const LOG_ENTRY: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries/1";
 const SENSOR_FIXTURE: &str = include_str!("../fixtures/sensor.json");
 const CHASSIS_FIXTURE: &str = include_str!("../fixtures/chassis.json");
+const SERVICE_ROOT: &str = "/redfish/v1";
+const SERVICE_ROOT_FIXTURE: &str = include_str!("../fixtures/service-root.json");
 const LOG_SERVICE_FIXTURE: &str = include_str!("../fixtures/log-service.json");
 const LOG_ENTRIES_FIXTURE: &str = include_str!("../fixtures/log-entries.json");
 const LOG_ENTRY_FIXTURE: &str = include_str!("../fixtures/log-entry.json");
@@ -104,8 +106,10 @@ fn work(runtime: &mut PollRuntime, context: &str) -> AcquisitionReport {
 }
 
 /// One primed round: a sensor report, a chassis report, then a log report —
-/// all four payload kinds under the three providers' identities.
-fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext) {
+/// all four payload kinds under the three providers' identities. The log
+/// read yields its records once: `first` is the round that ships them, and
+/// every later round finds the same entry already shipped.
+fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext, first: bool) {
     let sensor_report = work(runtime, "sensor turn");
     assert_eq!(sensor_report.status().outcome(), Outcome::Succeeded);
     assert!(
@@ -143,13 +147,20 @@ fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext) {
 
     let log_report = work(runtime, "log turn");
     assert_eq!(log_report.status().outcome(), Outcome::Succeeded);
-    assert!(
-        log_report
-            .batches()
-            .iter()
-            .any(|batch| matches!(batch.payload(), Payload::Logs(_))),
-        "the log fixture yields records"
-    );
+    if first {
+        assert!(
+            log_report
+                .batches()
+                .iter()
+                .any(|batch| matches!(batch.payload(), Payload::Logs(_))),
+            "the log fixture yields records"
+        );
+    } else {
+        assert!(
+            log_report.batches().is_empty(),
+            "the log read remembers where its last walk ended: the same entry is not a record twice"
+        );
+    }
     for batch in log_report.batches() {
         assert_eq!(batch.origin().provider(), LogRead::<()>::PROVIDER);
     }
@@ -159,6 +170,24 @@ fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext) {
             && log_report.issues().is_none(),
         "the nominal fixtures are clean"
     );
+}
+
+/// Primes `rounds` of the mixed poll. The mock is strict-FIFO, so priming
+/// follows dispatch order: the ring visits targets in needs order each
+/// round, and the log read asks three times — service, entries collection,
+/// member — plus, on its second round only, the service root, to learn
+/// whether the device filters; this one does not.
+fn prime_rounds(bmc: &Bmc<nv_redfish_bmc_mock::Error>, rounds: usize) {
+    for round in 0..rounds {
+        bmc.expect(Expect::get(SENSOR, SENSOR_FIXTURE));
+        bmc.expect(Expect::get(CHASSIS, CHASSIS_FIXTURE));
+        if round == 1 {
+            bmc.expect(Expect::get(SERVICE_ROOT, SERVICE_ROOT_FIXTURE));
+        }
+        bmc.expect(Expect::get(LOG_SERVICE, LOG_SERVICE_FIXTURE));
+        bmc.expect(Expect::get(LOG_ENTRIES, LOG_ENTRIES_FIXTURE));
+        bmc.expect(Expect::get(LOG_ENTRY, LOG_ENTRY_FIXTURE));
+    }
 }
 
 #[test]
@@ -174,16 +203,7 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
         .build()
         .expect("a valid endpoint");
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
-    // The mock is strict-FIFO, so priming follows dispatch order: the ring
-    // visits targets in needs order each round, and the log read asks
-    // three times — service, entries collection, member.
-    for _ in 0..3 {
-        bmc.expect(Expect::get(SENSOR, SENSOR_FIXTURE));
-        bmc.expect(Expect::get(CHASSIS, CHASSIS_FIXTURE));
-        bmc.expect(Expect::get(LOG_SERVICE, LOG_SERVICE_FIXTURE));
-        bmc.expect(Expect::get(LOG_ENTRIES, LOG_ENTRIES_FIXTURE));
-        bmc.expect(Expect::get(LOG_ENTRY, LOG_ENTRY_FIXTURE));
-    }
+    prime_rounds(&bmc, 3);
 
     let cadence = Duration::from_secs(30);
     let plan = plan(
@@ -250,7 +270,7 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
 
     // Three primed rounds; after each, one cadence hint moves the clock.
     for round in 0..3 {
-        assert_mixed_round(&mut runtime, &endpoint);
+        assert_mixed_round(&mut runtime, &endpoint, round == 0);
         match drive(&mut runtime) {
             Some(RuntimeOutput::SleepUntil(deadline)) => manual.advance_to(deadline),
             other => panic!(
