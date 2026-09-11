@@ -411,6 +411,12 @@ impl WalkBudget {
         Self { members, elapsed }
     }
 
+    /// How many ids the cursor keeps at one instant: four walks' worth, so a
+    /// frozen device clock cannot grow the cursor for the life of the process.
+    fn retained_ids(self) -> usize {
+        self.members.saturating_mul(4)
+    }
+
     /// Why the walk stops before its next member, if it does.
     fn exhausted(self, visited: usize, elapsed: Duration) -> Option<&'static str> {
         if visited >= self.members {
@@ -620,6 +626,13 @@ impl ReadKind for LogKind {
 /// records on one instant, which is why the instant alone cannot place a
 /// record and the ids emitted at that instant ride along.
 ///
+/// The ids kept at one instant are bounded to four walks' worth. A device
+/// whose clock is frozen stamps every entry on one second, which would
+/// otherwise grow the cursor for the life of the process; past the bound
+/// only the latest walk's ids are kept, which is where a newest-first walk
+/// stops anyway. A device whose member order is not chronological may then
+/// re-ship a few same-second entries after an overflow.
+///
 /// Two things move the cursor backwards. A log that was wiped and refilled,
 /// or a device clock stepped back, makes the newest entry present *older*
 /// than the cursor; the walk then discards the cursor and emits the whole
@@ -673,8 +686,9 @@ impl Position {
 
     /// The position after shipping `records` on top of `previous`: the
     /// newest instant among them, with the ids at that instant — merged
-    /// with the previous ids when the instant did not move.
-    fn after(previous: Option<&Self>, records: &[LogRecord]) -> Option<Self> {
+    /// with the previous ids when the instant did not move, up to
+    /// `retained` ids.
+    fn after(previous: Option<&Self>, records: &[LogRecord], retained: usize) -> Option<Self> {
         let at = records
             .iter()
             .filter_map(LogRecord::occurred_at)
@@ -683,19 +697,29 @@ impl Position {
         let Some(at) = at else {
             return previous.cloned();
         };
-        let mut ids: std::collections::BTreeSet<String> = records
-            .iter()
-            .filter(|record| record.occurred_at() == Some(&at))
-            .filter_map(|record| record.entry_id().map(str::to_owned))
-            .collect();
+        let ids = Self::ids_at(records, &at);
         match previous {
             Some(previous) if previous.at == at => {
-                ids.extend(previous.ids.iter().cloned());
+                let mut merged = previous.ids.clone();
+                merged.extend(ids.iter().cloned());
+                // Past the bound, keep this walk's ids alone: read newest
+                // first, they are what the next walk meets before any older
+                // shipped entry.
+                let ids = if merged.len() > retained { ids } else { merged };
                 Some(Self { at, ids })
             }
             Some(previous) if previous.at > at => Some(previous.clone()),
             _ => Some(Self { at, ids }),
         }
+    }
+
+    /// The entry ids among `records` stamped exactly at `at`.
+    fn ids_at(records: &[LogRecord], at: &Timestamp) -> std::collections::BTreeSet<String> {
+        records
+            .iter()
+            .filter(|record| record.occurred_at() == Some(at))
+            .filter_map(|record| record.entry_id().map(str::to_owned))
+            .collect()
     }
 }
 
@@ -789,7 +813,7 @@ where
             ),
         ));
     }
-    let position = Position::after(previous.as_ref(), &records);
+    let position = Position::after(previous.as_ref(), &records, budget.retained_ids());
     Ok(Walk {
         records,
         issues,
@@ -1203,6 +1227,48 @@ mod tests {
         prime(&bmc, &[(ENTRIES.to_owned(), page(0..5, 5, None))]);
         prime(&bmc, &[entry_at(4, same_second)]);
         assert!(walk_with(&bmc, &cursor, generous()).await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_frozen_clock_does_not_grow_the_cursor_without_bound() {
+        // Two members per walk, so the cursor keeps at most eight ids at one
+        // instant. Every entry carries the same stamp, as from a device whose
+        // clock never advances.
+        let frozen = "2026-03-01T10:00:00Z";
+        let budget = WalkBudget::new(2, Duration::from_secs(10));
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        let retained = |cursor: &super::LogCursor| cursor.load().expect("a position").ids.len();
+
+        // Two new entries per poll: the ids accumulate up to the bound.
+        for end in [2, 4, 6, 8] {
+            prime(&bmc, &[(ENTRIES.to_owned(), page(0..end, end, None))]);
+            prime(
+                &bmc,
+                &[entry_at(end - 1, frozen), entry_at(end - 2, frozen)],
+            );
+            assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [end - 2, end - 1]);
+            assert_eq!(retained(&cursor), end);
+        }
+
+        // One more poll would exceed the bound, so only its own ids remain.
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..10, 10, None))]);
+        prime(&bmc, &[entry_at(9, frozen), entry_at(8, frozen)]);
+        assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [8, 9]);
+        assert_eq!(retained(&cursor), 2);
+
+        // Those ids are the newest shipped, so they still end the next walk.
+        prime(
+            &bmc,
+            &[
+                (ENTRIES.to_owned(), page(0..10, 10, None)),
+                entry_at(9, frozen),
+            ],
+        );
+        assert!(walk_with(&bmc, &cursor, budget).await.0.is_empty());
+        prime(&bmc, &[(ENTRIES.to_owned(), page(0..11, 11, None))]);
+        prime(&bmc, &[entry_at(10, frozen), entry_at(9, frozen)]);
+        assert_eq!(walk_with(&bmc, &cursor, budget).await.0, [10]);
     }
 
     #[tokio::test]
