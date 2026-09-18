@@ -5,7 +5,5 @@
   "Name": "Root Service",
   "RedfishVersion": "1.10.0",
   "EventService": { "@odata.id": "/redfish/v1/EventService" },
-  "Links": {
-    "Sessions": { "@odata.id": "/redfish/v1/SessionService/Sessions" }
-  }
+  "Links": { "Sessions": { "@odata.id": "/redfish/v1/SessionService/Sessions" } }
 }

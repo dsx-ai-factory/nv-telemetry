@@ -12,6 +12,9 @@
 pub(crate) mod chassis;
 
 #[rustfmt::skip]
+pub(crate) mod events;
+
+#[rustfmt::skip]
 pub(crate) mod logs;
 
 #[rustfmt::skip]

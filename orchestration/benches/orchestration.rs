@@ -72,6 +72,7 @@ mod unix {
     use nv_telemetry_orchestration::Clock;
     use nv_telemetry_orchestration::EndpointFault;
     use nv_telemetry_orchestration::EndpointPolicy;
+    use nv_telemetry_orchestration::Needs;
     use nv_telemetry_orchestration::Plan;
     use nv_telemetry_orchestration::PollMeta;
     use nv_telemetry_orchestration::PollNeed;
@@ -256,7 +257,11 @@ mod unix {
     }
 
     fn subtree_input(count: usize) -> SubtreeInput {
-        let plan = plan(fleet_needs(count), &[declaration()]).expect("the declaration polls");
+        let plan = plan(
+            Needs::default().with_polls(fleet_needs(count)),
+            &[declaration()],
+        )
+        .expect("the declaration polls");
         let clock = FrozenClock {
             manual: ManualClock::new(),
         };
@@ -278,7 +283,7 @@ mod unix {
     fn primed_runtime(units: usize) -> PollRuntime {
         let input = subtree_input(units);
         let manual = input.clock.manual.clone();
-        let subtree = endpoint_subtree(&input.policy, &input.clock, input.units)
+        let subtree = endpoint_subtree(&input.policy, &input.clock, input.units, Vec::new())
             .expect("the units form a subtree");
         Runtime::new(
             RuntimeConfig {
@@ -316,7 +321,7 @@ mod unix {
             &input.endpoint,
             &input.origin,
             input.at,
-            Duration::from_millis(12),
+            Some(Duration::from_millis(12)),
             input.outcome,
         ))
     }
@@ -371,14 +376,17 @@ mod unix {
     #[library_benchmark]
     #[bench::matched_fleet(fleet_needs(FLEET_NEEDS))]
     pub fn plan_fleet(needs: Vec<PollNeed>) -> Plan {
-        black_box(plan(needs, &[declaration()]).expect("the declaration polls"))
+        black_box(
+            plan(Needs::default().with_polls(needs), &[declaration()])
+                .expect("the declaration polls"),
+        )
     }
 
     #[library_benchmark]
     #[bench::erased_chassis(subtree_input(SUBTREE_UNITS))]
     pub fn build_subtree(input: SubtreeInput) -> nv_telemetry_orchestration::EndpointSubtree {
         black_box(
-            endpoint_subtree(&input.policy, &input.clock, input.units)
+            endpoint_subtree(&input.policy, &input.clock, input.units, Vec::new())
                 .expect("the units form a subtree"),
         )
     }

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-util.workspace = true
 nv-redfish = { workspace = true, features = ["bmc-http"] }
 nv-redfish-bmc-mock.workspace = true
 nv-redfish-dispatcher.workspace = true

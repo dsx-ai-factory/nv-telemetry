@@ -1,0 +1,8 @@
+{
+  "@odata.id": "/redfish/v1/EventService",
+  "@odata.type": "#EventService.v1_9_3.EventService",
+  "Id": "EventService",
+  "Name": "Event Service",
+  "ServiceEnabled": true,
+  "ServerSentEventUri": "/redfish/v1/EventService/SSE"
+}

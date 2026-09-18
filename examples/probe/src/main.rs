@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use nv_redfish::bmc_http::reqwest::Client;
 use nv_redfish::bmc_http::reqwest::ClientParams;
 use nv_redfish::bmc_http::BmcCredentials;
@@ -36,11 +37,18 @@ use nv_telemetry_orchestration::plan;
 use nv_telemetry_orchestration::AcquisitionReport;
 use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
+use nv_telemetry_orchestration::Needs;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
+use nv_telemetry_orchestration::ReconnectPolicy;
+use nv_telemetry_orchestration::StreamNeed;
+use nv_telemetry_orchestration::StreamReports;
+use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_orchestration::SystemClock;
 use nv_telemetry_redfish::ChassisRead;
+use nv_telemetry_redfish::ClassifyError;
+use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
 use url::Url;
@@ -48,7 +56,7 @@ use url::Url;
 const USAGE: &str = "\
 usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
            [--sensor <odata-id> ...] [--chassis <odata-id> ...]
-           [--log-service <odata-id> ...]
+           [--log-service <odata-id> ...] [--event-stream]
            [--cadence-ms <ms>] [--count <n>] [--base-url <url>] [--insecure]
            [--strict]
 
@@ -56,6 +64,11 @@ usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
   http    poll a live Redfish service at --base-url; credentials come
           from PROBE_USERNAME and PROBE_PASSWORD; --insecure accepts
           self-signed BMC certificates
+
+--event-stream (http only) also plans the endpoint's server-sent event
+stream; each Event payload is one report. The dispatcher reopens a stream
+that ends after a backoff that doubles while instances deliver nothing,
+staggered per endpoint, unless the failure that ended it was not retryable.
 
 Prints one tagged line per stream item: batch, issues, status.
 --strict exits 1 after the requested reports if any acquisition failed or
@@ -74,6 +87,7 @@ struct Args {
     sensors: Vec<String>,
     chassis: Vec<String>,
     log_services: Vec<String>,
+    event_stream: bool,
     cadence: Duration,
     count: usize,
     base_url: Option<String>,
@@ -115,6 +129,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut sensors = Vec::new();
     let mut chassis = Vec::new();
     let mut log_services = Vec::new();
+    let mut event_stream = false;
     let mut cadence = Duration::from_secs(5);
     let mut count = 10;
     let mut base_url = None;
@@ -135,6 +150,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--sensor" => sensors.push(value("--sensor")?),
             "--chassis" => chassis.push(value("--chassis")?),
             "--log-service" => log_services.push(value("--log-service")?),
+            "--event-stream" => event_stream = true,
             "--cadence-ms" => {
                 let ms = value("--cadence-ms")?
                     .parse()
@@ -160,9 +176,16 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if strict && count == 0 {
         return Err("`--strict` requires `--count` greater than zero".to_owned());
     }
-    if sensors.is_empty() && chassis.is_empty() && log_services.is_empty() {
+    if event_stream && mode == Mode::Mock {
+        // The mock's expectations are strict-FIFO, and a stream's connect
+        // attempt shares the ring with the polls, so its requests cannot be
+        // primed in a known order.
+        return Err("`--event-stream` needs `--mode http`".to_owned());
+    }
+    if sensors.is_empty() && chassis.is_empty() && log_services.is_empty() && !event_stream {
         return Err(
-            "at least one `--sensor`, `--chassis`, or `--log-service` is required".to_owned(),
+            "at least one `--sensor`, `--chassis`, `--log-service`, or `--event-stream` is required"
+                .to_owned(),
         );
     }
     Ok(Args {
@@ -171,6 +194,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         sensors,
         chassis,
         log_services,
+        event_stream,
         cadence,
         count,
         base_url,
@@ -215,14 +239,19 @@ async fn run(args: &Args) -> Result<(), String> {
                 service.clone(),
                 args.cadence,
             )
-        }))
-        .collect();
+        }));
+    // The stream is planned like the polls: the embedder seats what the
+    // plan resolved and nothing else.
+    let stream_need = args
+        .event_stream
+        .then(|| StreamNeed::new(endpoint.clone(), EventStream::<()>::REQUEST_CLASS));
     let plan = plan(
-        needs,
+        Needs::default().with_polls(needs).with_streams(stream_need),
         &[
             SensorRead::<()>::declaration(),
             ChassisRead::<()>::declaration(),
             LogRead::<()>::declaration(),
+            EventStream::<()>::declaration(),
         ],
     )
     .map_err(|error| format!("plan: {error}"))?;
@@ -230,36 +259,10 @@ async fn run(args: &Args) -> Result<(), String> {
     match args.mode {
         Mode::Mock => {
             let bmc = Arc::new(nv_redfish_bmc_mock::Bmc::<nv_redfish_bmc_mock::Error>::default());
-            let sensor_fixture = include_str!("../fixtures/sensor.json");
-            let chassis_fixture = include_str!("../fixtures/chassis.json");
-            let log_service_fixture = include_str!("../fixtures/log-service.json");
-            let log_entries_fixture = include_str!("../fixtures/log-entries.json");
-            let log_entry_fixture = include_str!("../fixtures/log-entry.json");
-            let service_root_fixture = include_str!("../fixtures/service-root.json");
-            // Mock expectations are one-shot AND strict-FIFO, so priming
-            // follows dispatch order: the ring visits targets in needs
-            // order each round, and a log read asks three times — the
-            // service, its entries collection, then each member — plus the
-            // service root on its second round, to learn whether the device
-            // filters. The collection and entry URIs are the fixture's own.
-            for round in 0..args.count {
-                for sensor in &args.sensors {
-                    bmc.expect(Expect::get(sensor, sensor_fixture));
-                }
-                for chassis in &args.chassis {
-                    bmc.expect(Expect::get(chassis, chassis_fixture));
-                }
-                for service in &args.log_services {
-                    if round == 1 {
-                        bmc.expect(Expect::get("/redfish/v1", service_root_fixture));
-                    }
-                    bmc.expect(Expect::get(service, log_service_fixture));
-                    bmc.expect(Expect::get(LOG_ENTRIES, log_entries_fixture));
-                    bmc.expect(Expect::get(LOG_ENTRY, log_entry_fixture));
-                }
-            }
+            prime_mock(&bmc, args);
             let units = units(&plan, &bmc, clock);
-            drive(&endpoint, units, clock, args).await
+            let streams = streams(&plan, &bmc, clock);
+            drive(&endpoint, units, streams, clock, args).await
         }
         Mode::Http => {
             let base = args.base_url.as_deref().expect("checked at parse time");
@@ -278,7 +281,39 @@ async fn run(args: &Args) -> Result<(), String> {
                 CacheSettings::default(),
             ));
             let units = units(&plan, &bmc, clock);
-            drive(&endpoint, units, clock, args).await
+            let streams = streams(&plan, &bmc, clock);
+            drive(&endpoint, units, streams, clock, args).await
+        }
+    }
+}
+
+/// Mock expectations are one-shot AND strict-FIFO, so priming follows
+/// dispatch order: the ring visits targets in needs order each round, and a
+/// log read asks three times — the service, its entries collection, then
+/// each member — plus the service root on its second round, to learn
+/// whether the device filters. The collection and entry URIs are the
+/// fixture's own.
+fn prime_mock(bmc: &nv_redfish_bmc_mock::Bmc<nv_redfish_bmc_mock::Error>, args: &Args) {
+    let sensor_fixture = include_str!("../fixtures/sensor.json");
+    let chassis_fixture = include_str!("../fixtures/chassis.json");
+    let log_service_fixture = include_str!("../fixtures/log-service.json");
+    let log_entries_fixture = include_str!("../fixtures/log-entries.json");
+    let log_entry_fixture = include_str!("../fixtures/log-entry.json");
+    let service_root_fixture = include_str!("../fixtures/service-root.json");
+    for round in 0..args.count {
+        for sensor in &args.sensors {
+            bmc.expect(Expect::get(sensor, sensor_fixture));
+        }
+        for chassis in &args.chassis {
+            bmc.expect(Expect::get(chassis, chassis_fixture));
+        }
+        for service in &args.log_services {
+            if round == 1 {
+                bmc.expect(Expect::get("/redfish/v1", service_root_fixture));
+            }
+            bmc.expect(Expect::get(service, log_service_fixture));
+            bmc.expect(Expect::get(LOG_ENTRIES, log_entries_fixture));
+            bmc.expect(Expect::get(LOG_ENTRY, log_entry_fixture));
         }
     }
 }
@@ -300,7 +335,7 @@ fn units<B>(
 ) -> Vec<PollUnit>
 where
     B: nv_redfish::Bmc + Send + Sync + 'static,
-    B::Error: nv_telemetry_redfish::ClassifyError,
+    B::Error: ClassifyError,
 {
     plan.polls()
         .iter()
@@ -323,13 +358,81 @@ where
         .collect()
 }
 
+/// The streamed half of the class dispatch: each planned stream to the
+/// provider that declared its class, paired with the reports the driving
+/// loop pulls.
+fn streams<B>(
+    plan: &nv_telemetry_orchestration::Plan,
+    bmc: &Arc<B>,
+    clock: SystemClock,
+) -> Vec<(StreamUnit, StreamReports)>
+where
+    B: nv_redfish::Bmc + Send + Sync + 'static,
+    B::Error: ClassifyError + 'static,
+{
+    plan.streams()
+        .iter()
+        .map(|planned| {
+            if planned.origin().request_class() == EventStream::<B>::REQUEST_CLASS {
+                let unit = EventStream::new(planned.endpoint().clone(), Arc::clone(bmc));
+                StreamUnit::new(
+                    planned.clone(),
+                    Arc::new(unit),
+                    ReconnectPolicy::default(),
+                    clock,
+                )
+            } else {
+                unreachable!("the plan selects only declared providers")
+            }
+        })
+        .collect()
+}
+
+/// What the driving loop counts across every report, polled or streamed.
+#[derive(Default)]
+struct Tally {
+    reports: usize,
+    failures: usize,
+    issue_reports: usize,
+}
+
+impl Tally {
+    fn record(&mut self, result: Result<Vec<AcquisitionReport>, EndpointFault>) {
+        match result {
+            Ok(reports) => {
+                for report in reports {
+                    let (batches, issues, status) = report.into_parts();
+                    self.failures += usize::from(status.outcome() == Outcome::Failed);
+                    for batch in batches {
+                        println!("batch: {batch:?}");
+                    }
+                    if let Some(issues) = issues {
+                        self.issue_reports += 1;
+                        println!("issues: {issues:?}");
+                    }
+                    println!("status: {status:?}");
+                    self.reports += 1;
+                }
+            }
+            Err(fault) => {
+                self.failures += 1;
+                println!("status: {:?}", fault.into_status());
+                self.reports += 1;
+            }
+        }
+    }
+}
+
 async fn drive(
     endpoint: &EndpointContext,
     units: Vec<PollUnit>,
+    streams: Vec<(StreamUnit, StreamReports)>,
     clock: SystemClock,
     args: &Args,
 ) -> Result<(), String> {
-    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, units)
+    let polled = !units.is_empty();
+    let (streams, reports): (Vec<StreamUnit>, Vec<StreamReports>) = streams.into_iter().unzip();
+    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, units, streams)
         .map_err(|error| format!("recipe: {error}"))?;
 
     let mut runtime: Runtime<AcquisitionReport, EndpointFault, PollMeta> = Runtime::new(
@@ -342,66 +445,63 @@ async fn drive(
     let handle = runtime.handle();
 
     println!(
-        "polling {} target(s) on `{}` every {:?}, {} report(s)",
+        "polling {} target(s) on `{}` every {:?}{}, {} report(s)",
         args.sensors.len() + args.chassis.len() + args.log_services.len(),
         endpoint.endpoint_id(),
         args.cadence,
+        if reports.is_empty() {
+            ""
+        } else {
+            " plus its event stream"
+        },
         args.count
     );
 
-    let mut remaining = args.count;
-    let mut failures = 0usize;
-    let mut issue_reports = 0usize;
+    // The streams' reports join the runtime's outputs. The runtime itself
+    // schedules every connect and reconnect; the reports end once policy
+    // has stopped the last stream.
+    let mut streaming = !reports.is_empty();
+    let mut reports = futures_util::stream::select_all(reports);
+
+    let mut tally = Tally::default();
     let mut deadline = None;
     loop {
-        let output = if let Some(at) = deadline {
-            tokio::select! {
-                output = runtime.next() => output,
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {
-                    deadline = None;
-                    continue;
-                }
-            }
-        } else {
-            runtime.next().await
-        };
-
-        match output {
-            RuntimeOutput::SleepUntil(at) => deadline = Some(at),
-            RuntimeOutput::Work { result, .. } => {
-                match result {
-                    Ok(reports) => {
-                        for report in reports {
-                            let (batches, issues, status) = report.into_parts();
-                            failures += usize::from(status.outcome() == Outcome::Failed);
-                            for batch in batches {
-                                println!("batch: {batch:?}");
-                            }
-                            if let Some(issues) = issues {
-                                issue_reports += 1;
-                                println!("issues: {issues:?}");
-                            }
-                            println!("status: {status:?}");
-                            remaining = remaining.saturating_sub(1);
-                        }
-                    }
-                    Err(fault) => {
-                        failures += 1;
-                        println!("status: {:?}", fault.into_status());
-                        remaining = remaining.saturating_sub(1);
+        // Three wake-ups: the runtime spoke, a stream reported or the last
+        // one ended, or the runtime's sleep hint came due.
+        tokio::select! {
+            output = runtime.next() => match output {
+                RuntimeOutput::SleepUntil(at) => deadline = Some(at),
+                RuntimeOutput::Work { result, .. } => tally.record(result),
+                RuntimeOutput::Shutdown => break,
+                RuntimeOutput::Runtime(_) => {}
+            },
+            report = reports.next(), if streaming => {
+                if let Some(report) = report {
+                    tally.record(report.map(|report| vec![report]));
+                } else {
+                    // With no polls beside the ended streams, nothing more
+                    // can report.
+                    streaming = false;
+                    if !polled {
+                        handle.graceful_shutdown();
                     }
                 }
-                if remaining == 0 {
-                    handle.graceful_shutdown();
-                }
             }
-            RuntimeOutput::Shutdown => break,
-            RuntimeOutput::Runtime(_) => {}
+            () = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                    None => std::future::pending().await,
+                }
+            } => deadline = None,
+        }
+        if tally.reports >= args.count {
+            handle.graceful_shutdown();
         }
     }
-    if args.strict && (failures > 0 || issue_reports > 0) {
+    if args.strict && (tally.failures > 0 || tally.issue_reports > 0) {
         return Err(format!(
-            "strict check failed: {failures} failed acquisition(s), {issue_reports} report(s) with projection issues"
+            "strict check failed: {} failed acquisition(s), {} report(s) with projection issues",
+            tally.failures, tally.issue_reports
         ));
     }
     Ok(())

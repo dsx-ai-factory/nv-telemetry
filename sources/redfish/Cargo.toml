@@ -12,7 +12,9 @@ nv-telemetry-source.workspace = true
 # `chassis` is what makes Sensor reachable from ServiceRoot: generation is
 # rooted there, and an unreachable schema type is not emitted at all.
 # `log-services` brings LogService, its entries collection, and LogEntry.
-nv-redfish = { workspace = true, features = ["sensors", "chassis", "log-services"] }
+# `event-service` brings EventService, the SSE payload types, and the
+# vendor patches that make some devices' event records deserialize.
+nv-redfish = { workspace = true, features = ["sensors", "chassis", "log-services", "event-service"] }
 # Optional so the `bmc-mock` feature can gate a `ClassifyError` impl for the
 # mock's error type; tests pull it unconditionally through dev-dependencies.
 nv-redfish-bmc-mock = { workspace = true, optional = true }
@@ -20,6 +22,7 @@ serde.workspace = true
 time.workspace = true
 futures-timer.workspace = true
 futures-util.workspace = true
+uuid.workspace = true
 
 [features]
 # The HTTP transport is the default consumer path; without it this crate is

@@ -1048,23 +1048,48 @@ and generated projection code — and only the first is hand-written. Its size
 tracks how messy the protocol is, which is why Redfish is the large one and a
 proto-described source is small.
 
-## Unconstrained by this design
+## Streamed acquisition placement
 
-### Streamed acquisition placement
+Polled work maps directly to dispatcher tasks. A stream is a long-lived
+connection rather than a request and a response, so it could sit either as a
+stream-read adapter inside the dispatcher graph or beside the dispatcher with
+its connection attempts admitted through it. Redfish server-sent events took
+the second placement, and the choice holds for any stream whose items arrive
+at the device's pace:
 
-Polled work maps directly to dispatcher tasks. Streamed sources admit two
-placements, and the architecture constrains neither:
+- **Connection is dispatched work.** A stream's connect leaf sits in the
+  endpoint subtree beside the poll leaves, under the same concurrency limit,
+  breaker, and token bucket, and is charged the provider's declared cost. A
+  failed connect is a status like a failed poll, and an endpoint-scoped one
+  reaches the endpoint breaker.
+- **Reconnection is dispatcher scheduling.** When an instance ends, the leaf
+  computes the next due instant from a typed reconnect policy — a delay that
+  doubles across instances that delivered nothing, capped, spread per
+  endpoint by a share fixed from a hash of its id so a fleet that lost a
+  link does not reconnect in lockstep, and no retry when the failure said
+  retrying is pointless — and the runtime sleeps to it as it sleeps to a
+  poll's next tick. No loop and no timer exist beside the dispatcher.
+- **Items are pulled, not pushed.** The opened stream is drained outside the
+  dispatcher, because a work item completes once, through a stream of
+  reports the embedder pulls at its own pace. Backpressure is the consumer's
+  demand reaching the socket; the device's own overflow behavior is the
+  overflow policy, and it is reported as a coverage gap rather than absorbed
+  by an unbounded buffer.
+- **Cancellation and shutdown are drops.** Dropping the report stream stops
+  the leaf and makes a pending connect attempt open nothing; dropping the
+  subtree ends the report stream once its current instance does.
+- **Fairness covers connects.** The items themselves are not admitted: a
+  stream's rate is the device's, and throttling it client-side would only
+  move the overflow from the device's buffer, which reports it, to the
+  collector's, which cannot.
+- **A stream fetches nothing.** A record the payload only references is an
+  issue, never a request, because a request from the drain would be one
+  nothing admitted.
 
-- a stream-read adapter inside the dispatcher graph, keeping more activity
-  under common fairness control; or
-- subscriptions beside the dispatcher, with connection and reconnection
-  attempts admitted through it.
-
-The source abstraction is expressive enough for both, and whichever is chosen
-has to account for cancellation, reconnect backoff, fairness, shutdown, and
-output backpressure. gNMI is the source that exercises the question, because a
-`Subscribe` in STREAM mode is a long-lived gRPC stream rather than a request
-and a response.
+Streams are planned as polls are: a stream need names an endpoint and a
+request class, resolves to the one streamed declaration of that class, and
+the unit built for it is checked against the plan when the subtree is built.
+gNMI's `Subscribe` in STREAM mode fits the same shape.
 
 ## Falsifiable claims
 

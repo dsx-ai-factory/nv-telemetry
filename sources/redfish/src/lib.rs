@@ -3,12 +3,15 @@
 
 //! Redfish acquisition.
 //!
-//! Three providers ship, one [`Read`] envelope each: [`SensorRead`] — one
-//! sensor `OData` GET projected into a readings batch and a states batch,
-//! per `docs/DATA-MODEL.md`'s worked example — [`ChassisRead`] — one chassis
-//! GET projected into an inventory batch and a states batch — and
+//! Three polled providers ship, one [`Read`] envelope each: [`SensorRead`] —
+//! one sensor `OData` GET projected into a readings batch and a states
+//! batch, per `docs/DATA-MODEL.md`'s worked example — [`ChassisRead`] — one
+//! chassis GET projected into an inventory batch and a states batch — and
 //! [`LogRead`] — a walk over a log service's entries projected into logs
-//! batches. Transport rides nv-redfish's `Bmc` trait, so the providers are
+//! batches. One streamed provider ships beside them: [`EventStream`] — the
+//! endpoint's server-sent events, one item per `Event` payload, projected
+//! into logs batches under the event service's own scope. Transport rides
+//! nv-redfish's `Bmc` trait, so the providers are
 //! generic over HTTP and the mock the fixture corpus replays through;
 //! reqwest and tokio enter the workspace only here, behind the `bmc-http`
 //! feature.
@@ -28,6 +31,7 @@ mod generated;
 mod instant;
 mod projection;
 mod provider;
+mod stream;
 mod uri;
 
 pub use failure::ClassifyError;
@@ -44,3 +48,6 @@ pub use provider::WalkBudget;
 pub use provider::FILTER_REFUSED_LOCATOR;
 pub use provider::IN_FLIGHT_WALK_LOCATOR;
 pub use provider::TRUNCATED_WALK_LOCATOR;
+pub use stream::EventStream;
+pub use stream::GAP_LOCATOR;
+pub use stream::METRIC_REPORT_LOCATOR;

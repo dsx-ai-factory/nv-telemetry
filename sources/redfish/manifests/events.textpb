@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The EventRecord mapping: one record of a server-sent Event becomes one
+# LogRecord. An nv.telemetry.mapping.v1.Manifest in protobuf text format,
+# checked against the DMTF schema index and the contract at `make codegen`
+# time.
+#
+# An event is a fact in its own right, as a log entry is, so the manifest
+# declares no subject; `LogRecord.subject` waits for navigation references
+# (`OriginOfCondition`, `LogEntry`) to be projectable. The stream provider
+# takes the records out of each Event's `Events` array; this projects a
+# single record. A record's identity is the device's `EventId`, which
+# restarts with the device and is unique within one stream; the provider's
+# coverage scope tells streams apart.
+
+source: "redfish"
+backend: BACKEND_SCHEMA_INDEX
+index: "nv-redfish-schema/dmtf"
+
+projections {
+  name: "event-record"
+  source_type: "EventRecord"
+  target_type: "nv.telemetry.v1.LogRecord"
+  # When the device says it happened. The record's own stamp, not the
+  # instant the stream delivered it.
+  fields {
+    source_path: "EventTimestamp"
+    target_field: "occurred_at"
+  }
+  # `MessageSeverity` is the current property, a `Health` value the
+  # contract's ladder maps directly; `OK` is an informational event. The
+  # deprecated free-text `Severity`, which bmcweb still sets alone, rides
+  # along as an attribute.
+  fields {
+    source_path: "MessageSeverity"
+    target_field: "severity"
+    null_policy: NULL_POLICY_ABSENT
+    value_map { from: "OK" to: "SEVERITY_INFO" }
+    value_map { from: "Warning" to: "SEVERITY_WARNING" }
+    value_map { from: "Critical" to: "SEVERITY_CRITICAL" }
+  }
+  # Verbatim device text, filled from the message registry by the device.
+  # A record without one is malformed: `required` reports it and no record
+  # is emitted.
+  fields {
+    source_path: "Message"
+    target_field: "message"
+    required: true
+  }
+  # The device's own identifier for the event.
+  fields {
+    source_path: "EventId"
+    target_field: "entry_id"
+  }
+  map_assemblies {
+    target_field: "attributes"
+    entries {
+      key: "message-id"
+      source_path: "MessageId"
+    }
+    entries {
+      key: "event-type"
+      source_path: "EventType"
+    }
+    entries {
+      key: "severity"
+      source_path: "Severity"
+    }
+    entries {
+      key: "member-id"
+      source_path: "MemberId"
+    }
+    entries {
+      key: "context"
+      source_path: "Context"
+    }
+  }
+}

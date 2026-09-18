@@ -36,6 +36,8 @@ use crate::clock::Clock;
 use crate::plan::PlannedPoll;
 use crate::report::poll_future;
 use crate::report::TelemetryWork;
+use crate::stream::ReconnectPolicy;
+use crate::stream::StreamUnit;
 
 /// When the endpoint breaker opens and how it recovers.
 #[derive(Clone, Debug)]
@@ -206,7 +208,7 @@ pub enum RecipeError {
     /// A policy value would silently disable, permanently jam, or crash
     /// the admission stack; each is a configuration error, refused loudly.
     InvalidPolicy(&'static str),
-    /// A planned poll and the unit built for it disagree about the
+    /// A planned acquisition and the unit built for it disagree about the
     /// endpoint — a wiring bug that would stamp every product with the
     /// wrong device.
     EndpointMismatch {
@@ -215,8 +217,9 @@ pub enum RecipeError {
         /// The endpoint id the unit carries.
         unit: String,
     },
-    /// A planned poll and the unit built for it disagree about the origin —
-    /// a wiring bug that would stamp every product with the wrong provider.
+    /// A planned acquisition and the unit built for it disagree about the
+    /// origin — a wiring bug that would stamp every product with the wrong
+    /// provider.
     OriginMismatch {
         /// What the plan resolved.
         planned: Box<Origin>,
@@ -311,6 +314,31 @@ fn validate(policy: &EndpointPolicy) -> Result<(), RecipeError> {
     Ok(())
 }
 
+/// Refuses reconnect delays that would spin, never fire, or overflow.
+fn validate_reconnect(policy: &ReconnectPolicy) -> Result<(), RecipeError> {
+    if policy.first_retry().is_zero() {
+        return Err(RecipeError::InvalidPolicy(
+            "reconnect first retry must be positive",
+        ));
+    }
+    if policy.max_retry() < policy.first_retry() {
+        return Err(RecipeError::InvalidPolicy(
+            "reconnect max retry must not be below the first retry",
+        ));
+    }
+    if policy.max_retry() > MAX_POLICY_INTERVAL {
+        return Err(RecipeError::InvalidPolicy(
+            "reconnect delays must be at most a year",
+        ));
+    }
+    if policy.stagger_percent() > 100 {
+        return Err(RecipeError::InvalidPolicy(
+            "reconnect stagger must be at most 100 percent",
+        ));
+    }
+    Ok(())
+}
+
 /// One planned poll bound to its acquisition unit, erased to the future
 /// level so units of different types share one subtree.
 pub struct PollUnit {
@@ -350,32 +378,40 @@ impl std::fmt::Debug for PollUnit {
     }
 }
 
-/// Builds one endpoint's subtree from its planned polls and their units.
-/// Leaf epochs and the bucket epoch come from `clock`, so the subtree and
-/// whatever timeline drives the runtime cannot diverge. Units of different
-/// request classes share the round-robin ring; per-class lanes and the
-/// class breaker remain deliberately absent.
+/// Builds one endpoint's subtree from its planned polls and streams, each
+/// bound to its unit. Leaf epochs and the bucket epoch come from `clock`,
+/// so the subtree and whatever timeline drives the runtime cannot diverge.
+/// Units of different request classes, polled or streamed, share the
+/// round-robin ring; per-class lanes and the class breaker remain
+/// deliberately absent.
 ///
 /// # Errors
 ///
-/// [`RecipeError::NoUnits`] on an empty unit list;
-/// [`RecipeError::InvalidPolicy`] for a policy that would disable, jam, or
-/// crash the stack; [`RecipeError::EndpointMismatch`] /
-/// [`RecipeError::OriginMismatch`] when a planned poll and its unit
-/// disagree; and [`RecipeError::MixedEndpoints`] when the unit list spans
+/// [`RecipeError::NoUnits`] when there is neither a poll nor a stream;
+/// [`RecipeError::InvalidPolicy`] for an endpoint or reconnect policy that
+/// would disable, jam, or crash the stack; [`RecipeError::EndpointMismatch`]
+/// / [`RecipeError::OriginMismatch`] when a planned acquisition and its
+/// unit disagree; and [`RecipeError::MixedEndpoints`] when the units span
 /// more than one endpoint.
 pub fn endpoint_subtree<C: Clock>(
     policy: &EndpointPolicy,
     clock: &C,
     units: Vec<PollUnit>,
+    streams: Vec<StreamUnit>,
 ) -> Result<EndpointSubtree, RecipeError> {
-    if units.is_empty() {
-        return Err(RecipeError::NoUnits);
-    }
+    let subtree_endpoint = units
+        .first()
+        .map(|unit| unit.planned.endpoint().endpoint_id())
+        .or_else(|| {
+            streams
+                .first()
+                .map(|stream| stream.planned().endpoint().endpoint_id())
+        })
+        .ok_or(RecipeError::NoUnits)?
+        .to_owned();
     validate(policy)?;
 
     let now = clock.instant();
-    let subtree_endpoint = units[0].planned.endpoint().endpoint_id().to_owned();
     let mut lanes = RoundRobin::new();
     for unit in units {
         let planned = &unit.planned;
@@ -399,6 +435,30 @@ pub fn endpoint_subtree<C: Clock>(
         }
         let leaf = PeriodicLeaf::new(now, planned.cadence(), unit.make_work);
         lanes.add_child(FixedCost::new(CostUnits::new(planned.cost()), leaf));
+    }
+    for stream in streams {
+        let planned = stream.planned();
+        if planned.endpoint().endpoint_id() != subtree_endpoint {
+            return Err(RecipeError::MixedEndpoints {
+                first: subtree_endpoint,
+                other: planned.endpoint().endpoint_id().to_owned(),
+            });
+        }
+        if planned.endpoint() != stream.unit_endpoint() {
+            return Err(RecipeError::EndpointMismatch {
+                planned: planned.endpoint().endpoint_id().to_owned(),
+                unit: stream.unit_endpoint().endpoint_id().to_owned(),
+            });
+        }
+        if planned.origin() != stream.unit_origin() {
+            return Err(RecipeError::OriginMismatch {
+                planned: Box::new(planned.origin().clone()),
+                unit: Box::new(stream.unit_origin().clone()),
+            });
+        }
+        validate_reconnect(stream.policy())?;
+        let cost = CostUnits::new(planned.cost());
+        lanes.add_child(FixedCost::new(cost, stream));
     }
 
     Ok(BoundedConcurrency::new(

@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::pin::pin;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
@@ -17,6 +18,7 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::Stream;
 use nv_redfish_bmc_mock::Bmc;
 use nv_redfish_bmc_mock::Expect;
 use nv_redfish_dispatcher::ClockConfig;
@@ -35,10 +37,17 @@ use nv_telemetry_orchestration::AcquisitionReport;
 use nv_telemetry_orchestration::Clock;
 use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
+use nv_telemetry_orchestration::Needs;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
+use nv_telemetry_orchestration::ReconnectPolicy;
+use nv_telemetry_orchestration::StreamNeed;
+use nv_telemetry_orchestration::StreamReport;
+use nv_telemetry_orchestration::StreamReports;
+use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_redfish::ChassisRead;
+use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
 
@@ -207,7 +216,7 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
 
     let cadence = Duration::from_secs(30);
     let plan = plan(
-        vec![
+        Needs::default().with_polls([
             PollNeed::new(
                 endpoint.clone(),
                 SensorRead::<()>::REQUEST_CLASS,
@@ -226,7 +235,7 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
                 LOG_SERVICE,
                 cadence,
             ),
-        ],
+        ]),
         &[
             SensorRead::<()>::declaration(),
             ChassisRead::<()>::declaration(),
@@ -258,6 +267,7 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
             PollUnit::new(plan.polls()[1].clone(), chassis_unit, &clock),
             PollUnit::new(plan.polls()[2].clone(), log_unit, &clock),
         ],
+        Vec::new(),
     )
     .expect("three providers form one subtree");
     let mut runtime: PollRuntime = Runtime::new(
@@ -292,5 +302,134 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
     assert!(
         report.batches().is_empty(),
         "a failed request emits no batch"
+    );
+}
+
+const EVENT_SERVICE: &str = "/redfish/v1/EventService";
+const SSE: &str = "/redfish/v1/EventService/SSE";
+const EVENT_SERVICE_FIXTURE: &str = include_str!("../fixtures/event-service.json");
+const EVENTS_FIXTURE: &str = include_str!("../fixtures/events.json");
+
+/// A report the stream's reports must yield on this pull.
+fn pulled(reports: &mut StreamReports) -> StreamReport {
+    match Pin::new(&mut *reports).poll_next(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Some(report)) => report,
+        Poll::Ready(None) => panic!("a report is due, but the reports are over"),
+        Poll::Pending => panic!("a report is due, but none was pulled"),
+    }
+}
+
+#[test]
+fn a_mocked_endpoint_streams_events_end_to_end() {
+    let manual = ManualClock::new();
+    let clock = TestClock {
+        manual: manual.clone(),
+        epoch: manual.now(),
+    };
+    let endpoint = EndpointContext::builder()
+        .endpoint_id("bmc-lab-07")
+        .build()
+        .expect("a valid endpoint");
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    // One connect attempt asks for the root, then the event service, then
+    // the stream, which the mock ends after its scripted payloads.
+    bmc.expect(Expect::get(SERVICE_ROOT, SERVICE_ROOT_FIXTURE));
+    bmc.expect(Expect::get(EVENT_SERVICE, EVENT_SERVICE_FIXTURE));
+    bmc.expect(Expect::stream(SSE, EVENTS_FIXTURE));
+
+    let plan = plan(
+        Needs::default().with_streams([StreamNeed::new(
+            endpoint.clone(),
+            EventStream::<()>::REQUEST_CLASS,
+        )]),
+        &[EventStream::<()>::declaration()],
+    )
+    .expect("the stream is planned");
+    let events = Arc::new(EventStream::new(endpoint, Arc::clone(&bmc)));
+    let (stream, mut pulls) = StreamUnit::new(
+        plan.streams()[0].clone(),
+        events,
+        ReconnectPolicy::default(),
+        clock.clone(),
+    );
+    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, Vec::new(), vec![stream])
+        .expect("a stream alone forms a subtree");
+    let mut runtime: PollRuntime = Runtime::new(
+        RuntimeConfig {
+            global_max_in_flight: std::num::NonZeroUsize::MIN,
+            clock: ClockConfig::Manual(manual.clone()),
+        },
+        subtree,
+    );
+
+    // Due at construction, the connect attempt runs as work that earns no
+    // status.
+    match drive(&mut runtime) {
+        Some(RuntimeOutput::Work {
+            result: Ok(none), ..
+        }) => assert!(none.is_empty(), "a connection is not a report"),
+        other => panic!(
+            "expected the connect attempt, got {}",
+            describe(other.as_ref())
+        ),
+    }
+    // The stream in hand, the reports are pulled: the payload, then the
+    // device closing the stream.
+    manual.advance(Duration::from_secs(5));
+    let reports = [pulled(&mut pulls), pulled(&mut pulls)];
+    // Nothing follows until the runtime reconnects, which it is asked to
+    // do after the policy's first retry.
+    assert!(Pin::new(&mut pulls)
+        .poll_next(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    match drive(&mut runtime) {
+        Some(RuntimeOutput::SleepUntil(at)) => {
+            // The default policy's first retry, plus this endpoint's own
+            // stagger of at most a quarter of it.
+            let first_retry = manual.now() + Duration::from_secs(2);
+            assert!(
+                (first_retry..=first_retry + Duration::from_millis(500)).contains(&at),
+                "the reconnect is due after the first retry"
+            );
+        }
+        other => panic!(
+            "expected the reconnect hint, got {}",
+            describe(other.as_ref())
+        ),
+    }
+
+    let event = reports[0].as_ref().expect("a payload is a report");
+    assert_eq!(event.status().outcome(), Outcome::Succeeded);
+    assert_eq!(
+        event.status().started_at(),
+        &Timestamp::new(BASE_SECONDS + 5, 0).expect("a valid instant")
+    );
+    assert_eq!(event.batches().len(), 1);
+    let batch = &event.batches()[0];
+    assert_eq!(batch.origin().provider(), EventStream::<()>::PROVIDER);
+    assert_eq!(
+        batch.origin().request_class(),
+        EventStream::<()>::REQUEST_CLASS
+    );
+    let scope = batch.coverage().scope().expect("a scoped batch");
+    assert_eq!(scope.kind(), "event-service");
+    assert_eq!(scope.id(), "EventService");
+    let Payload::Logs(logs) = batch.payload() else {
+        panic!("events project into logs");
+    };
+    assert_eq!(logs.records().len(), 1);
+    assert_eq!(logs.records()[0].entry_id(), Some("7"));
+
+    let closed = reports[1]
+        .as_ref()
+        .expect("a protocol failure is request-scoped, not a fault");
+    assert_eq!(closed.status().outcome(), Outcome::Failed);
+    assert_eq!(
+        closed.status().failure_class(),
+        Some(FailureClass::Protocol)
+    );
+    assert_eq!(
+        closed.status().detail(),
+        Some("the device closed the event stream")
     );
 }

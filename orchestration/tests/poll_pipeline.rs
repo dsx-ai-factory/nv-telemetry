@@ -38,6 +38,7 @@ use nv_telemetry_orchestration::BreakerPolicy;
 use nv_telemetry_orchestration::Clock;
 use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
+use nv_telemetry_orchestration::Needs;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
@@ -215,11 +216,17 @@ fn pipeline(
         "fixture-target",
         cadence,
     )];
-    let plan = plan(needs, &declarations).expect("the fixture declaration polls");
+    let plan = plan(Needs::default().with_polls(needs), &declarations)
+        .expect("the fixture declaration polls");
     let planned = plan.polls()[0].clone();
 
-    let subtree = endpoint_subtree(policy, &clock, vec![PollUnit::new(planned, unit, &clock)])
-        .expect("one unit forms a subtree");
+    let subtree = endpoint_subtree(
+        policy,
+        &clock,
+        vec![PollUnit::new(planned, unit, &clock)],
+        Vec::new(),
+    )
+    .expect("one unit forms a subtree");
     let runtime = Runtime::new(
         RuntimeConfig {
             global_max_in_flight: std::num::NonZeroUsize::MIN,
@@ -440,7 +447,8 @@ fn two_request_classes_share_one_subtree() {
             Duration::from_secs(30),
         ),
     ];
-    let plan = plan(needs, &declarations).expect("both classes are served");
+    let plan =
+        plan(Needs::default().with_polls(needs), &declarations).expect("both classes are served");
     assert_eq!(plan.polls()[0].cost(), 1);
     assert_eq!(plan.polls()[1].cost(), 2);
 
@@ -453,6 +461,7 @@ fn two_request_classes_share_one_subtree() {
             PollUnit::new(plan.polls()[0].clone(), sensor_unit, &clock),
             PollUnit::new(plan.polls()[1].clone(), chassis_unit, &clock),
         ],
+        Vec::new(),
     )
     .expect("two classes form one subtree");
     let mut runtime: PollRuntime = Runtime::new(
@@ -493,7 +502,7 @@ fn recipe_checks_survive_erasure() {
             target,
             Duration::from_secs(30),
         )];
-        plan(needs, &declarations)
+        plan(Needs::default().with_polls(needs), &declarations)
             .expect("the fixture declaration polls")
             .polls()[0]
             .clone()
@@ -510,6 +519,7 @@ fn recipe_checks_survive_erasure() {
         &EndpointPolicy::default(),
         &clock,
         vec![PollUnit::new(planned(endpoint(), "t"), unit, &clock)],
+        Vec::new(),
     ) else {
         panic!("the origins disagree");
     };
@@ -525,6 +535,7 @@ fn recipe_checks_survive_erasure() {
         &EndpointPolicy::default(),
         &clock,
         vec![PollUnit::new(planned(endpoint(), "t"), unit, &clock)],
+        Vec::new(),
     ) else {
         panic!("the endpoints disagree");
     };
@@ -544,6 +555,7 @@ fn recipe_checks_survive_erasure() {
             PollUnit::new(planned(endpoint(), "a"), unit_a, &clock),
             PollUnit::new(planned(other_endpoint(), "b"), unit_b, &clock),
         ],
+        Vec::new(),
     ) else {
         panic!("a subtree is one endpoint's admission scope");
     };

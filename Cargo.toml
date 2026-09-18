@@ -85,6 +85,11 @@ url = "2"
 # The one hand-written Redfish document shape: a raw entries page, read for
 # the paging annotations nv-redfish's typed collections drop.
 serde = { version = "1", default-features = false, features = ["derive"] }
+# A random id per opened event stream: the scope that keeps a device's
+# per-boot `EventId`s from colliding across streams. The crate is already in
+# the tree through nv-redfish's `Edm.Guid`; the `v4` feature, and the
+# randomness source it pulls in, is this workspace's.
+uuid = { version = "1", features = ["v4"] }
 
 # Dev-only: fixture JSON for the acquisition corpus, and the executor
 # bmc-mock's async trait impl needs under test.
