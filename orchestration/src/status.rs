@@ -54,7 +54,8 @@ pub const fn trips_endpoint_breaker(class: AcquisitionFailureClass) -> bool {
 
 /// The status a completed, successful acquisition earns. `retryable` and
 /// `failure_class` stay absent: success carries no retry question, and the
-/// wrapper rule forbids a class without a failure.
+/// wrapper rule forbids a class without a failure. `duration` is the
+/// attempt's; a stream item, which arrives rather than runs, has none.
 ///
 /// # Panics
 ///
@@ -66,13 +67,23 @@ pub fn success_status(
     endpoint: &EndpointContext,
     origin: &Origin,
     at: Timestamp,
-    duration: Duration,
+    duration: Option<Duration>,
 ) -> AcquisitionStatus {
-    base(endpoint, origin, at)
-        .outcome(Outcome::Succeeded)
-        .duration_nanos(nanos(duration))
+    let mut builder = base(endpoint, origin, at).outcome(Outcome::Succeeded);
+    if let Some(duration) = duration {
+        builder = builder.duration_nanos(nanos(duration));
+    }
+    builder
         .build()
         .expect("pre-validated identity forms a valid status")
+}
+
+/// The failure's retryability as a status stamps it: the source's
+/// refinement when it made one, the class's policy default otherwise.
+pub(crate) fn resolved_retryable(failure: &AcquisitionFailure) -> bool {
+    failure
+        .retryable()
+        .unwrap_or_else(|| default_retryable(failure.class()))
 }
 
 /// The status a completed, failed acquisition earns. The stamped
@@ -93,13 +104,10 @@ pub fn failed_status(
     duration: Option<Duration>,
     failure: &AcquisitionFailure,
 ) -> AcquisitionStatus {
-    let retryable = failure
-        .retryable()
-        .unwrap_or_else(|| default_retryable(failure.class()));
     let mut builder = base(endpoint, origin, at)
         .outcome(Outcome::Failed)
         .failure_class(failure.class().into())
-        .retryable(retryable);
+        .retryable(resolved_retryable(failure));
     if let Some(duration) = duration {
         builder = builder.duration_nanos(nanos(duration));
     }
@@ -188,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_success_carries_duration_and_no_retry_question() {
-        let status = success_status(&endpoint(), &origin(), at(), Duration::from_secs(2));
+        let status = success_status(&endpoint(), &origin(), at(), Some(Duration::from_secs(2)));
         assert_eq!(status.outcome(), Outcome::Succeeded);
         assert_eq!(status.duration_nanos(), Some(2_000_000_000));
         assert_eq!(status.failure_class(), None);

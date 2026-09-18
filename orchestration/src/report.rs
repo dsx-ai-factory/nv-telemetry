@@ -114,8 +114,9 @@ pub type TelemetryWork = nv_redfish_dispatcher::FutureWork<AcquisitionReport, En
 
 /// Assembles one acquisition's outcome into its report. A failed streamed
 /// connection attempt comes through this boundary because no stream item
-/// exists to stamp. Pure: the entire status-and-issues doctrine, with no clock
-/// and no runtime, so every branch is directly testable.
+/// exists to stamp. `duration` is the attempt's, absent when nothing ran.
+/// Pure: the entire status-and-issues doctrine, with no clock and no
+/// runtime, so every branch is directly testable.
 ///
 /// # Errors
 ///
@@ -127,13 +128,13 @@ pub fn assemble(
     endpoint: &EndpointContext,
     origin: &Origin,
     at: Timestamp,
-    duration: Duration,
+    duration: Option<Duration>,
     outcome: Result<Acquired, AcquisitionFailure>,
 ) -> Result<AcquisitionReport, EndpointFault> {
     match outcome {
         Ok(acquired) => Ok(assemble_success(endpoint, origin, at, duration, acquired)),
         Err(failure) => {
-            let status = failed_status(endpoint, origin, at, Some(duration), &failure);
+            let status = failed_status(endpoint, origin, at, duration, &failure);
             if trips_endpoint_breaker(failure.class()) {
                 Err(EndpointFault {
                     status: Box::new(status),
@@ -160,9 +161,8 @@ pub fn assemble(
 /// cancellation, so it produces no item and no report.
 ///
 /// `at` is the wall-clock instant when orchestration receives the projected
-/// item. `handling_duration` is the monotonic time from that receipt until
-/// orchestration is ready to assemble the report. The duration excludes time
-/// waiting for the next item, the stream's lifetime, and reconnect backoff.
+/// item. The status carries no duration: an item arrives rather than runs,
+/// and the contract has the field absent when there was no attempt to time.
 ///
 /// # Errors
 ///
@@ -171,7 +171,6 @@ pub fn assemble(
 pub fn assemble_stream_item<A>(
     acquisition: &A,
     at: Timestamp,
-    handling_duration: Duration,
     item: SubscriptionItem,
 ) -> Result<AcquisitionReport, EndpointFault>
 where
@@ -183,7 +182,7 @@ where
         acquisition.endpoint(),
         acquisition.origin(),
         at,
-        handling_duration,
+        None,
         outcome,
     )
 }
@@ -192,7 +191,7 @@ fn assemble_success(
     endpoint: &EndpointContext,
     origin: &Origin,
     at: Timestamp,
-    duration: Duration,
+    duration: Option<Duration>,
     acquired: Acquired,
 ) -> AcquisitionReport {
     let (batches, issues) = acquired.into_parts();
@@ -208,7 +207,7 @@ fn assemble_success(
             return AcquisitionReport {
                 batches: Vec::new(),
                 issues: None,
-                status: failed_status(endpoint, origin, at, Some(duration), &failure),
+                status: failed_status(endpoint, origin, at, duration, &failure),
             };
         }
     };
@@ -256,7 +255,8 @@ where
         let at = clock.timestamp();
         let outcome = acquire(unit.as_ref(), at).await;
         let duration = clock.instant().saturating_duration_since(begun);
-        assemble(unit.endpoint(), unit.origin(), at, duration, outcome).map(|report| vec![report])
+        assemble(unit.endpoint(), unit.origin(), at, Some(duration), outcome)
+            .map(|report| vec![report])
     })
 }
 
@@ -357,7 +357,7 @@ mod tests {
             &endpoint(),
             &origin(),
             at(),
-            Duration::from_millis(5),
+            Some(Duration::from_millis(5)),
             Ok(acquired(parts)),
         )
         .expect("a request-scoped outcome is a report");
@@ -380,7 +380,7 @@ mod tests {
             &endpoint(),
             &origin(),
             at(),
-            Duration::ZERO,
+            Some(Duration::ZERO),
             Ok(acquired(parts)),
         )
         .expect("a clean success is a report");
@@ -403,7 +403,7 @@ mod tests {
             &endpoint(),
             &origin(),
             at(),
-            Duration::ZERO,
+            Some(Duration::ZERO),
             Ok(acquired(parts)),
         )
         .expect("an internal fault is request-scoped");
@@ -426,7 +426,7 @@ mod tests {
             &endpoint(),
             &origin(),
             at(),
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             Err(connectivity),
         )
         .expect_err("an endpoint-scoped failure rides the error channel");
@@ -441,7 +441,7 @@ mod tests {
             &endpoint(),
             &origin(),
             at(),
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             Err(unsupported),
         )
         .expect("a request-scoped failure rides the success channel");
@@ -466,14 +466,17 @@ mod tests {
             vec![ProjectionIssue::missing("Reading")],
         ));
 
-        let report = assemble_stream_item(&unit, at(), Duration::from_millis(3), item)
-            .expect("a notification is a report");
+        let report = assemble_stream_item(&unit, at(), item).expect("a notification is a report");
 
         assert_eq!(report.batches().len(), 1);
         assert_eq!(report.issues().map(|issues| issues.issues().len()), Some(1));
         assert_eq!(report.status().outcome(), Outcome::Succeeded);
         assert_eq!(report.status().started_at(), &at());
-        assert_eq!(report.status().duration_nanos(), Some(3_000_000));
+        assert_eq!(
+            report.status().duration_nanos(),
+            None,
+            "an arrival is not an attempt"
+        );
         assert_eq!(report.batches()[0].window().start(), &at());
     }
 
@@ -490,8 +493,8 @@ mod tests {
                 .with_detail("subscription closed"),
         );
 
-        let fault = assemble_stream_item(&unit, at(), Duration::from_secs(8), item)
-            .expect_err("connectivity is endpoint-scoped");
+        let fault =
+            assemble_stream_item(&unit, at(), item).expect_err("connectivity is endpoint-scoped");
 
         assert_eq!(fault.status().outcome(), Outcome::Failed);
 
@@ -501,6 +504,6 @@ mod tests {
         );
 
         assert_eq!(fault.status().detail(), Some("subscription closed"));
-        assert_eq!(fault.status().duration_nanos(), Some(8_000_000_000));
+        assert_eq!(fault.status().duration_nanos(), None);
     }
 }

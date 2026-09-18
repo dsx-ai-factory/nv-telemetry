@@ -1,0 +1,21 @@
+[
+  {
+    "@odata.id": "/redfish/v1/EventService/SSE#/Event7",
+    "@odata.type": "#Event.v1_9_2.Event",
+    "Id": "7",
+    "Name": "Event Array",
+    "Events": [
+      {
+        "@odata.id": "/redfish/v1/EventService/SSE#/Events/0",
+        "MemberId": "0",
+        "EventId": "7",
+        "EventType": "Alert",
+        "EventTimestamp": "2026-03-01T10:05:00Z",
+        "MessageId": "ResourceEvent.1.3.ResourcePoweredOn",
+        "Message": "The resource /redfish/v1/Systems/1 has powered on.",
+        "MessageSeverity": "OK",
+        "OriginOfCondition": { "@odata.id": "/redfish/v1/Systems/1/LogServices/SEL/Entries/1" }
+      }
+    ]
+  }
+]

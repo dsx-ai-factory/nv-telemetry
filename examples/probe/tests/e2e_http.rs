@@ -13,15 +13,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::StreamExt as _;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::NumericValue;
 use nv_telemetry_model::Payload;
+use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_redfish::ChassisRead;
+use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
 use nv_telemetry_source::acquire;
+use nv_telemetry_source::Acquire;
 use nv_telemetry_source::Acquired;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass as Failure;
@@ -74,6 +78,7 @@ async fn standalone_http_boundary() {
     log_pages_and_clearing(&server, &resources).await;
     bmc_reset_window(&server, &resources).await;
     log_cursor(&server, &resources).await;
+    events(&server, &resources).await;
 
     server
         .rules(&[rule(
@@ -471,4 +476,59 @@ async fn log_snapshots(server: &Server, resources: &Resources) {
         panic!("logs payload")
     };
     assert_eq!(logs.records().len(), 1);
+}
+
+async fn events(server: &Server, resources: &Resources) {
+    // The stream opens over HTTP/2 and delivers the lifecycle events a
+    // power cycle produces within its latency, each Event payload one logs
+    // batch under the event service's scope; the mock closing the stream
+    // ends it with one retryable failure, and nothing follows.
+    let stream = EventStream::new(endpoint(), server.bmc());
+    let mut items = stream.perform().await.expect("the event stream opens");
+    server.grow_log(resources, 1).await;
+
+    let mut records = 0;
+    while records == 0 {
+        let item = tokio::time::timeout(Duration::from_secs(5), items.next())
+            .await
+            .expect("an event arrives within the stream's latency")
+            .expect("the stream is open")
+            .expect("a payload, not the stream's end");
+        for (coverage, payload) in item.payloads() {
+            assert_eq!(coverage.scope().map(Subject::kind), Some("event-service"));
+            let Payload::Logs(logs) = payload else {
+                panic!("events project into logs");
+            };
+            for record in logs.records() {
+                assert!(record.entry_id().is_some(), "the device's EventId");
+                let message_id = record
+                    .attributes()
+                    .and_then(|attributes| attributes.get("message-id"))
+                    .expect("every event names its message");
+                assert!(
+                    format!("{message_id:?}").contains("ResourceEvent."),
+                    "a lifecycle event: {message_id:?}"
+                );
+                records += 1;
+            }
+        }
+    }
+
+    server.post("/Mock/EventService/close", &json!({})).await;
+    let end = loop {
+        match tokio::time::timeout(Duration::from_secs(5), items.next())
+            .await
+            .expect("the close reaches the client")
+        {
+            Some(Err(failure)) => break failure,
+            Some(Ok(_)) => {}
+            None => panic!("the stream ends with a terminal failure, not silently"),
+        }
+    };
+    assert_eq!(end.class(), Failure::Protocol);
+    assert_eq!(end.retryable(), Some(true));
+    assert!(
+        items.next().await.is_none(),
+        "nothing follows the terminal failure"
+    );
 }

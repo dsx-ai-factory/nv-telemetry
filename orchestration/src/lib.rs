@@ -22,6 +22,13 @@
 //! endpoint-scoped failures travel as errors, so the breaker samples
 //! exactly the classes that indict the endpoint.
 //!
+//! A stream ([`StreamUnit`]) enters the same subtree as its own connect
+//! leaf: each connect attempt is one admission, charged and breaker-sampled
+//! like a poll, and each reconnect is a due instant the leaf's
+//! [`ReconnectPolicy`] chooses and the runtime sleeps to. The stream an
+//! attempt opens is drained outside the dispatcher through
+//! [`StreamReports`], one report per item, at the embedder's pace.
+//!
 //! This crate is runtime-free: leaf futures are plain boxed futures, the
 //! embedder owns the dispatcher `Runtime`, its timer (`SleepUntil` is a
 //! hint delivered once, never a wake-up), and all fan-out.
@@ -31,14 +38,18 @@ mod plan;
 mod recipe;
 mod report;
 mod status;
+mod stream;
 
 pub use clock::Clock;
 pub use clock::SystemClock;
 pub use plan::plan;
+pub use plan::Needs;
 pub use plan::Plan;
 pub use plan::PlanError;
 pub use plan::PlannedPoll;
+pub use plan::PlannedStream;
 pub use plan::PollNeed;
+pub use plan::StreamNeed;
 pub use recipe::endpoint_subtree;
 pub use recipe::BreakerPolicy;
 pub use recipe::EndpointPolicy;
@@ -58,3 +69,8 @@ pub use status::failed_status;
 pub use status::refused_status;
 pub use status::success_status;
 pub use status::trips_endpoint_breaker;
+pub use stream::ReconnectPolicy;
+pub use stream::StreamEnd;
+pub use stream::StreamReport;
+pub use stream::StreamReports;
+pub use stream::StreamUnit;

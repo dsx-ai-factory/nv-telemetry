@@ -232,7 +232,7 @@ where
 
 /// A projection or assembly failure past the triage tiers is this crate's
 /// bug: an operational fact for the status stream, never device data.
-fn internal_bug(error: &Invalid) -> AcquisitionFailure {
+pub(crate) fn internal_bug(error: &Invalid) -> AcquisitionFailure {
     AcquisitionFailure::new(AcquisitionFailureClass::Internal)
         .with_retryable(false)
         .with_detail(format!("projection bug: {error}"))
@@ -1593,7 +1593,7 @@ fn member_disposition(
 /// projected. Coverage is partial and scoped to the service: one service of
 /// many, the entries a device has already rotated out are not an absence to
 /// report, and the scope is the namespace of every record's `entry_id`.
-fn assemble_logs(
+pub(crate) fn assemble_logs(
     mut records: Vec<LogRecord>,
     issues: Vec<ProjectionIssue>,
     scope: Subject,
