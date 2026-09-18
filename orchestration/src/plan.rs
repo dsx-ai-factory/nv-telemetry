@@ -196,14 +196,14 @@ impl Needs {
     /// Polls to plan, in the order they should appear in the plan.
     #[must_use]
     pub fn with_polls(mut self, polls: impl IntoIterator<Item = PollNeed>) -> Self {
-        self.polls.extend(polls);
+        self.polls = gather(self.polls, polls);
         self
     }
 
     /// Streams to plan, in the order they should appear in the plan.
     #[must_use]
     pub fn with_streams(mut self, streams: impl IntoIterator<Item = StreamNeed>) -> Self {
-        self.streams.extend(streams);
+        self.streams = gather(self.streams, streams);
         self
     }
 
@@ -218,6 +218,18 @@ impl Needs {
     pub fn streams(&self) -> &[StreamNeed] {
         &self.streams
     }
+}
+
+/// Adds `more` to `have`. Collecting into an empty vector lets a vector's
+/// own iterator hand its buffer over whole, where extending would allocate
+/// and copy a fleet-size list a second time.
+fn gather<T>(have: Vec<T>, more: impl IntoIterator<Item = T>) -> Vec<T> {
+    if have.is_empty() {
+        return more.into_iter().collect();
+    }
+    let mut have = have;
+    have.extend(more);
+    have
 }
 
 /// The resolved plan: every need, served.
@@ -378,12 +390,9 @@ pub fn plan(needs: Needs, declarations: &[ProviderDeclaration]) -> Result<Plan, 
     let polls = polls
         .into_iter()
         .map(|need| {
-            let offer = polled.get(need.request_class.as_str()).ok_or_else(|| {
-                PlanError::NoProviderFor {
-                    request_class: need.request_class.clone(),
-                    mode: AcquisitionMode::Polled,
-                }
-            })?;
+            let offer = polled
+                .get(need.request_class.as_str())
+                .ok_or_else(|| no_provider(&need.request_class, AcquisitionMode::Polled))?;
             if need.cadence.is_zero() || need.cadence > MAX_CADENCE {
                 return Err(PlanError::InvalidCadence {
                     target: need.target,
@@ -401,12 +410,9 @@ pub fn plan(needs: Needs, declarations: &[ProviderDeclaration]) -> Result<Plan, 
     let streams = streams
         .into_iter()
         .map(|need| {
-            let offer = streamed.get(need.request_class.as_str()).ok_or_else(|| {
-                PlanError::NoProviderFor {
-                    request_class: need.request_class.clone(),
-                    mode: AcquisitionMode::Streamed,
-                }
-            })?;
+            let offer = streamed
+                .get(need.request_class.as_str())
+                .ok_or_else(|| no_provider(&need.request_class, AcquisitionMode::Streamed))?;
             Ok(PlannedStream {
                 endpoint: need.endpoint,
                 origin: offer.origin.clone(),
@@ -415,6 +421,17 @@ pub fn plan(needs: Needs, declarations: &[ProviderDeclaration]) -> Result<Plan, 
         })
         .collect::<Result<_, _>>()?;
     Ok(Plan { polls, streams })
+}
+
+/// The unserved need's error, built off the resolution loop: the loop over
+/// a fleet's needs is benchmarked, and the error's construction inside it
+/// was enough to push the lookup's hashing out of line.
+#[cold]
+fn no_provider(request_class: &str, mode: AcquisitionMode) -> PlanError {
+    PlanError::NoProviderFor {
+        request_class: request_class.to_owned(),
+        mode,
+    }
 }
 
 /// Validates one declaration into what it offers.

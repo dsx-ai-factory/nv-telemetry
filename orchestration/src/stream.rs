@@ -124,11 +124,13 @@ impl ReconnectPolicy {
         self.stagger_percent
     }
 
-    /// The delay before `endpoint_id`'s next instance, given how the last
-    /// one ended and how many instances in a row delivered nothing, the
-    /// last one included; zero when it delivered. `None` when the failure
-    /// said retrying is pointless. The stagger rides above the cap: capped
-    /// after it, a fleet at the cap would fall back into lockstep.
+    /// The delay before `endpoint_id`'s next instance. `unproductive` is how
+    /// many instances in a row delivered nothing, the last one included,
+    /// and is zero when the last one delivered; zero and one alike yield
+    /// `first_retry`, and each further one doubles it up to the cap. `None`
+    /// when the failure said retrying is pointless. The stagger rides above
+    /// the cap: capped after it, a fleet at the cap would fall back into
+    /// lockstep.
     #[must_use]
     pub fn delay(&self, end: StreamEnd, unproductive: u32, endpoint_id: &str) -> Option<Duration> {
         if !end.retryable() {
