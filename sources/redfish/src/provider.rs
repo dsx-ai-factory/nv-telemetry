@@ -932,7 +932,7 @@ impl ReadKind for LogKind {
                         .with_detail("the log service carries no Entries collection"),
                 );
             };
-            let scope = service_scope(location, &service.base.id)?;
+            let scope = service_scope(location, &service.id)?;
             // A filter by stamp presumes the device's clock has not moved
             // back past the cursor's second. A service whose own clock reads
             // earlier says it has, and this poll walks the head, which
@@ -1719,7 +1719,11 @@ mod tests {
             .with_detail("HTTP 503");
         let issue = member_disposition(3, answered).expect("a device answer is recorded");
         assert_eq!(issue.path(), "Members[3]");
-        assert!(format!("{issue:?}").contains("member not read (Device): HTTP 503"));
+        assert!(matches!(
+            issue.kind(),
+            nv_telemetry_source::ProjectionIssueKind::Invalid { detail }
+                if detail == "member not read (Device): HTTP 503"
+        ));
 
         for class in [
             AcquisitionFailureClass::Connectivity,

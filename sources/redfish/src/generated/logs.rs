@@ -97,7 +97,7 @@ pub(crate) fn project_log_entry(
         }
     };
     let log_record_entry_id = {
-        let value = log_entry.base.id.clone();
+        let value = log_entry.id.clone();
         if value.is_empty() {
             issues
                 .push(

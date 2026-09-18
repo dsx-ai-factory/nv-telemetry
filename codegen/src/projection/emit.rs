@@ -1091,7 +1091,7 @@ impl Emitter<'_> {
         }
         let id_local = claim_local(locals, "subject_id", &context)?;
         let id_blame = format!("{source_type}.{}", subject.id_path);
-        let id_place = place(id_leaf.hops, &source_field_ident(&id_leaf.property));
+        let id_place = place(&source_field_ident(&id_leaf.property));
         let id_conversion = checked_text(
             &self.text_check(&id_field),
             &id_blame,
@@ -1584,7 +1584,7 @@ fn leaf_match(
     let mut expression = quote! { #source_param };
     let mut optional = false;
     for step in prefix_steps {
-        let step_place = place(step.hops, &source_field_ident(&step.property));
+        let step_place = place(&source_field_ident(&step.property));
         expression = match (optional, step.shape()) {
             (_, Shape::Nullable | Shape::RequiredNullable) => {
                 return Err(format!(
@@ -1605,7 +1605,7 @@ fn leaf_match(
         };
     }
 
-    let leaf_place = place(leaf.hops, &source_field_ident(&leaf.property));
+    let leaf_place = place(&source_field_ident(&leaf.property));
     let extract = if leaf.is_text() {
         quote! { #leaf_place.clone() }
     } else {
@@ -1846,9 +1846,10 @@ fn source_type_tokens(namespace: &str, name: &str) -> TokenStream {
     quote! { ::nv_redfish::schema::#module::#name }
 }
 
-fn place(hops: usize, field: &Ident) -> TokenStream {
-    let bases = std::iter::repeat_n(quote! { .base }, hops).collect::<TokenStream>();
-    quote! { #bases.#field }
+/// The generated model flattens a type's base chain, so a field declared
+/// on an ancestor is reached like one declared on the type itself.
+fn place(field: &Ident) -> TokenStream {
+    quote! { .#field }
 }
 
 fn source_field_ident(property: &str) -> Ident {

@@ -65,14 +65,14 @@ heck = "0.5"
 # the HTTP stack (reqwest, tokio) enters the tree only where the crate's
 # `bmc-http` feature asks for it; the mock implements the same trait for
 # transport-free tests.
-nv-redfish = { version = "0.16", default-features = false }
-nv-redfish-bmc-mock = "0.16"
+nv-redfish = { version = "0.17", default-features = false }
+nv-redfish-bmc-mock = "0.17"
 
 # Build-time only, for the projection compiler: the same CSDL parser and
 # vendored DMTF bundle that nv-redfish generates its typed models from.
-nv-redfish-csdl-compiler = "0.16"
-nv-redfish-schema = "0.16"
-nv-redfish-dispatcher = "0.16"
+nv-redfish-csdl-compiler = "0.17"
+nv-redfish-schema = "0.17"
+nv-redfish-dispatcher = "0.17"
 # The instant type behind nv-redfish's `Edm.DateTimeOffset`; `sources/redfish`
 # reads seconds and nanos off it for the contract's `Timestamp`.
 time = { version = "0.3", default-features = false }

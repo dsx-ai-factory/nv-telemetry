@@ -72,10 +72,6 @@ impl ResolvedField {
 pub struct Step {
     /// The segment, in CSDL spelling.
     pub property: String,
-    /// `base` hops from the holding type to the declaring type in the
-    /// optimizer-collapsed chain — the count of `.base` accesses generation
-    /// puts in front of the field.
-    pub hops: usize,
     /// `Redfish.Required` on the property; with `nullable`, decides the
     /// generated field's `Option` nesting.
     pub required: bool,
@@ -263,7 +259,6 @@ impl RedfishIndex<'_> {
             .zip(steps)
             .map(|(segment, step)| Step {
                 property: segment.to_owned(),
-                hops: step.hops,
                 required: step.required,
                 nullable: step.nullable,
                 collection: step.collection,
@@ -347,26 +342,24 @@ mod tests {
         let bundle = Bundle::dmtf().expect("the vendored bundle parses");
         let index = bundle.index().expect("the bundle compiles");
 
-        // Id: one base hop up the collapsed chain, required and
-        // non-nullable — generation makes it a bare field — and a typedef
-        // whose underlying primitive conversion selection keys on.
+        // Id: declared up the base chain, which the generated model
+        // flattens; required and non-nullable — generation makes it a bare
+        // field — and a typedef whose underlying primitive conversion
+        // selection keys on.
         let steps = index.steps("Sensor", "Id").expect("Id resolves");
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].hops, 1);
         assert_eq!(steps[0].shape(), Shape::Bare);
         assert_eq!(steps[0].class, TypeClass::TypeDefinition);
         assert_eq!(steps[0].underlying.as_deref(), Some("String"));
 
         // A nullable leaf under two presence-only complex segments, each
-        // declared on its own type: no hops, single-`Option` shapes.
+        // declared on its own type: single-`Option` shapes.
         let steps = index
             .steps("Sensor", "Thresholds.UpperCritical.Reading")
             .expect("the threshold reading resolves");
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[0].shape(), Shape::Optional);
-        assert_eq!(steps[0].hops, 0);
         assert_eq!(steps[1].shape(), Shape::Optional);
-        assert_eq!(steps[1].hops, 0);
         assert_eq!(steps[2].shape(), Shape::Nullable);
         assert_eq!(steps[2].namespace, "Edm");
         assert_eq!(steps[2].name, "Decimal");
