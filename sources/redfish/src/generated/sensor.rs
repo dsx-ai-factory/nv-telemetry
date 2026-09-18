@@ -710,7 +710,7 @@ pub(crate) fn project_sensor(
         sensor_threshold_lower_fatal_value_entries.push(("reading".to_owned(), value));
     }
     let subject_id = {
-        let value = sensor.base.id.clone();
+        let value = sensor.id.clone();
         if value.is_empty() {
             issues
                 .push(

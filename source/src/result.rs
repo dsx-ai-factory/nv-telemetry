@@ -349,7 +349,11 @@ mod tests {
         let bounded = bounded_issues(five.clone(), 3);
         assert_eq!(&bounded[..2], &five[..2]);
         assert_eq!(bounded[2].path(), OMITTED_ISSUES_LOCATOR);
-        assert!(format!("{:?}", bounded[2]).contains("3 further issues omitted"));
+        assert!(matches!(
+            bounded[2].kind(),
+            crate::ProjectionIssueKind::Invalid { detail }
+                if detail == "3 further issues omitted at the envelope's bound"
+        ));
 
         // At or under the bound nothing changes.
         assert_eq!(bounded_issues(five.clone(), 5), five);

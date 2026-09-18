@@ -273,6 +273,111 @@ async fn a_record_the_device_did_not_inline_is_an_issue_not_a_request() {
     failure(&items[2]);
 }
 
+/// One connect attempt's three requests, the stream scripted with ids and
+/// expected to resume `after` the given one.
+fn expect_connect(
+    bmc: &Bmc<nv_redfish_bmc_mock::Error>,
+    after: Option<&str>,
+    events: Vec<(Option<&str>, Json)>,
+) {
+    bmc.expect(Expect::get(
+        ROOT,
+        include_str!("fixtures/events/service-root.json"),
+    ));
+    bmc.expect(Expect::get(
+        EVENT_SERVICE,
+        include_str!("fixtures/events/event-service.json"),
+    ));
+    bmc.expect(Expect::stream_events(SSE, after, events));
+}
+
+/// The run a batch's scope names.
+fn run_of(item: &SubscriptionItem) -> String {
+    let (coverage, _) = &parts(item).payloads()[0];
+    coverage.scope().expect("a scoped batch").scope()[1].clone()
+}
+
+#[tokio::test]
+async fn a_reconnect_resumes_after_the_last_id_in_the_same_run() {
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    expect_connect(
+        &bmc,
+        None,
+        vec![(Some("7"), powered_on(7)), (Some("8"), powered_on(8))],
+    );
+    expect_connect(&bmc, Some("8"), vec![(Some("9"), powered_on(9))]);
+    let stream = EventStream::new(endpoint(), Arc::clone(&bmc));
+    assert_eq!(stream.resume_position(), None, "nothing read yet");
+
+    // The first instance starts live; the id in effect after its last
+    // payload is where the next one resumes, in the run the scope names.
+    let first: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream opens")
+        .collect()
+        .await;
+    assert_eq!(first.len(), 3, "two payloads, then the stream's end");
+    let run = run_of(&first[0]);
+    let position = stream.resume_position().expect("the device sent ids");
+    assert_eq!(position.last_event_id(), "8");
+    assert_eq!(position.run().as_str(), run);
+
+    // The next instance asks for what follows and ships under the same
+    // scope, so the consumer's dedup key continues rather than restarts.
+    let second: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream resumes")
+        .collect()
+        .await;
+    assert_eq!(second.len(), 2);
+    assert_eq!(run_of(&second[0]), run);
+    let Payload::Logs(logs) = &parts(&second[0]).payloads()[0].1 else {
+        panic!("events project into logs");
+    };
+    assert_eq!(logs.records()[0].entry_id(), Some("9"));
+    assert_eq!(
+        stream
+            .resume_position()
+            .map(|position| position.last_event_id().to_owned()),
+        Some("9".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
+    // A device that sends no ids: each instance starts live, and each is
+    // its own run, since nothing says how their event ids relate.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    for _ in 0..2 {
+        bmc.expect(Expect::get(
+            ROOT,
+            include_str!("fixtures/events/service-root.json"),
+        ));
+        bmc.expect(Expect::get(
+            EVENT_SERVICE,
+            include_str!("fixtures/events/event-service.json"),
+        ));
+        bmc.expect(Expect::stream(SSE, Json::Array(vec![powered_on(7)])));
+    }
+    let stream = EventStream::new(endpoint(), Arc::clone(&bmc));
+    let first: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream opens")
+        .collect()
+        .await;
+    assert_eq!(stream.resume_position(), None, "no id was ever in effect");
+    let second: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream opens again, live")
+        .collect()
+        .await;
+    assert_ne!(run_of(&first[0]), run_of(&second[0]));
+}
+
 #[tokio::test]
 async fn a_root_without_an_event_service_cannot_stream() {
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());

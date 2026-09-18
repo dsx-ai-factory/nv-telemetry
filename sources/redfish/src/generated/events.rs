@@ -220,7 +220,7 @@ pub(crate) fn project_event_record(
         event_record_attributes_entries.push(("severity".to_owned(), value));
     }
     if let Some(value) = {
-        let value = event_record.base.member_id.clone();
+        let value = event_record.member_id.clone();
         if value.len()
             > ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize
         {

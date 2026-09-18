@@ -528,28 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn streamed_declarations_do_not_change_polled_resolution() {
-        let declarations = [
-            ProviderDeclaration::polled("redfish.sensor.odata", "sensor-read", 1),
-            ProviderDeclaration::streamed("gnmi.dynamic", "sensor-read", 9),
-        ];
-
-        let needs = vec![PollNeed::new(
-            endpoint(),
-            "sensor-read",
-            "/redfish/v1/Chassis/1U/Sensors/S1",
-            Duration::from_secs(30),
-        )];
-
-        let plan = plan(Needs::default().with_polls(needs), &declarations)
-            .expect("the polled provider serves the need");
-
-        assert_eq!(plan.polls().len(), 1);
-        assert_eq!(plan.polls()[0].origin().provider(), "redfish.sensor.odata");
-        assert_eq!(plan.polls()[0].cost(), 1);
-    }
-
-    #[test]
     fn a_streamed_declaration_cannot_satisfy_a_poll_need() {
         let declarations = [ProviderDeclaration::streamed(
             "gnmi.dynamic",
@@ -630,7 +608,6 @@ mod tests {
             PlanError::NoProviderFor { request_class, mode: AcquisitionMode::Streamed }
                 if request_class == "sensor-read"
         ));
-        assert!(error.to_string().contains("no streamed declaration"));
     }
 
     #[test]

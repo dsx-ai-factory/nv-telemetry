@@ -9,26 +9,30 @@ mod support {
     pub(crate) mod bmc_mock;
 }
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::Stream;
 use futures_util::StreamExt as _;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::NumericValue;
 use nv_telemetry_model::Payload;
-use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::LogRead;
+use nv_telemetry_redfish::ResumePosition;
 use nv_telemetry_redfish::SensorRead;
+use nv_telemetry_redfish::StreamRun;
 use nv_telemetry_source::acquire;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::Acquired;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass as Failure;
+use nv_telemetry_source::SubscriptionItem;
 use serde_json::json;
 use serde_json::Value;
 use support::bmc_mock::text;
@@ -478,42 +482,12 @@ async fn log_snapshots(server: &Server, resources: &Resources) {
     assert_eq!(logs.records().len(), 1);
 }
 
-async fn events(server: &Server, resources: &Resources) {
-    // The stream opens over HTTP/2 and delivers the lifecycle events a
-    // power cycle produces within its latency, each Event payload one logs
-    // batch under the event service's scope; the mock closing the stream
-    // ends it with one retryable failure, and nothing follows.
-    let stream = EventStream::new(endpoint(), server.bmc());
-    let mut items = stream.perform().await.expect("the event stream opens");
-    server.grow_log(resources, 1).await;
-
-    let mut records = 0;
-    while records == 0 {
-        let item = tokio::time::timeout(Duration::from_secs(5), items.next())
-            .await
-            .expect("an event arrives within the stream's latency")
-            .expect("the stream is open")
-            .expect("a payload, not the stream's end");
-        for (coverage, payload) in item.payloads() {
-            assert_eq!(coverage.scope().map(Subject::kind), Some("event-service"));
-            let Payload::Logs(logs) = payload else {
-                panic!("events project into logs");
-            };
-            for record in logs.records() {
-                assert!(record.entry_id().is_some(), "the device's EventId");
-                let message_id = record
-                    .attributes()
-                    .and_then(|attributes| attributes.get("message-id"))
-                    .expect("every event names its message");
-                assert!(
-                    format!("{message_id:?}").contains("ResourceEvent."),
-                    "a lifecycle event: {message_id:?}"
-                );
-                records += 1;
-            }
-        }
-    }
-
+/// The open stream's items until the mock, asked to close it, ends it: the
+/// terminal failure, after which nothing follows.
+async fn close_and_end(
+    server: &Server,
+    items: &mut Pin<Box<dyn Stream<Item = SubscriptionItem> + Send>>,
+) -> AcquisitionFailure {
     server.post("/Mock/EventService/close", &json!({})).await;
     let end = loop {
         match tokio::time::timeout(Duration::from_secs(5), items.next())
@@ -525,10 +499,116 @@ async fn events(server: &Server, resources: &Resources) {
             None => panic!("the stream ends with a terminal failure, not silently"),
         }
     };
-    assert_eq!(end.class(), Failure::Protocol);
-    assert_eq!(end.retryable(), Some(true));
     assert!(
         items.next().await.is_none(),
         "nothing follows the terminal failure"
     );
+    end
+}
+
+/// Pulls until one logs batch arrives: the run its scope names and the
+/// entry ids it carried.
+async fn next_batch(
+    items: &mut Pin<Box<dyn Stream<Item = SubscriptionItem> + Send>>,
+) -> (String, Vec<String>) {
+    loop {
+        let item = tokio::time::timeout(Duration::from_secs(5), items.next())
+            .await
+            .expect("an event arrives within the stream's latency")
+            .expect("the stream is open")
+            .expect("a payload, not the stream's end");
+        let mut ids = Vec::new();
+        let mut run = None;
+        for (coverage, payload) in item.payloads() {
+            let scope = coverage.scope().expect("a scoped batch");
+            assert_eq!(scope.kind(), "event-service");
+            run = Some(scope.scope()[1].clone());
+            let Payload::Logs(logs) = payload else {
+                panic!("events project into logs");
+            };
+            for record in logs.records() {
+                assert!(
+                    record
+                        .attributes()
+                        .is_some_and(|attributes| attributes.contains_key("message-id")),
+                    "every event names its message"
+                );
+                ids.push(record.entry_id().expect("the device's EventId").to_owned());
+            }
+        }
+        if let Some(run) = run {
+            if !ids.is_empty() {
+                return (run, ids);
+            }
+        }
+    }
+}
+
+async fn events(server: &Server, resources: &Resources) {
+    // The stream opens over HTTP/2 and delivers the lifecycle events a
+    // power cycle produces within its latency, each Event payload one logs
+    // batch under the event service's scope; the mock closing the stream
+    // ends it with one retryable failure, and nothing follows.
+    let stream = EventStream::new(endpoint(), server.bmc());
+    let mut items = stream.perform().await.expect("the event stream opens");
+    server.grow_log(resources, 1).await;
+    let (run, seen) = next_batch(&mut items).await;
+    let end = close_and_end(server, &mut items).await;
+    assert_eq!(end.class(), Failure::Protocol);
+    assert_eq!(end.retryable(), Some(true));
+
+    // Events the device produces while nobody is connected are what resume
+    // is for: the provider kept the id in effect, the next instance asks
+    // for what follows, and receives the missed events first, under the
+    // same scope, with nothing already read among them.
+    let position = stream.resume_position().expect("the mock sends ids");
+    server.grow_log(resources, 1).await;
+    let mut items = stream.perform().await.expect("the stream resumes");
+    let (resumed_run, resumed) = next_batch(&mut items).await;
+    assert_eq!(resumed_run, run, "a resumed instance continues the run");
+    assert!(
+        resumed.iter().all(|id| !seen.contains(id)),
+        "a resumed instance replays nothing already read: {resumed:?} after {seen:?}"
+    );
+    let moved = stream.resume_position().expect("ids kept coming");
+    assert_ne!(moved.last_event_id(), position.last_event_id());
+    assert_eq!(moved.run(), position.run());
+    close_and_end(server, &mut items).await;
+
+    // An id the device no longer holds is refused with a protocol answer.
+    // The provider reports it as the device gave it, naming the position,
+    // and keeps the position: whether to start afresh is the embedder's
+    // call, and a fresh stream is a new run.
+    let stale_position = ResumePosition::new(
+        "999999999",
+        StreamRun::new(run.clone()).expect("the run the scope named fits"),
+    )
+    .expect("a non-empty id");
+    let stale = EventStream::new(endpoint(), server.bmc()).with_resume_position(stale_position);
+    let refused = stale
+        .perform()
+        .await
+        .err()
+        .expect("the mock refuses an id outside its history");
+    assert_eq!(refused.class(), Failure::Protocol);
+    assert_eq!(refused.retryable(), Some(false));
+    assert!(
+        refused.detail().is_some_and(|detail| {
+            detail.starts_with("open while resuming after event 999999999 failed")
+        }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        stale
+            .resume_position()
+            .map(|position| position.last_event_id().to_owned()),
+        Some("999999999".to_owned()),
+        "the position is the embedder's to drop"
+    );
+    let fresh = EventStream::new(endpoint(), server.bmc());
+    let mut items = fresh.perform().await.expect("a fresh stream starts live");
+    server.grow_log(resources, 1).await;
+    let (fresh_run, _) = next_batch(&mut items).await;
+    assert_ne!(fresh_run, run, "a fresh start is a new run");
+    close_and_end(server, &mut items).await;
 }

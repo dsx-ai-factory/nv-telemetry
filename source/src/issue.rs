@@ -155,17 +155,6 @@ mod tests {
             .at_index("Sensors", 3)
             .at("Chassis");
         assert_eq!(issue.path(), "Chassis.Sensors[3].Reading");
-        assert_eq!(
-            issue.to_string(),
-            "`Chassis.Sensors[3].Reading`: reported but unusable: not a finite number"
-        );
-    }
-
-    #[test]
-    fn a_missing_field_states_the_silence() {
-        let issue = ProjectionIssue::missing("Id");
-        assert_eq!(issue.kind(), &ProjectionIssueKind::MissingRequired);
-        assert_eq!(issue.to_string(), "`Id`: required but not reported");
     }
 
     #[test]

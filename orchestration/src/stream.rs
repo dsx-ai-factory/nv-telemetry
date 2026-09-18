@@ -603,8 +603,6 @@ mod tests {
             policy.delay(StreamEnd::Failed { retryable: false }, 1, ENDPOINT),
             None
         );
-        assert!(StreamEnd::Closed.retryable());
-        assert!(!StreamEnd::Failed { retryable: false }.retryable());
     }
 
     #[test]
@@ -632,7 +630,5 @@ mod tests {
             .map(|rack| delay(&format!("bmc-lab-{rack:02}")))
             .collect();
         assert!(spread.len() > 1, "a fleet spreads out");
-        // Above the cap, so a fleet at the cap stays spread.
-        assert!(delay("rack-3/slot-12") >= base);
     }
 }

@@ -50,6 +50,8 @@ use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
+use serde_json::json;
+use serde_json::Value as Json;
 
 const SENSOR: &str = "/redfish/v1/Chassis/1U/Sensors/CPU1Temp";
 const CHASSIS: &str = "/redfish/v1/Chassis/1U";
@@ -310,6 +312,15 @@ const SSE: &str = "/redfish/v1/EventService/SSE";
 const EVENT_SERVICE_FIXTURE: &str = include_str!("../fixtures/event-service.json");
 const EVENTS_FIXTURE: &str = include_str!("../fixtures/events.json");
 
+/// The fixture's one event payload, carrying `id` as the device's event id.
+fn event(id: &str) -> Json {
+    let mut payloads: Vec<Json> = serde_json::from_str(EVENTS_FIXTURE).expect("fixture JSON");
+    let mut event = payloads.remove(0);
+    event["Id"] = json!(id);
+    event["Events"][0]["EventId"] = json!(id);
+    event
+}
+
 /// A report the stream's reports must yield on this pull.
 fn pulled(reports: &mut StreamReports) -> StreamReport {
     match Pin::new(&mut *reports).poll_next(&mut Context::from_waker(Waker::noop())) {
@@ -332,10 +343,20 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
         .expect("a valid endpoint");
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
     // One connect attempt asks for the root, then the event service, then
-    // the stream, which the mock ends after its scripted payloads.
+    // the stream, which the mock ends after its scripted payloads. The
+    // reconnect the runtime schedules asks the same three, the stream now
+    // resumed after the id the first instance read: the expectation matches
+    // nothing else.
     bmc.expect(Expect::get(SERVICE_ROOT, SERVICE_ROOT_FIXTURE));
     bmc.expect(Expect::get(EVENT_SERVICE, EVENT_SERVICE_FIXTURE));
-    bmc.expect(Expect::stream(SSE, EVENTS_FIXTURE));
+    bmc.expect(Expect::stream_events(SSE, None, [(Some("7"), event("7"))]));
+    bmc.expect(Expect::get(SERVICE_ROOT, SERVICE_ROOT_FIXTURE));
+    bmc.expect(Expect::get(EVENT_SERVICE, EVENT_SERVICE_FIXTURE));
+    bmc.expect(Expect::stream_events(
+        SSE,
+        Some("7"),
+        [(Some("8"), event("8"))],
+    ));
 
     let plan = plan(
         Needs::default().with_streams([StreamNeed::new(
@@ -364,15 +385,7 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
 
     // Due at construction, the connect attempt runs as work that earns no
     // status.
-    match drive(&mut runtime) {
-        Some(RuntimeOutput::Work {
-            result: Ok(none), ..
-        }) => assert!(none.is_empty(), "a connection is not a report"),
-        other => panic!(
-            "expected the connect attempt, got {}",
-            describe(other.as_ref())
-        ),
-    }
+    connected(&mut runtime);
     // The stream in hand, the reports are pulled: the payload, then the
     // device closing the stream.
     manual.advance(Duration::from_secs(5));
@@ -399,26 +412,11 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
     }
 
     let event = reports[0].as_ref().expect("a payload is a report");
-    assert_eq!(event.status().outcome(), Outcome::Succeeded);
     assert_eq!(
         event.status().started_at(),
         &Timestamp::new(BASE_SECONDS + 5, 0).expect("a valid instant")
     );
-    assert_eq!(event.batches().len(), 1);
-    let batch = &event.batches()[0];
-    assert_eq!(batch.origin().provider(), EventStream::<()>::PROVIDER);
-    assert_eq!(
-        batch.origin().request_class(),
-        EventStream::<()>::REQUEST_CLASS
-    );
-    let scope = batch.coverage().scope().expect("a scoped batch");
-    assert_eq!(scope.kind(), "event-service");
-    assert_eq!(scope.id(), "EventService");
-    let Payload::Logs(logs) = batch.payload() else {
-        panic!("events project into logs");
-    };
-    assert_eq!(logs.records().len(), 1);
-    assert_eq!(logs.records()[0].entry_id(), Some("7"));
+    let run = event_scope(event, "7");
 
     let closed = reports[1]
         .as_ref()
@@ -432,4 +430,55 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
         closed.status().detail(),
         Some("the device closed the event stream")
     );
+
+    // When the hint comes due the runtime reconnects on its own, and the
+    // provider resumes after the id it read: the mock's next expectation
+    // matches only a request carrying that id. The instance it opens ships
+    // under the scope the first one left.
+    manual.advance(Duration::from_secs(3));
+    connected(&mut runtime);
+    let resumed = pulled(&mut pulls).expect("a payload is a report");
+    assert_eq!(
+        event_scope(&resumed, "8"),
+        run,
+        "a resumed instance continues the run"
+    );
+}
+
+/// The runtime ran a connect attempt that opened the stream: work that
+/// earns no status.
+fn connected(runtime: &mut PollRuntime) {
+    match drive(runtime) {
+        Some(RuntimeOutput::Work {
+            result: Ok(none), ..
+        }) => assert!(none.is_empty(), "a connection is not a report"),
+        other => panic!(
+            "expected the connect attempt, got {}",
+            describe(other.as_ref())
+        ),
+    }
+}
+
+/// One event payload's report: a succeeded status carrying one logs batch
+/// of this provider's origin, scoped to the event service, with one record
+/// whose `entry_id` is the device's. Returns the scope's segments, which
+/// name the run.
+fn event_scope(report: &AcquisitionReport, entry_id: &str) -> Vec<String> {
+    assert_eq!(report.status().outcome(), Outcome::Succeeded);
+    assert_eq!(report.batches().len(), 1);
+    let batch = &report.batches()[0];
+    assert_eq!(batch.origin().provider(), EventStream::<()>::PROVIDER);
+    assert_eq!(
+        batch.origin().request_class(),
+        EventStream::<()>::REQUEST_CLASS
+    );
+    let scope = batch.coverage().scope().expect("a scoped batch");
+    assert_eq!(scope.kind(), "event-service");
+    assert_eq!(scope.id(), "EventService");
+    let Payload::Logs(logs) = batch.payload() else {
+        panic!("events project into logs");
+    };
+    assert_eq!(logs.records().len(), 1);
+    assert_eq!(logs.records()[0].entry_id(), Some(entry_id));
+    scope.scope().to_vec()
 }

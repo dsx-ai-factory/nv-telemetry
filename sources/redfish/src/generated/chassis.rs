@@ -419,7 +419,7 @@ pub(crate) fn project_chassis(
         _ => None,
     };
     let subject_id = {
-        let value = chassis.base.id.clone();
+        let value = chassis.id.clone();
         if value.is_empty() {
             issues
                 .push(
