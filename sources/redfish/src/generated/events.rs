@@ -65,7 +65,28 @@ pub(crate) fn project_event_record(
                 }
             }
         }
-        None => None,
+        None => {
+            match event_record.severity.clone() {
+                Some(value) => {
+                    match value.as_str() {
+                        "OK" => Some(::nv_telemetry_model::Severity::Info),
+                        "Warning" => Some(::nv_telemetry_model::Severity::Warning),
+                        "Critical" => Some(::nv_telemetry_model::Severity::Critical),
+                        _ => {
+                            issues
+                                .push(
+                                    ::nv_telemetry_source::ProjectionIssue::invalid(
+                                        "EventRecord.Severity",
+                                        "outside the known value set",
+                                    ),
+                                );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        }
     };
     let event_record_message = match event_record.message.clone() {
         Some(value) => {
@@ -193,31 +214,6 @@ pub(crate) fn project_event_record(
         }
     } {
         event_record_attributes_entries.push(("event-type".to_owned(), value));
-    }
-    if let Some(value) = match event_record.severity.clone() {
-        Some(value) => {
-            if value.len()
-                > ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize
-            {
-                issues
-                    .push(
-                        ::nv_telemetry_source::ProjectionIssue::invalid(
-                            "EventRecord.Severity",
-                            format!(
-                                "`string_value`: {} bytes long, over the schema's bound of {}",
-                                value.len(),
-                                ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN
-                            ),
-                        ),
-                    );
-                None
-            } else {
-                Some(::nv_telemetry_model::Value::string(value)?)
-            }
-        }
-        None => None,
-    } {
-        event_record_attributes_entries.push(("severity".to_owned(), value));
     }
     if let Some(value) = {
         let value = event_record.member_id.clone();

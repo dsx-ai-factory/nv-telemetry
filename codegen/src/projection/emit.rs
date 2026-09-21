@@ -254,6 +254,57 @@ enum Conversion {
         rows: Vec<(String, String)>,
         destination: EnumDestination,
     },
+    /// Device text against a `value_map` that is its whole vocabulary: a
+    /// listed value projects to its row, anything else is reported.
+    TextMap {
+        rows: Vec<(String, String)>,
+        destination: EnumDestination,
+    },
+}
+
+/// The Rust type a conversion's local carries. Every member of a fallback
+/// chain must share one, since one `let` holds them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalShape {
+    /// A value-vocabulary constructor's output.
+    Vocabulary,
+    /// The contract's own `Timestamp`.
+    Timestamp,
+    /// Device text, owned.
+    OwnedText,
+    /// A row's text, static.
+    StaticText,
+    /// A variant of the target's contract enumeration.
+    Contract,
+}
+
+impl Conversion {
+    fn local_shape(&self) -> LocalShape {
+        match self {
+            Self::Decimal { .. }
+            | Self::Scalar { .. }
+            | Self::Timestamp {
+                destination: TimestampDestination::Vocabulary(_),
+            }
+            | Self::Text {
+                destination: TextDestination::Vocabulary(_),
+                ..
+            } => LocalShape::Vocabulary,
+            Self::Timestamp {
+                destination: TimestampDestination::Field,
+            } => LocalShape::Timestamp,
+            Self::Text {
+                destination: TextDestination::Plain,
+                ..
+            } => LocalShape::OwnedText,
+            Self::Enum { destination, .. } | Self::TextMap { destination, .. } => match destination
+            {
+                EnumDestination::Text(TextDestination::Plain) => LocalShape::StaticText,
+                EnumDestination::Text(TextDestination::Vocabulary(_)) => LocalShape::Vocabulary,
+                EnumDestination::Contract { .. } => LocalShape::Contract,
+            },
+        }
+    }
 }
 
 enum TextDestination {
@@ -494,14 +545,26 @@ impl Emitter<'_> {
                     )
                 })?;
 
-                let mut pending = Vec::new();
+                // Mappings onto one target are one chain, read in
+                // declaration order.
+                let mut chains: Vec<Vec<&FieldSpec>> = Vec::new();
                 for field in &instance.fields {
+                    match chains
+                        .iter_mut()
+                        .find(|chain| chain[0].target_field == field.target_field)
+                    {
+                        Some(chain) => chain.push(field),
+                        None => chains.push(vec![field]),
+                    }
+                }
+                let mut pending = Vec::new();
+                for chain in &chains {
                     let (tokens, output) = self.field_evaluation(
                         source_type,
                         &source_param,
                         &prefix,
                         &target,
-                        field,
+                        chain,
                         &mut locals,
                         &context,
                     )?;
@@ -644,9 +707,13 @@ impl Emitter<'_> {
         })
     }
 
-    /// One field mapping's evaluation: a local holding `Option` of the
-    /// converted value, issues pushed for what the device answered
-    /// unusably.
+    /// One target's evaluation over its mapping chain: a local holding
+    /// `Option` of the converted value, issues pushed for what the device
+    /// answered unusably. The chain is read in declaration order, each
+    /// member only when every earlier one was absent, so a fallback's read
+    /// sits in its predecessor's absence arm; a present but unusable value
+    /// is that member's issue and reads nothing further, since the device
+    /// answered.
     #[allow(clippy::too_many_arguments)]
     fn field_evaluation(
         &self,
@@ -654,36 +721,61 @@ impl Emitter<'_> {
         source_param: &Ident,
         prefix: &str,
         target: &MessageDescriptor,
-        field: &FieldSpec,
+        chain: &[&FieldSpec],
         locals: &mut BTreeSet<String>,
         context: &str,
     ) -> Result<(TokenStream, PendingOutput), String> {
-        let steps = self
-            .index
-            .steps(source_type, &field.source_path)
-            .map_err(|error| format!("{context}: {error}"))?;
-        let issue_path = format!("{source_type}.{}", field.source_path);
-        let landing = target_landing(target, &field.target_field, context)?;
-        let conversion = self.conversion(
-            steps.last().expect("a resolved path has a leaf"),
-            &landing,
-            &field.value_map,
-            &field.known_values,
-            context,
-        )?;
+        let primary = chain.first().expect("a chain has a first mapping");
+        let landing = target_landing(target, &primary.target_field, context)?;
+        let primary_issue_path = format!("{source_type}.{}", primary.source_path);
+
+        // Innermost first: the last member's absence is the chain's, and
+        // each earlier member's absence arm is the next member's read.
+        let mut evaluation = absent_tokens(primary.required, &primary_issue_path);
+        let mut shape: Option<LocalShape> = None;
+        for (position, field) in chain.iter().enumerate().rev() {
+            let steps = self
+                .index
+                .steps(source_type, &field.source_path)
+                .map_err(|error| format!("{context}: {error}"))?;
+            let issue_path = format!("{source_type}.{}", field.source_path);
+            let conversion = self.conversion(
+                steps.last().expect("a resolved path has a leaf"),
+                &landing,
+                &field.value_map,
+                &field.known_values,
+                context,
+            )?;
+            if let Some(expected) = shape {
+                if conversion.local_shape() != expected {
+                    // The shape was set by the member declared after this one.
+                    let later = &chain[position + 1];
+                    return Err(format!(
+                        "{context}: `{}` and `{}` both map onto `{}` but produce \
+                         different values ({:?} and {expected:?}); a chain needs \
+                         one — extending the compiler is required",
+                        field.source_path,
+                        later.source_path,
+                        primary.target_field,
+                        conversion.local_shape()
+                    ));
+                }
+            }
+            shape = Some(conversion.local_shape());
+            evaluation = leaf_match(
+                source_param,
+                &steps,
+                &conversion_tokens(&conversion, &issue_path),
+                field.null_policy,
+                &evaluation,
+                &issue_path,
+                context,
+            )?;
+        }
 
         let local = claim_local(
             locals,
             &format!("{prefix}_{}", landing.setter_path.join("_").to_snake_case()),
-            context,
-        )?;
-        let evaluation = leaf_match(
-            source_param,
-            &steps,
-            &conversion_tokens(&conversion, &issue_path),
-            field.null_policy,
-            field.required,
-            &issue_path,
             context,
         )?;
 
@@ -696,7 +788,7 @@ impl Emitter<'_> {
             .first()
             .expect("a checked target landing has a root field");
         let gates =
-            if field.anchor || field.required || root_required(self.vocabulary, target, root) {
+            if primary.anchor || primary.required || root_required(self.vocabulary, target, root) {
                 vec![quote! { #local.is_some() }]
             } else {
                 Vec::new()
@@ -709,7 +801,7 @@ impl Emitter<'_> {
                 local,
                 setter_path: landing.setter_path,
                 gates,
-                issue_path,
+                issue_path: primary_issue_path,
             },
         ))
     }
@@ -792,7 +884,7 @@ impl Emitter<'_> {
             &steps,
             &conversion_tokens(&conversion, &issue_path),
             entry.null_policy,
-            false,
+            &absent_tokens(false, &issue_path),
             &issue_path,
             context,
         )?;
@@ -854,6 +946,23 @@ impl Emitter<'_> {
             (LandingKind::Field(field), SourceClass::DateTimeOffset) if is_timestamp(field) => {
                 Ok(Conversion::Timestamp {
                     destination: TimestampDestination::Field,
+                })
+            }
+            (_, SourceClass::Text) if !value_map.is_empty() => {
+                let destination = match kind {
+                    LandingKind::Field(field) => match field.kind() {
+                        Kind::Enum(contract_enum) => EnumDestination::Contract {
+                            model: short_name(contract_enum.full_name()),
+                        },
+                        _ => EnumDestination::Text(text_destination(kind, leaf, context)?),
+                    },
+                    LandingKind::VocabArm { .. } => {
+                        EnumDestination::Text(text_destination(kind, leaf, context)?)
+                    }
+                };
+                Ok(Conversion::TextMap {
+                    rows: value_map.to_vec(),
+                    destination,
                 })
             }
             (_, SourceClass::Text) => Ok(Conversion::Text {
@@ -1127,8 +1236,15 @@ impl Emitter<'_> {
                     );
                     // Identity the payload fails to state is missing, not
                     // guessable; the projection reports and emits nothing.
-                    let evaluation =
-                        leaf_match(source_param, &steps, &conversion, 0, true, &blame, &context)?;
+                    let evaluation = leaf_match(
+                        source_param,
+                        &steps,
+                        &conversion,
+                        0,
+                        &absent_tokens(true, &blame),
+                        &blame,
+                        &context,
+                    )?;
                     evaluations.extend(quote! { let #local = #evaluation; });
                     scope_locals.push(local);
                     blames.push(blame);
@@ -1447,30 +1563,53 @@ fn conversion_tokens(conversion: &Conversion, issue_path: &str) -> TokenStream {
             let enum_type = source_type_tokens(namespace, name);
             let arms = rows.iter().map(|(from, to)| {
                 let variant = escaped_ident(&casemungler::to_camel(from));
-                let output = match destination {
-                    EnumDestination::Text(destination) => {
-                        let value = quote! { #to };
-                        text_accept(destination, &value)
-                    }
-                    EnumDestination::Contract { model } => {
-                        let variant = ident(&variant_name(model, to));
-                        let model = ident(model);
-                        quote! { Some(::nv_telemetry_model::#model::#variant) }
-                    }
-                };
+                let output = row_output(destination, to);
                 quote! { #enum_type::#variant => #output, }
             });
-            quote! {
-                match value {
-                    #(#arms)*
-                    _ => {
-                        issues.push(::nv_telemetry_source::ProjectionIssue::invalid(
-                            #issue_path,
-                            "outside the known value set",
-                        ));
-                        None
-                    }
-                }
+            unknown_value_match(&quote! { value }, arms, issue_path)
+        }
+        Conversion::TextMap { rows, destination } => {
+            let arms = rows.iter().map(|(from, to)| {
+                let output = row_output(destination, to);
+                quote! { #from => #output, }
+            });
+            unknown_value_match(&quote! { value.as_str() }, arms, issue_path)
+        }
+    }
+}
+
+/// What one `value_map` row projects to: its text into a text landing, or
+/// the contract enumeration's variant.
+fn row_output(destination: &EnumDestination, to: &str) -> TokenStream {
+    match destination {
+        EnumDestination::Text(destination) => {
+            let value = quote! { #to };
+            text_accept(destination, &value)
+        }
+        EnumDestination::Contract { model } => {
+            let variant = ident(&variant_name(model, to));
+            let model = ident(model);
+            quote! { Some(::nv_telemetry_model::#model::#variant) }
+        }
+    }
+}
+
+/// A match over `scrutinee` with the rows' arms and the report every other
+/// value earns.
+fn unknown_value_match(
+    scrutinee: &TokenStream,
+    arms: impl Iterator<Item = TokenStream>,
+    issue_path: &str,
+) -> TokenStream {
+    quote! {
+        match #scrutinee {
+            #(#arms)*
+            _ => {
+                issues.push(::nv_telemetry_source::ProjectionIssue::invalid(
+                    #issue_path,
+                    "outside the known value set",
+                ));
+                None
             }
         }
     }
@@ -1570,12 +1709,30 @@ fn location_helper(name: &Ident, pattern: &LocationPattern) -> TokenStream {
 /// rejected by the lint (`nullable intermediate segments`), and a
 /// required-nullable leaf below an optional prefix would conflate absence
 /// with null, so both are errors here rather than silently collapsed reads.
+/// What an absent leaf evaluates to: nothing, or nothing with the absence
+/// reported.
+fn absent_tokens(required: bool, issue_path: &str) -> TokenStream {
+    if required {
+        quote! {
+            {
+                issues.push(::nv_telemetry_source::ProjectionIssue::missing(#issue_path));
+                None
+            }
+        }
+    } else {
+        quote! { None }
+    }
+}
+
+/// The read of one leaf, converting a present value and evaluating to
+/// `absent` otherwise: `None`, the reported absence, or the next mapping of
+/// a fallback chain.
 fn leaf_match(
     source_param: &Ident,
     steps: &[Step],
     conversion: &TokenStream,
     null_policy: i32,
-    required: bool,
+    absent: &TokenStream,
     issue_path: &str,
     context: &str,
 ) -> Result<TokenStream, String> {
@@ -1630,16 +1787,6 @@ fn leaf_match(
         ),
     };
 
-    let absent = if required {
-        quote! {
-            {
-                issues.push(::nv_telemetry_source::ProjectionIssue::missing(#issue_path));
-                None
-            }
-        }
-    } else {
-        quote! { None }
-    };
     let null_invalid = quote! {
         {
             issues.push(::nv_telemetry_source::ProjectionIssue::invalid(

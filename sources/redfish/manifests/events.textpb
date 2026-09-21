@@ -29,13 +29,22 @@ projections {
     target_field: "occurred_at"
   }
   # `MessageSeverity` is the current property, a `Health` value the
-  # contract's ladder maps directly; `OK` is an informational event. The
-  # deprecated free-text `Severity`, which bmcweb still sets alone, rides
-  # along as an attribute.
+  # contract's ladder maps directly; `OK` is an informational event. It
+  # arrived with Event v1.5; a device declaring an earlier version sends the
+  # free-text `Severity` alone, spec-valid, with the same values from the
+  # message registry. The second mapping is read only when the first is
+  # absent.
   fields {
     source_path: "MessageSeverity"
     target_field: "severity"
     null_policy: NULL_POLICY_ABSENT
+    value_map { from: "OK" to: "SEVERITY_INFO" }
+    value_map { from: "Warning" to: "SEVERITY_WARNING" }
+    value_map { from: "Critical" to: "SEVERITY_CRITICAL" }
+  }
+  fields {
+    source_path: "Severity"
+    target_field: "severity"
     value_map { from: "OK" to: "SEVERITY_INFO" }
     value_map { from: "Warning" to: "SEVERITY_WARNING" }
     value_map { from: "Critical" to: "SEVERITY_CRITICAL" }
@@ -62,10 +71,6 @@ projections {
     entries {
       key: "event-type"
       source_path: "EventType"
-    }
-    entries {
-      key: "severity"
-      source_path: "Severity"
     }
     entries {
       key: "member-id"
