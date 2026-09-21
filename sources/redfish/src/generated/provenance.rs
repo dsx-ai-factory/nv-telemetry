@@ -133,6 +133,12 @@ pub(crate) const PROVENANCE: &[Extraction] = &[
     Extraction {
         manifest: "sources/redfish/manifests/events.textpb",
         projection: "event-record",
+        source: "EventRecord.Severity",
+        target: "nv.telemetry.v1.LogRecord.severity",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/events.textpb",
+        projection: "event-record",
         source: "EventRecord.Message",
         target: "nv.telemetry.v1.LogRecord.message",
     },
@@ -153,12 +159,6 @@ pub(crate) const PROVENANCE: &[Extraction] = &[
         projection: "event-record",
         source: "EventRecord.EventType",
         target: "nv.telemetry.v1.LogRecord.attributes[\"event-type\"]",
-    },
-    Extraction {
-        manifest: "sources/redfish/manifests/events.textpb",
-        projection: "event-record",
-        source: "EventRecord.Severity",
-        target: "nv.telemetry.v1.LogRecord.attributes[\"severity\"]",
     },
     Extraction {
         manifest: "sources/redfish/manifests/events.textpb",

@@ -317,6 +317,19 @@ pub enum Reason {
     ReservedProvenance(String),
     InventoryPairing(String),
     NestedAssemblyTarget(String),
+    RepeatedSource {
+        path: String,
+        source: String,
+    },
+    FallbackGate {
+        path: String,
+        source: String,
+    },
+    UnreachableFallback {
+        path: String,
+        always: String,
+        source: String,
+    },
 }
 
 impl fmt::Display for Reason {
@@ -408,6 +421,25 @@ impl fmt::Display for Reason {
                 f,
                 "two declarations set `{path}`; whichever ran last would \
                  silently win"
+            ),
+            Self::RepeatedSource { path, source } => write!(
+                f,
+                "`{source}` is mapped onto `{path}` twice; the second read \
+                 could never run"
+            ),
+            Self::FallbackGate { path, source } => write!(
+                f,
+                "`{source}` is a fallback for `{path}` and declares `required` \
+                 or `anchor`; the gate is the chain's first mapping's"
+            ),
+            Self::UnreachableFallback {
+                path,
+                always,
+                source,
+            } => write!(
+                f,
+                "`{always}` is always present, so `{source}` could never be \
+                 read for `{path}`"
             ),
             Self::OverlappingTargets { outer, inner } => write!(
                 f,
@@ -1331,13 +1363,28 @@ impl<'a, 'b> Checker<'a, 'b> {
                 feature: "NULL_POLICY_EXPLICIT_NULL",
             });
         }
-        self.check_vocabulary(
-            path,
-            &resolved,
-            value_map.iter().map(|(from, _)| from),
-            "value_map on a source that is not an enumeration",
-        );
+        // On text the rows are the whole vocabulary and nothing checks
+        // their spelling; on an enumeration they must name members.
+        if !resolved.text {
+            self.check_vocabulary(
+                path,
+                &resolved,
+                value_map.iter().map(|(from, _)| from),
+                "value_map on a source that is not an enumeration",
+            );
+        }
         Some(resolved)
+    }
+
+    /// Whether every segment of `path` is required and non-nullable, so the
+    /// read can never be absent.
+    fn always_present(&self, path: &str) -> bool {
+        self.known
+            && self.index.steps(self.source_type, path).is_ok_and(|steps| {
+                steps
+                    .iter()
+                    .all(|step| step.shape() == crate::projection::index::Shape::Bare)
+            })
     }
 
     /// Every proper prefix of a source path must be a singular segment: the
@@ -1511,9 +1558,11 @@ impl<'a, 'b> Checker<'a, 'b> {
         known_values: &[String],
         target: &FieldDescriptor,
     ) {
-        let Some(members) = &resolved.enum_members else {
+        // A closed vocabulary is an enumeration's members, or a text
+        // source's value_map, which is the whole vocabulary.
+        if resolved.enum_members.is_none() && !resolved.text {
             return;
-        };
+        }
         match target.kind() {
             Kind::String => {}
             // A contract enumeration: rows name its values by their
@@ -1552,13 +1601,15 @@ impl<'a, 'b> Checker<'a, 'b> {
         }
 
         let mut outputs: Vec<&str> = value_map.iter().map(|(_, to)| to.as_str()).collect();
-        for known in known_values {
-            if !value_map.iter().any(|(from, _)| from == known) {
-                outputs.push(known);
+        if let Some(members) = &resolved.enum_members {
+            for known in known_values {
+                if !value_map.iter().any(|(from, _)| from == known) {
+                    outputs.push(known);
+                }
             }
-        }
-        if outputs.is_empty() {
-            outputs.extend(members.iter().map(String::as_str));
+            if outputs.is_empty() {
+                outputs.extend(members.iter().map(String::as_str));
+            }
         }
         for output in outputs {
             self.check_static_text(&format!("enum output for `{path}`"), output, target);
@@ -1584,11 +1635,58 @@ impl<'a, 'b> Checker<'a, 'b> {
     /// Target fields must not collide: two writes to one path, a write
     /// inside a field another declaration sets whole, or two cases of one
     /// oneof.
+    /// Field mappings onto one target form a fallback chain in declaration
+    /// order: the gate is the first member's, a source read twice could
+    /// never run the second time, and a member that is always present
+    /// leaves nothing for those after it. Returns the targets, each once,
+    /// in declaration order.
+    fn check_chains<'c>(&mut self, instance: &'c ProjectionSpec) -> Vec<&'c str> {
+        let mut chains: Vec<(&str, Vec<&FieldSpec>)> = Vec::new();
+        for field in &instance.fields {
+            if field.target_field.is_empty() {
+                continue;
+            }
+            match chains
+                .iter_mut()
+                .find(|(path, _)| *path == field.target_field)
+            {
+                Some((_, members)) => members.push(field),
+                None => chains.push((field.target_field.as_str(), vec![field])),
+            }
+        }
+        for (path, members) in &chains {
+            let mut sources = BTreeSet::new();
+            for (position, member) in members.iter().enumerate() {
+                if !sources.insert(member.source_path.as_str()) {
+                    self.push(Reason::RepeatedSource {
+                        path: (*path).to_owned(),
+                        source: member.source_path.clone(),
+                    });
+                }
+                if position > 0 && (member.required || member.anchor) {
+                    self.push(Reason::FallbackGate {
+                        path: (*path).to_owned(),
+                        source: member.source_path.clone(),
+                    });
+                }
+                if let Some(next) = members.get(position + 1) {
+                    if self.always_present(&member.source_path) {
+                        self.push(Reason::UnreachableFallback {
+                            path: (*path).to_owned(),
+                            always: member.source_path.clone(),
+                            source: next.source_path.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        chains.into_iter().map(|(path, _)| path).collect()
+    }
+
     fn check_targets(&mut self, instance: &ProjectionSpec, vocabulary: &Vocabulary) {
-        let declared: Vec<&str> = instance
-            .fields
-            .iter()
-            .map(|field| field.target_field.as_str())
+        let declared: Vec<&str> = self
+            .check_chains(instance)
+            .into_iter()
             .chain(
                 instance
                     .constants

@@ -166,11 +166,6 @@ async fn an_event_payload_is_one_logs_batch_under_the_streams_scope() {
         attribute("member-id"),
         Some(Value::string("0").expect("text"))
     );
-    assert_eq!(
-        attribute("severity"),
-        None,
-        "no free-text Severity was sent"
-    );
 
     // The device closed the stream: one terminal, retryable failure, so the
     // embedder reconnects.
@@ -178,6 +173,58 @@ async fn an_event_payload_is_one_logs_batch_under_the_streams_scope() {
     assert_eq!(end.class(), AcquisitionFailureClass::Protocol);
     assert_eq!(end.retryable(), Some(true));
     assert_eq!(end.detail(), Some("the device closed the event stream"));
+}
+
+/// `powered_on`, with the record's `MessageSeverity` replaced by the
+/// deprecated free-text `Severity`, as a device declaring an Event schema
+/// before v1.5 sends it.
+fn powered_on_deprecated_severity(event_id: u32, severity: &str) -> Json {
+    let mut payload = powered_on(event_id);
+    let record = payload["Events"][0]
+        .as_object_mut()
+        .expect("a record object");
+    record.remove("MessageSeverity");
+    record.insert("Severity".to_owned(), json!(severity));
+    payload
+}
+
+#[tokio::test]
+async fn severity_falls_back_to_the_deprecated_property_when_the_current_is_absent() {
+    let mut both = powered_on(8);
+    both["Events"][0]["MessageSeverity"] = json!("Critical");
+    both["Events"][0]["Severity"] = json!("OK");
+    let items = open(&[
+        powered_on_deprecated_severity(7, "Warning"),
+        both,
+        powered_on_deprecated_severity(9, "Bogus"),
+    ])
+    .await;
+    assert_eq!(items.len(), 4);
+    let severity = |item: &SubscriptionItem| {
+        let Payload::Logs(logs) = &parts(item).payloads()[0].1 else {
+            panic!("events project into logs");
+        };
+        logs.records()[0].severity()
+    };
+
+    // The deprecated property alone: the same value set, the same severity,
+    // and no issue.
+    assert_eq!(severity(&items[0]), Some(Severity::Warning));
+    assert!(parts(&items[0]).issues().is_empty());
+    // Both present: the current property decides, the deprecated one is
+    // not read.
+    assert_eq!(severity(&items[1]), Some(Severity::Critical));
+    // A deprecated value outside the set is that property's issue, at the
+    // record's place in the payload; the record still ships, without a
+    // severity.
+    assert_eq!(severity(&items[2]), None);
+    assert_eq!(
+        parts(&items[2]).issues(),
+        [
+            ProjectionIssue::invalid("EventRecord.Severity", "outside the known value set")
+                .at_index("Events", 0)
+        ]
+    );
 }
 
 #[tokio::test]

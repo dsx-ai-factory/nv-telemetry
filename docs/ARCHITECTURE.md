@@ -680,7 +680,10 @@ schema — that names the source schema path, the target core field, subject
 derivation, unit handling, and the known-value set for open enumerations.
 Manifests reference protocol schema paths such as `Sensor/Reading`, never the
 source crate's Rust shapes, so the projection backend can change without
-rewriting a declaration.
+rewriting a declaration. A target that several mappings name is read in
+declaration order, the first present source deciding, which is how a
+deprecated property stands in for its successor on devices whose schema
+version predates it.
 
 The compiler never resolves a path against a protocol directly. It resolves
 against a schema index: a backend-neutral description of a source field — its

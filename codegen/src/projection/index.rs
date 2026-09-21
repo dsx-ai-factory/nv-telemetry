@@ -51,6 +51,10 @@ pub struct ResolvedField {
     pub class: TypeClass,
     pub nullable: bool,
     pub collection: bool,
+    /// Whether one value is text, as the leaf [`Step`] classifies it for
+    /// the emitter. A `value_map` on text is the whole vocabulary the field
+    /// admits.
+    pub text: bool,
     /// Member names when the type is an enum: the closed vocabulary
     /// `value_map` and `known_values` are validated against.
     pub enum_members: Option<Vec<String>>,
@@ -220,11 +224,17 @@ impl RedfishIndex<'_> {
     #[must_use]
     pub fn resolve(&self, source_type: &str, path: &str) -> Option<ResolvedField> {
         let property = self.query.resolve(source_type, path)?;
+        let text = self
+            .steps(source_type, path)
+            .ok()
+            .and_then(|steps| steps.into_iter().last())
+            .is_some_and(|leaf| leaf.is_text());
         Some(ResolvedField {
             type_name: property.type_name.to_string(),
             class: property.class,
             nullable: property.nullable,
             collection: property.collection,
+            text,
             enum_members: property.enum_members.map(|members| {
                 members
                     .iter()

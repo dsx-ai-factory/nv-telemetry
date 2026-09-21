@@ -232,6 +232,15 @@ message ScopeSource {
 }
 
 message FieldMapping {
+  // Source property to read, as a dotted path in the source schema. Several
+  // mappings onto one target form a fallback chain in declaration order: the
+  // first present source decides, and a later one is read only when every
+  // earlier one is absent, which is how a deprecated property stands in for
+  // its successor on devices that predate it. A present but unusable value is
+  // that source's issue, never a reason to read the next. `required` and
+  // `anchor` belong on the first mapping and speak for the chain: a required
+  // chain reports absence, at the first source's path, only when no member is
+  // present.
   string source_path = 1;
 
   // Target field, as a dotted path into the target message so that a nested
@@ -267,7 +276,8 @@ message FieldMapping {
 
   // Rewrites source values to contract values, for sources that spell the
   // same fact differently. An unlisted value is reported as invalid unless
-  // the source enumeration is open.
+  // the source enumeration is open. On a text source the rows are the whole
+  // vocabulary: text outside them is reported.
   repeated ValueMapping value_map = 9;
 }
 

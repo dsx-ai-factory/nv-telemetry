@@ -80,6 +80,16 @@ fn passes(spec: ManifestSpec) {
     );
 }
 
+/// The rendered module of one test manifest.
+fn emitted_module(projections: Vec<ProjectionSpec>) -> String {
+    let files = emit(&[manifest(projections)]).expect("the manifest emits");
+    files
+        .into_iter()
+        .find(|(path, _)| path.ends_with("test.rs"))
+        .map(|(_, text)| text)
+        .expect("the manifest's module is rendered")
+}
+
 fn subject() -> SubjectSpec {
     SubjectSpec {
         kind: "sensor".to_owned(),
@@ -200,6 +210,39 @@ fn log_projection(name: &str) -> ProjectionSpec {
                 })
                 .collect(),
         }],
+        ..projection(name)
+    }
+}
+
+fn severity_rows() -> Vec<(String, String)> {
+    vec![
+        ("OK".to_owned(), "SEVERITY_INFO".to_owned()),
+        ("Warning".to_owned(), "SEVERITY_WARNING".to_owned()),
+        ("Critical".to_owned(), "SEVERITY_CRITICAL".to_owned()),
+    ]
+}
+
+/// The shipped event-record shape: `severity` read from the current
+/// enumeration, falling back to the deprecated text property.
+fn event_projection(name: &str) -> ProjectionSpec {
+    let mut current = field("MessageSeverity", "severity");
+    current.value_map = severity_rows();
+    let mut deprecated = field("Severity", "severity");
+    deprecated.value_map = severity_rows();
+    let mut message = field("Message", "message");
+    message.required = true;
+    ProjectionSpec {
+        source_type: "EventRecord".to_owned(),
+        target_type: "nv.telemetry.v1.LogRecord".to_owned(),
+        subject: None,
+        fields: vec![
+            field("EventTimestamp", "occurred_at"),
+            current,
+            deprecated,
+            message,
+            field("EventId", "entry_id"),
+        ],
+        map_assemblies: Vec::new(),
         ..projection(name)
     }
 }
@@ -721,11 +764,66 @@ fn descent_through_a_repeated_target_is_rejected() {
 }
 
 #[test]
-fn two_writes_to_one_target_are_rejected() {
-    let mut broken = projection("sample");
-    broken
-        .fields
-        .push(field("ReadingUnits", "value.double_value"));
+fn a_second_mapping_onto_a_target_is_read_only_when_the_first_is_absent() {
+    // The fallback's read sits in the primary's absence arm: one local
+    // holds the chain, the current property is inspected first, and the
+    // deprecated text is matched against the same rows.
+    passes(manifest(vec![event_projection("event-record")]));
+    let module = emitted_module(vec![event_projection("event-record")]);
+    assert_eq!(
+        module.matches("let event_record_severity =").count(),
+        1,
+        "one local holds the chain"
+    );
+    assert!(module.contains("event_record.message_severity"));
+    assert!(module.contains("event_record.severity.clone()"));
+    assert!(module.contains("match value.as_str()"));
+    assert!(module.contains("\"Warning\" => Some(::nv_telemetry_model::Severity::Warning)"));
+    assert!(module.contains("\"EventRecord.Severity\""));
+}
+
+#[test]
+fn a_source_mapped_onto_a_target_twice_is_rejected() {
+    let mut twice = event_projection("event-record");
+    let again = twice.fields[1].clone();
+    twice.fields.push(again);
+    rejects(manifest(vec![twice]), "twice");
+}
+
+#[test]
+fn a_fallback_carries_no_gate_of_its_own() {
+    let mut gated = event_projection("event-record");
+    gated.fields[2].required = true;
+    rejects(manifest(vec![gated]), "the chain's first mapping");
+}
+
+#[test]
+fn a_fallback_behind_an_always_present_source_is_rejected() {
+    // `Id` is required and non-nullable: nothing after it could be read.
+    let mut dead = descriptor("descriptor");
+    dead.fields = vec![field("Id", "unit"), field("ReadingUnits", "unit")];
+    rejects(manifest(vec![dead]), "always present");
+}
+
+#[test]
+fn a_chain_over_different_value_shapes_is_refused() {
+    // Device text lands owned, an enumeration's row lands static: one
+    // local cannot hold both, and the refusal names the two members.
+    let mut mixed = event_projection("event-record");
+    let mut kind = field("EventType", "message");
+    kind.value_map = vec![("Alert".to_owned(), "alert".to_owned())];
+    mixed.fields.push(kind);
+    passes(manifest(vec![mixed.clone()]));
+    emit_rejects(
+        manifest(vec![mixed]),
+        "`Message` and `EventType` both map onto `message`",
+    );
+}
+
+#[test]
+fn a_field_beside_a_constant_on_one_target_still_conflicts() {
+    let mut broken = state_projection("state");
+    broken.fields.push(field("Id", "name"));
     rejects(manifest(vec![broken]), "two declarations set");
 }
 
@@ -1073,17 +1171,28 @@ fn required_nullable_source_fields_keep_explicit_null_distinct() {
 }
 
 #[test]
-fn vocabulary_on_a_non_enum_source_is_not_honored() {
-    // The rewrites would be consulted by nothing: a mapping that reads as
-    // enforced while doing nothing.
-    let mut mapped = projection("sample");
-    mapped.fields[0].source_path = "ReadingUnits".to_owned();
-    mapped.fields[0].value_map = vec![("Cel".to_owned(), "celsius".to_owned())];
-    rejects(
-        manifest(vec![mapped]),
-        "`value_map on a source that is not an enumeration`",
-    );
+fn a_value_map_on_a_text_source_is_its_whole_vocabulary() {
+    // Listed text projects to its row; anything else is reported.
+    let mut mapped = descriptor("descriptor");
+    let mut units = field("ReadingUnits", "unit");
+    units.value_map = vec![("Cel".to_owned(), "celsius".to_owned())];
+    mapped.fields = vec![units];
+    passes(manifest(vec![mapped.clone()]));
+    let module = emitted_module(vec![mapped]);
+    assert!(module.contains("match value.as_str()"));
+    assert!(module.contains("\"Cel\" => Some(\"celsius\")"));
+    assert!(module.contains("outside the known value set"));
 
+    // Text into a contract enumeration needs the rows as much as an
+    // enumeration does: nothing projects verbatim.
+    let mut unmapped = event_projection("event-record");
+    unmapped.fields[2].value_map.clear();
+    rejects(manifest(vec![unmapped]), "without a value_map");
+}
+
+#[test]
+fn known_values_on_a_non_enum_source_are_not_honored() {
+    // A verbatim allow-list over text would be consulted by nothing yet.
     let mut known = projection("sample");
     known.fields[0].source_path = "ReadingUnits".to_owned();
     known.fields[0].known_values = vec!["Cel".to_owned()];
