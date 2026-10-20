@@ -1,0 +1,7 @@
+{
+  "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HostBIOS_0",
+  "@odata.type": "#SoftwareInventory.v1_10_0.SoftwareInventory",
+  "Id": "HostBMC_0",
+  "Name": "Host UEFI",
+  "Version": "02.04.01"
+}

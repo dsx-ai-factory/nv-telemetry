@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Demo embedder: polls one Redfish endpoint's sensors, chassis, and log
-//! services on a cadence and prints the three output streams — batches,
-//! statuses, and issues — one tagged line each.
+//! Demo embedder: polls one Redfish endpoint's sensors, chassis, log
+//! services, and update services on a cadence and prints the three output
+//! streams — batches, statuses, and issues — one tagged line each.
 //!
 //! This binary is the embedder role the architecture assigns outside the
 //! library: it owns the endpoint list, the driving loop, and the timer.
@@ -49,6 +49,7 @@ use nv_telemetry_orchestration::SystemClock;
 use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::ClassifyError;
 use nv_telemetry_redfish::EventStream;
+use nv_telemetry_redfish::FirmwareRead;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
 use url::Url;
@@ -56,7 +57,8 @@ use url::Url;
 const USAGE: &str = "\
 usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
            [--sensor <odata-id> ...] [--chassis <odata-id> ...]
-           [--log-service <odata-id> ...] [--event-stream]
+           [--log-service <odata-id> ...] [--update-service <odata-id> ...]
+           [--event-stream]
            [--cadence-ms <ms>] [--count <n>] [--base-url <url>] [--insecure]
            [--strict]
 
@@ -80,6 +82,10 @@ reported acquisition failures and issues do not change the exit status.
 /// replayed service document links to, whatever `--log-service` named.
 const LOG_ENTRIES: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries";
 const LOG_ENTRY: &str = "/redfish/v1/Systems/1/LogServices/SEL/Entries/1";
+/// Likewise the mock update-service fixture's own firmware inventory
+/// collection and member.
+const FIRMWARE_INVENTORY: &str = "/redfish/v1/UpdateService/FirmwareInventory";
+const FIRMWARE_ITEM: &str = "/redfish/v1/UpdateService/FirmwareInventory/HostBMC_0";
 
 struct Args {
     mode: Mode,
@@ -87,6 +93,7 @@ struct Args {
     sensors: Vec<String>,
     chassis: Vec<String>,
     log_services: Vec<String>,
+    update_services: Vec<String>,
     event_stream: bool,
     cadence: Duration,
     count: usize,
@@ -129,6 +136,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut sensors = Vec::new();
     let mut chassis = Vec::new();
     let mut log_services = Vec::new();
+    let mut update_services = Vec::new();
     let mut event_stream = false;
     let mut cadence = Duration::from_secs(5);
     let mut count = 10;
@@ -150,6 +158,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--sensor" => sensors.push(value("--sensor")?),
             "--chassis" => chassis.push(value("--chassis")?),
             "--log-service" => log_services.push(value("--log-service")?),
+            "--update-service" => update_services.push(value("--update-service")?),
             "--event-stream" => event_stream = true,
             "--cadence-ms" => {
                 let ms = value("--cadence-ms")?
@@ -182,11 +191,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         // primed in a known order.
         return Err("`--event-stream` needs `--mode http`".to_owned());
     }
-    if sensors.is_empty() && chassis.is_empty() && log_services.is_empty() && !event_stream {
-        return Err(
-            "at least one `--sensor`, `--chassis`, `--log-service`, or `--event-stream` is required"
-                .to_owned(),
-        );
+    if sensors.is_empty()
+        && chassis.is_empty()
+        && log_services.is_empty()
+        && update_services.is_empty()
+        && !event_stream
+    {
+        return Err("at least one `--sensor`, `--chassis`, `--log-service`, \
+                    `--update-service`, or `--event-stream` is required"
+            .to_owned());
     }
     Ok(Args {
         mode,
@@ -194,6 +207,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         sensors,
         chassis,
         log_services,
+        update_services,
         event_stream,
         cadence,
         count,
@@ -239,6 +253,14 @@ async fn run(args: &Args) -> Result<(), String> {
                 service.clone(),
                 args.cadence,
             )
+        }))
+        .chain(args.update_services.iter().map(|service| {
+            PollNeed::new(
+                endpoint.clone(),
+                FirmwareRead::<()>::REQUEST_CLASS,
+                service.clone(),
+                args.cadence,
+            )
         }));
     // The stream is planned like the polls: the embedder seats what the
     // plan resolved and nothing else.
@@ -251,6 +273,7 @@ async fn run(args: &Args) -> Result<(), String> {
             SensorRead::<()>::declaration(),
             ChassisRead::<()>::declaration(),
             LogRead::<()>::declaration(),
+            FirmwareRead::<()>::declaration(),
             EventStream::<()>::declaration(),
         ],
     )
@@ -291,8 +314,9 @@ async fn run(args: &Args) -> Result<(), String> {
 /// dispatch order: the ring visits targets in needs order each round, and a
 /// log read asks three times — the service, its entries collection, then
 /// each member — plus the service root on its second round, to learn
-/// whether the device filters. The collection and entry URIs are the
-/// fixture's own.
+/// whether the device filters; a firmware read asks three times too — the
+/// update service, its inventory collection, then each member. The
+/// collection and member URIs are the fixtures' own.
 fn prime_mock(bmc: &nv_redfish_bmc_mock::Bmc<nv_redfish_bmc_mock::Error>, args: &Args) {
     let sensor_fixture = include_str!("../fixtures/sensor.json");
     let chassis_fixture = include_str!("../fixtures/chassis.json");
@@ -300,6 +324,9 @@ fn prime_mock(bmc: &nv_redfish_bmc_mock::Bmc<nv_redfish_bmc_mock::Error>, args: 
     let log_entries_fixture = include_str!("../fixtures/log-entries.json");
     let log_entry_fixture = include_str!("../fixtures/log-entry.json");
     let service_root_fixture = include_str!("../fixtures/service-root.json");
+    let update_service_fixture = include_str!("../fixtures/update-service.json");
+    let firmware_inventory_fixture = include_str!("../fixtures/firmware-inventory.json");
+    let firmware_item_fixture = include_str!("../fixtures/firmware-item.json");
     for round in 0..args.count {
         for sensor in &args.sensors {
             bmc.expect(Expect::get(sensor, sensor_fixture));
@@ -314,6 +341,11 @@ fn prime_mock(bmc: &nv_redfish_bmc_mock::Bmc<nv_redfish_bmc_mock::Error>, args: 
             bmc.expect(Expect::get(service, log_service_fixture));
             bmc.expect(Expect::get(LOG_ENTRIES, log_entries_fixture));
             bmc.expect(Expect::get(LOG_ENTRY, log_entry_fixture));
+        }
+        for service in &args.update_services {
+            bmc.expect(Expect::get(service, update_service_fixture));
+            bmc.expect(Expect::get(FIRMWARE_INVENTORY, firmware_inventory_fixture));
+            bmc.expect(Expect::get(FIRMWARE_ITEM, firmware_item_fixture));
         }
     }
 }
@@ -350,6 +382,9 @@ where
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
             } else if planned.origin().request_class() == LogRead::<B>::REQUEST_CLASS {
                 let unit = LogRead::new(endpoint, target, Arc::clone(bmc));
+                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+            } else if planned.origin().request_class() == FirmwareRead::<B>::REQUEST_CLASS {
+                let unit = FirmwareRead::new(endpoint, target, Arc::clone(bmc));
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
             } else {
                 unreachable!("the plan selects only declared providers")
@@ -446,7 +481,10 @@ async fn drive(
 
     println!(
         "polling {} target(s) on `{}` every {:?}{}, {} report(s)",
-        args.sensors.len() + args.chassis.len() + args.log_services.len(),
+        args.sensors.len()
+            + args.chassis.len()
+            + args.log_services.len()
+            + args.update_services.len(),
         endpoint.endpoint_id(),
         args.cadence,
         if reports.is_empty() {

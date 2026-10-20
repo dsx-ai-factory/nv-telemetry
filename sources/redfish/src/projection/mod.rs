@@ -17,6 +17,7 @@
 pub(crate) use crate::generated::chassis::project_chassis;
 pub(crate) use crate::generated::chassis::ChassisParts;
 pub(crate) use crate::generated::events::project_event_record;
+pub(crate) use crate::generated::firmware::project_software_inventory;
 pub(crate) use crate::generated::logs::project_log_entry;
 pub(crate) use crate::generated::sensor::project_sensor;
 pub(crate) use crate::generated::sensor::SensorParts;

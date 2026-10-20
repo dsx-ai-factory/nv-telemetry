@@ -15,6 +15,9 @@ pub(crate) mod chassis;
 pub(crate) mod events;
 
 #[rustfmt::skip]
+pub(crate) mod firmware;
+
+#[rustfmt::skip]
 pub(crate) mod logs;
 
 #[rustfmt::skip]

@@ -3,12 +3,14 @@
 
 //! Redfish acquisition.
 //!
-//! Three polled providers ship, one [`Read`] envelope each: [`SensorRead`] —
+//! Four polled providers ship, one [`Read`] envelope each: [`SensorRead`] —
 //! one sensor `OData` GET projected into a readings batch and a states
 //! batch, per `docs/DATA-MODEL.md`'s worked example — [`ChassisRead`] — one
-//! chassis GET projected into an inventory batch and a states batch — and
+//! chassis GET projected into an inventory batch and a states batch —
 //! [`LogRead`] — a walk over a log service's entries projected into logs
-//! batches. One streamed provider ships beside them: [`EventStream`] — the
+//! batches — and [`FirmwareRead`] — a walk over the update service's
+//! firmware inventory projected into an inventory batch and a states batch.
+//! One streamed provider ships beside them: [`EventStream`] — the
 //! endpoint's server-sent events, one item per `Event` payload, projected
 //! into logs batches under the event service's own scope. Transport rides
 //! nv-redfish's `Bmc` trait, so the providers are
@@ -37,6 +39,8 @@ mod uri;
 pub use failure::ClassifyError;
 pub use provider::ChassisKind;
 pub use provider::ChassisRead;
+pub use provider::FirmwareKind;
+pub use provider::FirmwareRead;
 pub use provider::LogCursor;
 pub use provider::LogKind;
 pub use provider::LogRead;

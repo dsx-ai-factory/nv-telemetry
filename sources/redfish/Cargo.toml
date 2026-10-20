@@ -14,7 +14,7 @@ nv-telemetry-source.workspace = true
 # `log-services` brings LogService, its entries collection, and LogEntry.
 # `event-service` brings EventService, the SSE payload types, and the
 # vendor patches that make some devices' event records deserialize.
-nv-redfish = { workspace = true, features = ["sensors", "chassis", "log-services", "event-service"] }
+nv-redfish = { workspace = true, features = ["sensors", "chassis", "log-services", "event-service", "update-service"] }
 # Optional so the `bmc-mock` feature can gate a `ClassifyError` impl for the
 # mock's error type; tests pull it unconditionally through dev-dependencies.
 nv-redfish-bmc-mock = { workspace = true, optional = true }

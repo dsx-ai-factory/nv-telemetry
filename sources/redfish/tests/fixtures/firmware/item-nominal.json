@@ -1,0 +1,14 @@
+{
+  "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HostBMC_0",
+  "@odata.type": "#SoftwareInventory.v1_10_0.SoftwareInventory",
+  "@odata.etag": "W/\"4B2C1A\"",
+  "Id": "HostBMC_0",
+  "Name": "Host BMC Firmware",
+  "Version": "47.20.02",
+  "Manufacturer": "NVIDIA",
+  "SoftwareId": "BMC-47",
+  "ReleaseDate": "2026-01-15T00:00:00Z",
+  "LowestSupportedVersion": "47.00.00",
+  "Updateable": true,
+  "Status": { "State": "Enabled", "Health": "OK" }
+}

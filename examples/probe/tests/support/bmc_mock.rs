@@ -56,6 +56,8 @@ pub(crate) struct Resources {
     pub(crate) clear_log: String,
     /// `#Manager.Reset` on the first manager, as the manager advertises it.
     pub(crate) manager_reset: String,
+    /// The update service, as the service root links it.
+    pub(crate) update_service: String,
 }
 
 /// How long the child mock stays offline after `Manager.Reset`.
@@ -266,6 +268,7 @@ impl Server {
             .get(members(&managers).next().expect("a manager"))
             .await;
         let manager_reset = action_target(&manager, "#Manager.Reset");
+        let update_service = link(&root, "UpdateService");
         let systems = self.get(&link(&root, "Systems")).await;
         for path in members(&systems) {
             let system = self.get(path).await;
@@ -289,6 +292,7 @@ impl Server {
                     system_reset: action_target(&system, "#ComputerSystem.Reset"),
                     clear_log: action_target(&service, "#LogService.ClearLog"),
                     manager_reset,
+                    update_service,
                     log,
                 };
             }

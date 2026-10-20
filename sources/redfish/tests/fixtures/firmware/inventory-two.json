@@ -1,0 +1,10 @@
+{
+  "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory",
+  "@odata.type": "#SoftwareInventoryCollection.SoftwareInventoryCollection",
+  "Name": "Firmware Inventory Collection",
+  "Members@odata.count": 2,
+  "Members": [
+    { "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HostBMC_0" },
+    { "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HostBIOS_0" }
+  ]
+}

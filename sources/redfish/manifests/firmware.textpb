@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The SoftwareInventory mapping: one member of the update service's firmware
+# inventory becomes one InventoryItem, and its Status two states. An
+# nv.telemetry.mapping.v1.Manifest in protobuf text format, checked against
+# the DMTF schema index and the contract at `make codegen` time. The
+# provider walks the FirmwareInventory collection; this projects one member.
+
+source: "redfish"
+backend: BACKEND_SCHEMA_INDEX
+index: "nv-redfish-schema/dmtf"
+
+# One update service per service root, so `Id` alone names a firmware
+# component; the member's location lands as provenance, never identity.
+subject {
+  kind: "firmware"
+  id_path: "Id"
+}
+
+projections {
+  name: "firmware-inventory"
+  source_type: "SoftwareInventory"
+  target_type: "nv.telemetry.v1.InventoryItem"
+  # `Name` is required of every resource, so a component always emits an
+  # item; a component the device lists without a version is still a
+  # component. Everything else joins when present.
+  map_assemblies {
+    target_field: "attributes"
+    anchor: true
+    entries {
+      key: "name"
+      source_path: "Name"
+    }
+    entries {
+      key: "version"
+      source_path: "Version"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "manufacturer"
+      source_path: "Manufacturer"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "software-id"
+      source_path: "SoftwareId"
+    }
+    entries {
+      key: "release-date"
+      source_path: "ReleaseDate"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "lowest-supported-version"
+      source_path: "LowestSupportedVersion"
+      null_policy: NULL_POLICY_ABSENT
+    }
+    entries {
+      key: "updateable"
+      source_path: "Updateable"
+      null_policy: NULL_POLICY_ABSENT
+    }
+  }
+}
+
+projections {
+  name: "firmware-state"
+  source_type: "SoftwareInventory"
+  target_type: "nv.telemetry.v1.StateObservation"
+  constants { target_field: "name" value: "state" }
+  # DMTF spelling verbatim; the wire enumeration is open, so an unlisted
+  # value is reported rather than coerced.
+  fields {
+    source_path: "Status.State"
+    target_field: "value.string_value"
+    anchor: true
+    null_policy: NULL_POLICY_ABSENT
+    known_values: "Enabled"
+    known_values: "Disabled"
+    known_values: "StandbyOffline"
+    known_values: "StandbySpare"
+    known_values: "InTest"
+    known_values: "Starting"
+    known_values: "Absent"
+    known_values: "UnavailableOffline"
+    known_values: "Deferring"
+    known_values: "Quiesced"
+    known_values: "Updating"
+    known_values: "Qualified"
+    known_values: "Degraded"
+  }
+}
+
+projections {
+  name: "firmware-health"
+  source_type: "SoftwareInventory"
+  target_type: "nv.telemetry.v1.StateObservation"
+  constants { target_field: "name" value: "health" }
+  fields {
+    source_path: "Status.Health"
+    target_field: "value.string_value"
+    anchor: true
+    null_policy: NULL_POLICY_ABSENT
+    known_values: "OK"
+    known_values: "Warning"
+    known_values: "Critical"
+  }
+}

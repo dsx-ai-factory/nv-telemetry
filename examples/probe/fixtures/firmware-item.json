@@ -1,0 +1,11 @@
+{
+  "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HostBMC_0",
+  "@odata.type": "#SoftwareInventory.v1_10_0.SoftwareInventory",
+  "Id": "HostBMC_0",
+  "Name": "Host BMC Firmware",
+  "Version": "47.20.02",
+  "Manufacturer": "NVIDIA",
+  "SoftwareId": "BMC-47",
+  "Updateable": true,
+  "Status": { "State": "Enabled", "Health": "OK" }
+}

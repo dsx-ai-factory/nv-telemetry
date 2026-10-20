@@ -5,8 +5,9 @@
 //! dispatcher runtime, a mocked device, and a virtual timeline. An
 //! embedder-shaped test — protocol crates and orchestration meet here, not
 //! in the orchestration crate's own tests. The run is mixed: a sensor, a
-//! chassis, and a log service interleave under one endpoint's admission
-//! stack, so one round carries all four payload kinds from three providers.
+//! chassis, a log service, and an update service interleave under one
+//! endpoint's admission stack, so one round carries all four payload kinds
+//! from four providers.
 
 use std::future::Future;
 use std::pin::pin;
@@ -38,6 +39,7 @@ use nv_telemetry_orchestration::Clock;
 use nv_telemetry_orchestration::EndpointFault;
 use nv_telemetry_orchestration::EndpointPolicy;
 use nv_telemetry_orchestration::Needs;
+use nv_telemetry_orchestration::Plan;
 use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
@@ -48,6 +50,7 @@ use nv_telemetry_orchestration::StreamReports;
 use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::EventStream;
+use nv_telemetry_redfish::FirmwareRead;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::SensorRead;
 use serde_json::json;
@@ -65,6 +68,12 @@ const SERVICE_ROOT_FIXTURE: &str = include_str!("../fixtures/service-root.json")
 const LOG_SERVICE_FIXTURE: &str = include_str!("../fixtures/log-service.json");
 const LOG_ENTRIES_FIXTURE: &str = include_str!("../fixtures/log-entries.json");
 const LOG_ENTRY_FIXTURE: &str = include_str!("../fixtures/log-entry.json");
+const UPDATE_SERVICE: &str = "/redfish/v1/UpdateService";
+const FIRMWARE_INVENTORY: &str = "/redfish/v1/UpdateService/FirmwareInventory";
+const FIRMWARE_ITEM: &str = "/redfish/v1/UpdateService/FirmwareInventory/HostBMC_0";
+const UPDATE_SERVICE_FIXTURE: &str = include_str!("../fixtures/update-service.json");
+const FIRMWARE_INVENTORY_FIXTURE: &str = include_str!("../fixtures/firmware-inventory.json");
+const FIRMWARE_ITEM_FIXTURE: &str = include_str!("../fixtures/firmware-item.json");
 const BASE_SECONDS: i64 = 1_785_621_243;
 
 #[derive(Clone)]
@@ -116,10 +125,11 @@ fn work(runtime: &mut PollRuntime, context: &str) -> AcquisitionReport {
     }
 }
 
-/// One primed round: a sensor report, a chassis report, then a log report —
-/// all four payload kinds under the three providers' identities. The log
-/// read yields its records once: `first` is the round that ships them, and
-/// every later round finds the same entry already shipped.
+/// One primed round: a sensor report, a chassis report, a log report, then
+/// a firmware report — all four payload kinds under the four providers'
+/// identities. The log read yields its records once: `first` is the round
+/// that ships them, and every later round finds the same entry already
+/// shipped.
 fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext, first: bool) {
     let sensor_report = work(runtime, "sensor turn");
     assert_eq!(sensor_report.status().outcome(), Outcome::Succeeded);
@@ -175,10 +185,24 @@ fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext, fir
     for batch in log_report.batches() {
         assert_eq!(batch.origin().provider(), LogRead::<()>::PROVIDER);
     }
+
+    let firmware_report = work(runtime, "firmware turn");
+    assert_eq!(firmware_report.status().outcome(), Outcome::Succeeded);
+    assert!(
+        firmware_report
+            .batches()
+            .iter()
+            .any(|batch| matches!(batch.payload(), Payload::Inventory(_))),
+        "the firmware fixture yields inventory"
+    );
+    for batch in firmware_report.batches() {
+        assert_eq!(batch.origin().provider(), FirmwareRead::<()>::PROVIDER);
+    }
     assert!(
         sensor_report.issues().is_none()
             && chassis_report.issues().is_none()
-            && log_report.issues().is_none(),
+            && log_report.issues().is_none()
+            && firmware_report.issues().is_none(),
         "the nominal fixtures are clean"
     );
 }
@@ -187,7 +211,8 @@ fn assert_mixed_round(runtime: &mut PollRuntime, endpoint: &EndpointContext, fir
 /// follows dispatch order: the ring visits targets in needs order each
 /// round, and the log read asks three times — service, entries collection,
 /// member — plus, on its second round only, the service root, to learn
-/// whether the device filters; this one does not.
+/// whether the device filters; this one does not. The firmware read asks
+/// three times too: update service, inventory collection, member.
 fn prime_rounds(bmc: &Bmc<nv_redfish_bmc_mock::Error>, rounds: usize) {
     for round in 0..rounds {
         bmc.expect(Expect::get(SENSOR, SENSOR_FIXTURE));
@@ -198,26 +223,16 @@ fn prime_rounds(bmc: &Bmc<nv_redfish_bmc_mock::Error>, rounds: usize) {
         bmc.expect(Expect::get(LOG_SERVICE, LOG_SERVICE_FIXTURE));
         bmc.expect(Expect::get(LOG_ENTRIES, LOG_ENTRIES_FIXTURE));
         bmc.expect(Expect::get(LOG_ENTRY, LOG_ENTRY_FIXTURE));
+        bmc.expect(Expect::get(UPDATE_SERVICE, UPDATE_SERVICE_FIXTURE));
+        bmc.expect(Expect::get(FIRMWARE_INVENTORY, FIRMWARE_INVENTORY_FIXTURE));
+        bmc.expect(Expect::get(FIRMWARE_ITEM, FIRMWARE_ITEM_FIXTURE));
     }
 }
 
-#[test]
-fn a_mocked_endpoint_polls_all_providers_end_to_end() {
-    let manual = ManualClock::new();
-    let clock = TestClock {
-        manual: manual.clone(),
-        epoch: manual.now(),
-    };
-
-    let endpoint = EndpointContext::builder()
-        .endpoint_id("bmc-lab-07")
-        .build()
-        .expect("a valid endpoint");
-    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
-    prime_rounds(&bmc, 3);
-
+/// One need per polled provider, every thirty seconds, all four resolved.
+fn mixed_plan(endpoint: &EndpointContext) -> Plan {
     let cadence = Duration::from_secs(30);
-    let plan = plan(
+    plan(
         Needs::default().with_polls([
             PollNeed::new(
                 endpoint.clone(),
@@ -237,14 +252,39 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
                 LOG_SERVICE,
                 cadence,
             ),
+            PollNeed::new(
+                endpoint.clone(),
+                FirmwareRead::<()>::REQUEST_CLASS,
+                UPDATE_SERVICE,
+                cadence,
+            ),
         ]),
         &[
             SensorRead::<()>::declaration(),
             ChassisRead::<()>::declaration(),
             LogRead::<()>::declaration(),
+            FirmwareRead::<()>::declaration(),
         ],
     )
-    .expect("all three declarations poll");
+    .expect("all four declarations poll")
+}
+
+#[test]
+fn a_mocked_endpoint_polls_all_providers_end_to_end() {
+    let manual = ManualClock::new();
+    let clock = TestClock {
+        manual: manual.clone(),
+        epoch: manual.now(),
+    };
+
+    let endpoint = EndpointContext::builder()
+        .endpoint_id("bmc-lab-07")
+        .build()
+        .expect("a valid endpoint");
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    prime_rounds(&bmc, 3);
+
+    let plan = mixed_plan(&endpoint);
     let sensor_unit = Arc::new(SensorRead::new(
         endpoint.clone(),
         plan.polls()[0].target().to_owned().into(),
@@ -260,6 +300,11 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
         plan.polls()[2].target().to_owned().into(),
         Arc::clone(&bmc),
     ));
+    let firmware_unit = Arc::new(FirmwareRead::new(
+        endpoint.clone(),
+        plan.polls()[3].target().to_owned().into(),
+        Arc::clone(&bmc),
+    ));
 
     let subtree = endpoint_subtree(
         &EndpointPolicy::default(),
@@ -268,10 +313,11 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
             PollUnit::new(plan.polls()[0].clone(), sensor_unit, &clock),
             PollUnit::new(plan.polls()[1].clone(), chassis_unit, &clock),
             PollUnit::new(plan.polls()[2].clone(), log_unit, &clock),
+            PollUnit::new(plan.polls()[3].clone(), firmware_unit, &clock),
         ],
         Vec::new(),
     )
-    .expect("three providers form one subtree");
+    .expect("four providers form one subtree");
     let mut runtime: PollRuntime = Runtime::new(
         RuntimeConfig {
             global_max_in_flight: std::num::NonZeroUsize::MIN,

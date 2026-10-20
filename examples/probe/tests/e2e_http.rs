@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use futures_util::Stream;
 use futures_util::StreamExt as _;
+use nv_telemetry_model::Completeness;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::NumericValue;
@@ -23,6 +24,7 @@ use nv_telemetry_model::Payload;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::EventStream;
+use nv_telemetry_redfish::FirmwareRead;
 use nv_telemetry_redfish::LogRead;
 use nv_telemetry_redfish::ResumePosition;
 use nv_telemetry_redfish::SensorRead;
@@ -163,6 +165,23 @@ async fn nominal(server: &Server, resources: &Resources) {
         .batches()
         .iter()
         .any(|batch| matches!(batch.payload(), Payload::Logs(_))));
+    // The mock lists its firmware in full, so the walk claims the whole
+    // population.
+    let firmware = acquire(
+        &FirmwareRead::new(
+            endpoint(),
+            resources.update_service.clone().into(),
+            server.bmc(),
+        ),
+        Timestamp::new(0, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(firmware.issues().is_empty());
+    assert!(firmware.batches().iter().any(|batch| {
+        matches!(batch.payload(), Payload::Inventory(_))
+            && batch.coverage().completeness() == Completeness::Complete
+    }));
     // The actual CLI must also complete a mixed run. Payload assertions above
     // use the model, never the CLI's Debug rendering.
     assert_eq!(
@@ -171,9 +190,10 @@ async fn nominal(server: &Server, resources: &Resources) {
                 &[
                     ("--sensor", &resources.sensor),
                     ("--chassis", &resources.chassis),
-                    ("--log-service", &resources.log)
+                    ("--log-service", &resources.log),
+                    ("--update-service", &resources.update_service)
                 ],
-                6,
+                8,
                 true,
                 text(&server.fixture, "password")
             )

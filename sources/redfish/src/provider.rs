@@ -8,6 +8,8 @@
 //! parts. Single documents are one `OData` GET each, up to two batches; a
 //! log service is a walk over its entries collection.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -24,6 +26,8 @@ use nv_redfish::schema::log_entry::LogEntry;
 use nv_redfish::schema::log_service::LogService;
 use nv_redfish::schema::sensor::Sensor;
 use nv_redfish::schema::service_root::ServiceRoot;
+use nv_redfish::schema::software_inventory::SoftwareInventory;
+use nv_redfish::schema::update_service::UpdateService;
 use nv_redfish::Bmc;
 use nv_telemetry_model::limits::LOGS_RECORDS_MAX_ITEMS;
 use nv_telemetry_model::Completeness;
@@ -31,11 +35,13 @@ use nv_telemetry_model::Coverage;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Invalid;
 use nv_telemetry_model::Inventory;
+use nv_telemetry_model::InventoryItem;
 use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::Logs;
 use nv_telemetry_model::Origin;
 use nv_telemetry_model::Payload;
 use nv_telemetry_model::Readings;
+use nv_telemetry_model::StateObservation;
 use nv_telemetry_model::States;
 use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
@@ -51,12 +57,13 @@ use crate::failure::ClassifyError;
 use crate::projection::project_chassis;
 use crate::projection::project_log_entry;
 use crate::projection::project_sensor;
+use crate::projection::project_software_inventory;
 use crate::projection::ChassisParts;
 use crate::projection::SensorParts;
 use crate::uri;
 
-/// The locator of the issue a log walk records when its budget stops it
-/// short: a fact about the walk, not about any source field.
+/// The locator of the issue a walk records when it stops short of the
+/// collection's end: a fact about the walk, not about any source field.
 pub const TRUNCATED_WALK_LOCATOR: &str = "@truncated";
 
 /// Locator of the issue a log poll raises when it finds a walk of the same
@@ -129,6 +136,10 @@ pub type ChassisRead<B> = Read<B, ChassisKind>;
 
 /// One log service's entries, read over one endpoint's `Bmc`: log records.
 pub type LogRead<B> = Read<B, LogKind>;
+
+/// One update service's firmware inventory, read over one endpoint's
+/// `Bmc`: inventory and states.
+pub type FirmwareRead<B> = Read<B, FirmwareKind>;
 
 impl<B, K: ReadKind> fmt::Debug for Read<B, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -354,6 +365,271 @@ fn assemble_chassis(parts: ChassisParts) -> Result<AcquisitionParts, Invalid> {
     Ok(AcquisitionParts::new(payloads, parts.issues))
 }
 
+/// Walk the update service's firmware inventory: GET the service, its
+/// `FirmwareInventory` collection page by page, and each member the
+/// collection did not carry inline, and project every member to one
+/// inventory item and its states. The walk has the log walk's element
+/// semantics — a member's issues are prefixed `Members[i]`, a member the
+/// device listed but would not serve is recorded against `Members[i]` and the
+/// walk continues, anything else ends the walk — and runs under
+/// [`WalkBudget::DEFAULT`], reporting a stop once at
+/// [`TRUNCATED_WALK_LOCATOR`].
+///
+/// Coverage is scoped to the update service and `COMPLETE` when every listed
+/// member was read: the collection is the population of firmware components,
+/// so a consumer may retire one absent from the batch, and an empty
+/// collection ships as an empty inventory batch for the same reason. A member
+/// the device would not serve, or a walk the budget cut, makes the batch
+/// `PARTIAL`: a component that could not be read is not a removed one. A
+/// member the collection lists twice — a real device does — is read once and
+/// the repeat recorded; a member whose document claims another member's `Id`
+/// is recorded and dropped, and the batch is `PARTIAL`, since one component
+/// then goes unrepresented.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct FirmwareKind;
+
+impl sealed::Sealed for FirmwareKind {}
+
+impl ReadKind for FirmwareKind {
+    const PROVIDER: &'static str = "redfish.update-service.odata";
+    const REQUEST_CLASS: &'static str = "firmware-read";
+    type State = ();
+
+    async fn acquire<B>(
+        bmc: &B,
+        target: &ODataId,
+        _location: &str,
+        (): &(),
+    ) -> Result<AcquisitionParts, AcquisitionFailure>
+    where
+        B: Bmc,
+        B::Error: ClassifyError,
+    {
+        let budget = WalkBudget::DEFAULT;
+        with_deadline(budget.deadline(), async {
+            let started = Instant::now();
+            let service = bmc
+                .get::<UpdateService>(target)
+                .await
+                .map_err(|error| error.classify())?;
+            let scope = update_service_scope(&service.id)?;
+            let Some(collection) = &service.firmware_inventory else {
+                return Err(
+                    AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
+                        .with_retryable(false)
+                        .with_detail("update service has no firmware inventory"),
+                );
+            };
+            let walk = walk_firmware(bmc, collection.id(), budget, started).await?;
+            assemble_firmware(walk, scope).map_err(|error| internal_bug(&error))
+        })
+        .await
+    }
+}
+
+/// What a firmware walk read: every member's item and states, issues in
+/// collection order, and whether the batch may claim the whole collection.
+struct FirmwareWalk {
+    items: Vec<InventoryItem>,
+    states: Vec<StateObservation>,
+    issues: Vec<ProjectionIssue>,
+    complete: bool,
+    /// Where each member id was first listed.
+    listed: HashMap<ODataId, usize>,
+    /// Where each subject was first taken from; the batch admits a subject
+    /// once.
+    identities: HashMap<Subject, usize>,
+}
+
+impl FirmwareWalk {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            states: Vec::new(),
+            issues: Vec::new(),
+            complete: true,
+            listed: HashMap::new(),
+            identities: HashMap::new(),
+        }
+    }
+
+    /// Reads and projects the member at `index`, or records why it did not.
+    async fn visit<B>(
+        &mut self,
+        bmc: &B,
+        index: usize,
+        member: &NavProperty<SoftwareInventory>,
+    ) -> Result<(), AcquisitionFailure>
+    where
+        B: Bmc,
+        B::Error: ClassifyError,
+    {
+        match self.listed.entry(member.id().clone()) {
+            Entry::Occupied(first) => {
+                self.issues.push(ProjectionIssue::invalid(
+                    format!("Members[{index}]"),
+                    format!("member listed twice, first at Members[{}]", first.get()),
+                ));
+                return Ok(());
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(index);
+            }
+        }
+        let item = match member.get(bmc).await {
+            Ok(item) => item,
+            Err(error) => {
+                self.issues
+                    .push(member_disposition(index, error.classify())?);
+                self.complete = false;
+                return Ok(());
+            }
+        };
+        let location = member.id().to_string();
+        let parts =
+            project_software_inventory(&item, &location).map_err(|error| internal_bug(&error))?;
+        if let Some(subject) = parts
+            .inventory_items
+            .first()
+            .map(|item| item.subject().clone())
+        {
+            match self.identities.entry(subject) {
+                Entry::Occupied(first) => {
+                    self.issues.push(ProjectionIssue::invalid(
+                        format!("Members[{index}]"),
+                        format!("claims the identity of Members[{}]", first.get()),
+                    ));
+                    self.complete = false;
+                    return Ok(());
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(index);
+                }
+            }
+        }
+        self.items.extend(parts.inventory_items);
+        self.states.extend(parts.state_observations);
+        self.issues.extend(
+            parts
+                .issues
+                .into_iter()
+                .map(|issue| issue.at_index("Members", index)),
+        );
+        Ok(())
+    }
+}
+
+async fn walk_firmware<B>(
+    bmc: &B,
+    collection: &ODataId,
+    budget: WalkBudget,
+    started: Instant,
+) -> Result<FirmwareWalk, AcquisitionFailure>
+where
+    B: Bmc,
+    B::Error: ClassifyError,
+{
+    let mut walk = FirmwareWalk::new();
+    let mut seen = std::collections::HashSet::from([collection.clone()]);
+    let mut next = Some(collection.clone());
+    let mut count = None;
+    let mut visited = 0;
+    let mut stopped: Option<&'static str> = None;
+    'pages: while let Some(page_id) = next.take() {
+        let page = bmc
+            .get::<Page<SoftwareInventory>>(&page_id)
+            .await
+            .map_err(|error| error.classify())?;
+        count = count.or(page.count);
+        // The first page empty is an empty collection; a later one is a
+        // device that pages past its members.
+        if page.members.is_empty() && page_id != *collection {
+            stopped = Some(EMPTY_PAGE);
+            break;
+        }
+        for member in &page.members {
+            if let Some(reason) = budget.exhausted(visited, started.elapsed()) {
+                stopped = Some(reason.as_str());
+                break 'pages;
+            }
+            let index = visited;
+            visited += 1;
+            walk.visit(bmc, index, member).await?;
+        }
+        next = match page.next_link.as_deref() {
+            None => None,
+            Some(link) => match next_page_id(&page_id, link) {
+                None => {
+                    stopped = Some(NEXT_LINK_UNRESOLVED);
+                    None
+                }
+                Some(id) if !seen.insert(id.clone()) => {
+                    stopped = Some(NEXT_LINK_LOOPS);
+                    None
+                }
+                Some(id) => Some(id),
+            },
+        };
+    }
+    // A listing shorter than the count the device itself advertised is not
+    // the whole population either.
+    if stopped.is_none()
+        && count.is_some_and(|count| u64::try_from(visited).is_ok_and(|visited| count > visited))
+    {
+        stopped = Some(MEMBERS_SHORT_OF_COUNT);
+    }
+    if let Some(reason) = stopped {
+        walk.complete = false;
+        let detail = match count {
+            Some(count) => format!("walk read the first {visited} of {count} members: {reason}"),
+            None => format!("walk read the first {visited} members: {reason}"),
+        };
+        walk.issues
+            .push(ProjectionIssue::invalid(TRUNCATED_WALK_LOCATOR, detail));
+    }
+    Ok(walk)
+}
+
+/// The update service the batch covers, the population every firmware
+/// component belongs to, named by the service's own `Id`.
+fn update_service_scope(service_id: &str) -> Result<Subject, AcquisitionFailure> {
+    Subject::builder()
+        .kind("update-service")
+        .id(service_id)
+        .build()
+        .map_err(|_| {
+            AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
+                .with_retryable(false)
+                .with_detail("update service identity violates subject bounds")
+        })
+}
+
+/// An inventory batch — always when the walk was complete, since an empty
+/// population is a claim worth shipping — and a states batch when there are
+/// observations, both under the update service's scope.
+fn assemble_firmware(walk: FirmwareWalk, scope: Subject) -> Result<AcquisitionParts, Invalid> {
+    let completeness = if walk.complete {
+        Completeness::Complete
+    } else {
+        Completeness::Partial
+    };
+    let coverage = Coverage::builder()
+        .completeness(completeness)
+        .scope(scope)
+        .build()?;
+    let mut payloads = Vec::new();
+    if walk.complete || !walk.items.is_empty() {
+        let inventory = Inventory::builder().items(walk.items).build()?;
+        payloads.push((coverage.clone(), Payload::Inventory(inventory)));
+    }
+    if !walk.states.is_empty() {
+        let states = States::builder().observations(walk.states).build()?;
+        payloads.push((coverage, Payload::States(states)));
+    }
+    Ok(AcquisitionParts::new(payloads, walk.issues))
+}
+
 /// Walk a log service: GET the service, its entries collection page by page,
 /// and each member the collection did not carry expanded inline — a
 /// `NavProperty` already expanded resolves without I/O — and project every
@@ -415,7 +691,7 @@ pub struct WalkBudget {
 }
 
 impl WalkBudget {
-    /// The budget every log walk runs under today. Kinds are unit types, so
+    /// The budget every walk runs under today. Kinds are unit types, so
     /// the budget is a constant; a per-service budget is a `Read` carrying
     /// kind state, when a deployment asks for one.
     pub const DEFAULT: Self = Self::new(1024, Duration::from_secs(30));
@@ -461,13 +737,14 @@ impl Stop {
     }
 }
 
-/// One page of an entries collection, read raw: nv-redfish 0.16's typed
-/// collection drops `Members@odata.count` and `Members@odata.nextLink`, and
-/// without them a paged log is silently its first page. Members keep their
-/// `NavProperty` form, so an entry the device expanded inline still resolves
-/// without I/O.
+/// One page of a resource collection, read raw: nv-redfish's typed
+/// collections drop `Members@odata.count` and `Members@odata.nextLink`, and
+/// without them a paged collection is silently its first page. Members keep
+/// their `NavProperty` form, so a member the device expanded inline still
+/// resolves without I/O.
 #[derive(Debug, Deserialize)]
-struct EntryPage {
+#[serde(bound(deserialize = "T: EntityTypeRef + for<'dt> Deserialize<'dt>"))]
+struct Page<T: EntityTypeRef> {
     #[serde(rename = "@odata.id")]
     odata_id: ODataId,
     /// Kept so the transport's cache can revalidate the page with
@@ -475,14 +752,17 @@ struct EntryPage {
     #[serde(rename = "@odata.etag")]
     etag: Option<ODataETag>,
     #[serde(rename = "Members")]
-    members: Vec<NavProperty<LogEntry>>,
+    members: Vec<NavProperty<T>>,
     #[serde(rename = "Members@odata.count")]
     count: Option<u64>,
     #[serde(rename = "Members@odata.nextLink")]
     next_link: Option<String>,
 }
 
-impl EntityTypeRef for EntryPage {
+/// A page of a log service's entries.
+type EntryPage = Page<LogEntry>;
+
+impl<T: EntityTypeRef> EntityTypeRef for Page<T> {
     fn odata_id(&self) -> &ODataId {
         &self.odata_id
     }
@@ -600,6 +880,7 @@ const PAGES_PAST_BUDGET_FROM_START: &str =
 const NEXT_LINK_UNRESOLVED: &str = "the collection's nextLink could not be resolved";
 const NEXT_LINK_LOOPS: &str = "the collection's nextLink returned to a page already read";
 const EMPTY_PAGE: &str = "the collection answered an empty page";
+const MEMBERS_SHORT_OF_COUNT: &str = "the collection listed fewer members than its count";
 
 impl EntryWindow {
     fn members_read(&self) -> usize {
@@ -1541,7 +1822,7 @@ async fn with_deadline<T>(
                 AcquisitionFailureClass::Timeout,
             )
             .with_retryable(true)
-            .with_detail("log walk deadline exceeded")));
+            .with_detail("walk deadline exceeded")));
         }
         work.as_mut().poll(cx)
     })
@@ -1630,6 +1911,8 @@ mod tests {
     use super::service_scope;
     use super::ChassisKind;
     use super::ChassisRead;
+    use super::FirmwareKind;
+    use super::FirmwareRead;
     use super::LogKind;
     use super::LogRead;
     use super::Read;
@@ -1688,6 +1971,7 @@ mod tests {
         assert_clone::<SensorRead<NonCloneBmc>>();
         assert_clone::<ChassisRead<NonCloneBmc>>();
         assert_clone::<LogRead<NonCloneBmc>>();
+        assert_clone::<FirmwareRead<NonCloneBmc>>();
     }
 
     #[test]
@@ -1696,6 +1980,7 @@ mod tests {
             (debug_of::<SensorKind>(), SensorKind::PROVIDER),
             (debug_of::<ChassisKind>(), ChassisKind::PROVIDER),
             (debug_of::<LogKind>(), LogKind::PROVIDER),
+            (debug_of::<FirmwareKind>(), FirmwareKind::PROVIDER),
         ] {
             assert!(rendered.contains("endpoint-a"));
             assert!(rendered.contains(provider));
@@ -1710,6 +1995,10 @@ mod tests {
         assert_declaration_matches_origin::<SensorKind>("redfish.sensor.odata", "sensor-read");
         assert_declaration_matches_origin::<ChassisKind>("redfish.chassis.odata", "chassis-read");
         assert_declaration_matches_origin::<LogKind>("redfish.log-service.odata", "log-read");
+        assert_declaration_matches_origin::<FirmwareKind>(
+            "redfish.update-service.odata",
+            "firmware-read",
+        );
     }
 
     #[test]
