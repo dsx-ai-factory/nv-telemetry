@@ -8,6 +8,8 @@
 //! parts. Single documents are one `OData` GET each, up to two batches; a
 //! log service is a walk over its entries collection.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -378,7 +380,11 @@ fn assemble_chassis(parts: ChassisParts) -> Result<AcquisitionParts, Invalid> {
 /// so a consumer may retire one absent from the batch, and an empty
 /// collection ships as an empty inventory batch for the same reason. A member
 /// the device would not serve, or a walk the budget cut, makes the batch
-/// `PARTIAL`: a component that could not be read is not a removed one.
+/// `PARTIAL`: a component that could not be read is not a removed one. A
+/// member the collection lists twice — a real device does — is read once and
+/// the repeat recorded; a member whose document claims another member's `Id`
+/// is recorded and dropped, and the batch is `PARTIAL`, since one component
+/// then goes unrepresented.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct FirmwareKind;
@@ -429,6 +435,89 @@ struct FirmwareWalk {
     states: Vec<StateObservation>,
     issues: Vec<ProjectionIssue>,
     complete: bool,
+    /// Where each member id was first listed.
+    listed: HashMap<ODataId, usize>,
+    /// Where each subject was first taken from; the batch admits a subject
+    /// once.
+    identities: HashMap<Subject, usize>,
+}
+
+impl FirmwareWalk {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            states: Vec::new(),
+            issues: Vec::new(),
+            complete: true,
+            listed: HashMap::new(),
+            identities: HashMap::new(),
+        }
+    }
+
+    /// Reads and projects the member at `index`, or records why it did not.
+    async fn visit<B>(
+        &mut self,
+        bmc: &B,
+        index: usize,
+        member: &NavProperty<SoftwareInventory>,
+    ) -> Result<(), AcquisitionFailure>
+    where
+        B: Bmc,
+        B::Error: ClassifyError,
+    {
+        match self.listed.entry(member.id().clone()) {
+            Entry::Occupied(first) => {
+                self.issues.push(ProjectionIssue::invalid(
+                    format!("Members[{index}]"),
+                    format!("member listed twice, first at Members[{}]", first.get()),
+                ));
+                return Ok(());
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(index);
+            }
+        }
+        let item = match member.get(bmc).await {
+            Ok(item) => item,
+            Err(error) => {
+                self.issues
+                    .push(member_disposition(index, error.classify())?);
+                self.complete = false;
+                return Ok(());
+            }
+        };
+        let location = member.id().to_string();
+        let parts =
+            project_software_inventory(&item, &location).map_err(|error| internal_bug(&error))?;
+        if let Some(subject) = parts
+            .inventory_items
+            .first()
+            .map(|item| item.subject().clone())
+        {
+            match self.identities.entry(subject) {
+                Entry::Occupied(first) => {
+                    self.issues.push(ProjectionIssue::invalid(
+                        format!("Members[{index}]"),
+                        format!("claims the identity of Members[{}]", first.get()),
+                    ));
+                    self.complete = false;
+                    return Ok(());
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(index);
+                }
+            }
+        }
+        self.items.extend(parts.inventory_items);
+        self.states.extend(parts.state_observations);
+        self.issues.extend(
+            parts
+                .issues
+                .into_iter()
+                .map(|issue| issue.at_index("Members", index)),
+        );
+        Ok(())
+    }
 }
 
 async fn walk_firmware<B>(
@@ -441,12 +530,7 @@ where
     B: Bmc,
     B::Error: ClassifyError,
 {
-    let mut walk = FirmwareWalk {
-        items: Vec::new(),
-        states: Vec::new(),
-        issues: Vec::new(),
-        complete: true,
-    };
+    let mut walk = FirmwareWalk::new();
     let mut seen = std::collections::HashSet::from([collection.clone()]);
     let mut next = Some(collection.clone());
     let mut count = None;
@@ -471,26 +555,7 @@ where
             }
             let index = visited;
             visited += 1;
-            let item = match member.get(bmc).await {
-                Ok(item) => item,
-                Err(error) => {
-                    walk.issues
-                        .push(member_disposition(index, error.classify())?);
-                    walk.complete = false;
-                    continue;
-                }
-            };
-            let location = member.id().to_string();
-            let parts = project_software_inventory(&item, &location)
-                .map_err(|error| internal_bug(&error))?;
-            walk.items.extend(parts.inventory_items);
-            walk.states.extend(parts.state_observations);
-            walk.issues.extend(
-                parts
-                    .issues
-                    .into_iter()
-                    .map(|issue| issue.at_index("Members", index)),
-            );
+            walk.visit(bmc, index, member).await?;
         }
         next = match page.next_link.as_deref() {
             None => None,

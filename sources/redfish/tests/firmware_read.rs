@@ -6,8 +6,9 @@
 //! asserts *both* the batches and the exact issue list, the same discipline
 //! as the other corpora. The pins this corpus owns: the walk claims
 //! `COMPLETE` only when every listed member was read — a member the device
-//! would not serve, or a walk cut short, ships `PARTIAL` — and an empty
-//! collection is still a complete claim, shipped as an empty batch.
+//! would not serve, or a walk cut short, ships `PARTIAL` — an empty
+//! collection is still a complete claim, shipped as an empty batch, and a
+//! collection that lists one member twice, as a GH200's does, is read once.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -452,6 +453,59 @@ async fn an_unknown_state_is_reported_while_health_and_the_item_survive() {
             "outside the known value set"
         )
         .at_index("Members", 0)]
+    );
+}
+
+#[tokio::test]
+async fn a_member_listed_twice_is_read_once() {
+    // Three listings, two members: the repeat is recorded at its own
+    // position, costs no request, and the population is still whole.
+    let acquired = acquire(&[
+        (SERVICE, UPDATE_SERVICE),
+        (
+            INVENTORY,
+            include_str!("fixtures/firmware/inventory-duplicate-listing.json"),
+        ),
+        (BMC, ITEM_NOMINAL),
+        (BIOS, ITEM_MINIMAL),
+    ])
+    .await;
+
+    assert_eq!(
+        acquired.batches(),
+        [
+            inventory(Completeness::Complete, vec![nominal_item(), minimal_item()]),
+            states(Completeness::Complete, nominal_states()),
+        ]
+    );
+    assert_eq!(
+        acquired.issues(),
+        &[ProjectionIssue::invalid(
+            "Members[2]",
+            "member listed twice, first at Members[0]"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_member_claiming_anothers_identity_is_recorded_and_dropped() {
+    // Two members, one `Id`: the batch admits a subject once, and the
+    // component that went unrepresented keeps the claim partial.
+    let acquired = acquire(&[
+        (SERVICE, UPDATE_SERVICE),
+        (INVENTORY, INVENTORY_TWO),
+        (BMC, ITEM_NOMINAL),
+        (BIOS, include_str!("fixtures/firmware/item-claims-bmc.json")),
+    ])
+    .await;
+
+    assert_eq!(acquired.batches(), partial_nominal());
+    assert_eq!(
+        acquired.issues(),
+        &[ProjectionIssue::invalid(
+            "Members[1]",
+            "claims the identity of Members[0]"
+        )]
     );
 }
 
