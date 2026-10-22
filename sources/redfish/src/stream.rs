@@ -530,6 +530,11 @@ where
                 .with_retryable(false)
                 .with_detail(format!("document did not decode: {decode}"))
         }
+        nv_redfish::Error::Decode(decode) => {
+            AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
+                .with_retryable(false)
+                .with_detail(format!("document did not decode: {decode}"))
+        }
         other => AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
             .with_retryable(false)
             .with_detail(other.to_string()),

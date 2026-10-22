@@ -9,8 +9,8 @@
 //! endpoint breaker; unsupported and protocol failures scope to their
 //! request class) and this module owns which Redfish failure is which.
 
+use nv_redfish::core::RepairError;
 use nv_telemetry_source::AcquisitionFailure;
-#[cfg(any(feature = "bmc-http", test))]
 use nv_telemetry_source::AcquisitionFailureClass;
 
 /// Classifies a transport error into an [`AcquisitionFailure`].
@@ -129,6 +129,12 @@ mod http {
                     false,
                     "Redfish client state is invalid",
                 ),
+                // Reads invoke no actions; reaching this is our bug.
+                BmcError::ActionNotSupported => with(
+                    AcquisitionFailureClass::Internal,
+                    false,
+                    "Redfish action is not advertised",
+                ),
                 // Eviction after a 304: a retry re-fetches and succeeds, but
                 // the cause is our cache sizing.
                 BmcError::CacheMiss => with(
@@ -164,6 +170,20 @@ mod http {
                     "Redfish event stream idle beyond the client's window",
                 ),
             }
+        }
+    }
+}
+
+/// A transport wrapped in nv-redfish's compatibility layer: its own failures
+/// classify as the transport does, and a document that did not decode after
+/// the platform's repairs is a protocol answer.
+impl<E: ClassifyError> ClassifyError for RepairError<E> {
+    fn classify(&self) -> AcquisitionFailure {
+        match self {
+            Self::Transport(error) => error.classify(),
+            Self::Decode(_) => AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
+                .with_retryable(false)
+                .with_detail("Redfish response did not match its schema"),
         }
     }
 }
@@ -236,6 +256,23 @@ mod tests {
     fn detail_never_copies_an_untrusted_response_body() {
         let failure = classify_status(503);
         assert_eq!(failure.detail(), Some("HTTP 503"));
+    }
+
+    #[test]
+    fn the_compat_layer_keeps_the_transport_class_and_scopes_decode_failures() {
+        use nv_redfish::core::repair::decode;
+        use nv_redfish::core::RepairError;
+
+        use super::ClassifyError;
+
+        let transport = RepairError::Transport(nv_redfish_bmc_mock::Error::NotSupported).classify();
+        assert_eq!(transport.class(), AcquisitionFailureClass::Internal);
+
+        let undecodable = decode::<u32>(serde_json::json!("not a number")).unwrap_err();
+        let decode = RepairError::<nv_redfish_bmc_mock::Error>::Decode(undecodable).classify();
+        assert_eq!(decode.class(), AcquisitionFailureClass::Protocol);
+        assert_eq!(decode.retryable(), Some(false));
+        assert!(!decode.class().is_endpoint_scoped());
     }
 
     #[cfg(feature = "bmc-http")]

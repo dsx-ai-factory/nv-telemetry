@@ -21,6 +21,7 @@ use nv_redfish::bmc_http::CacheSettings;
 use nv_redfish::bmc_http::HttpBmc;
 use nv_redfish::bmc_http::HttpClient as _;
 use nv_redfish::core::ModificationResponse;
+use nv_redfish::core::NoRepair;
 use serde_json::json;
 use serde_json::Value;
 use url::Url;
@@ -152,6 +153,7 @@ impl Server {
                         &server.credentials,
                         None,
                         &Default::default(),
+                        &NoRepair,
                     )
                     .await
                 {
@@ -179,8 +181,13 @@ impl Server {
     pub(crate) async fn get(&self, path: &str) -> Value {
         tokio::time::timeout(
             Duration::from_secs(5),
-            self.client
-                .get(self.url(path), &self.credentials, None, &Default::default()),
+            self.client.get(
+                self.url(path),
+                &self.credentials,
+                None,
+                &Default::default(),
+                &NoRepair,
+            ),
         )
         .await
         .expect("GET deadline")
