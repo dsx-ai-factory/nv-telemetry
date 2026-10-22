@@ -29,22 +29,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # Its built-in cache: a cold build of the protobuf crates dominates
+      # the job.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: "1.95.0"
-
-      # Cached because a cold build of the protobuf crates dominates the job.
-      # actions/cache rather than a third-party Rust cache action: NVIDIA's
-      # allowlist admits actions/*, and the caching this needs is a path list.
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
 
       # buf checks the current schema: style and formatting.
       # Downloaded rather than installed through an action, because NVIDIA's
@@ -82,21 +71,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: "1.95.0"
-
-      # actions/cache rather than a third-party Rust cache action: NVIDIA's
-      # allowlist admits actions/*, and the caching this needs is a path list.
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Install valgrind
         run: |

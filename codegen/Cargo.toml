@@ -1,6 +1,8 @@
 [package]
 name = "nv-telemetry-codegen"
 description = "Schema compiler for nv-telemetry: validators, wrappers, hashing, and projections"
+# A repository tool: generated code is checked in.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
