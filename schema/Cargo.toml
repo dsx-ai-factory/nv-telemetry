@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # The schema is compiled by protox at build time, so no protoc binary is
 # needed here or anywhere downstream. Nothing is pulled into the runtime: the

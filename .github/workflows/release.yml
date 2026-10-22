@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Publish crates
+        run: |
+          set -euo pipefail
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Publishing version $VERSION"
+
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version = .*/version = "'"$VERSION"'"/}' Cargo.toml
+          sed -i -E 's/^(nv-telemetry-[a-z]+ = \{ path = "[^"]+", version = ")[^"]+(" \})/\1'"$VERSION"'\2/' Cargo.toml
+          # Moves only the workspace members' own entries in the lockfile, so
+          # every dependency publishes against the versions CI tested.
+          cargo update --workspace
+
+          # A manifest line the patterns above missed would publish a crate
+          # pinned to the previous release.
+          STALE=$(cargo metadata --format-version=1 --no-deps \
+            | jq -r --arg v "$VERSION" '.packages[] | select(.version != $v) | .name')
+          if [ -n "$STALE" ]; then
+            echo "not at $VERSION: $STALE" >&2
+            exit 1
+          fi
+          if grep -E '^nv-telemetry-[a-z]+ = .*version = "' Cargo.toml | grep -v "version = \"$VERSION\""; then
+            echo "workspace dependency not at $VERSION" >&2
+            exit 1
+          fi
+
+          # Publishes every member without `publish = false`, in dependency
+          # order.
+          cargo publish --workspace --locked --all-features --allow-dirty

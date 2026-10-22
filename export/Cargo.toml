@@ -1,6 +1,8 @@
 [package]
 name = "nv-telemetry-export"
 description = "Shared exporter machinery for nv-telemetry observation batches"
+# A placeholder until its first implementation lands.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,8 @@
 [package]
 name = "nv-telemetry-prometheus"
 description = "Prometheus exporter for nv-telemetry observation batches"
+# A placeholder until its first implementation lands.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

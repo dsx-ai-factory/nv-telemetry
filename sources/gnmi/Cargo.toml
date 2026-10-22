@@ -1,6 +1,8 @@
 [package]
 name = "nv-telemetry-gnmi"
 description = "gNMI acquisition for nv-telemetry"
+# A placeholder until its first implementation lands.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
