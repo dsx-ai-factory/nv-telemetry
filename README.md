@@ -1,5 +1,82 @@
 # nv-telemetry
-Libraries for bare-metal telemetry collection
+
+[![CI](https://github.com/dsx-ai-factory/nv-telemetry/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dsx-ai-factory/nv-telemetry/actions/workflows/ci.yml)
+
+Rust libraries for bare-metal telemetry collection.
+
+Use this workspace when building a service that reads BMC telemetry and needs a
+shared observation model for readings, states, inventory, and logs. The
+embedding service owns endpoint inventory, credentials, dispatch, timers, and
+consumer policy. The [probe example](examples/probe/src/main.rs) shows that
+integration with mock and HTTP transports.
+
+## Current capabilities
+
+| Component | Available now |
+| --- | --- |
+| Observation model | Versioned protobuf schema, generated validated Rust types, canonical ordering, content hashing, and encode/decode support. |
+| Redfish | Sensor and chassis reads, log-service and firmware-inventory walks, and server-sent events projected into observation batches. |
+| Orchestration | Deterministic poll/stream planning, endpoint admission, circuit-breaker and rate policies, report assembly, and stream reconnect policy. |
+| Probe | A demo embedder with in-process mock and live HTTP modes; tagged batches, statuses, and projection issues on stdout. |
+
+The project is under active development, and `nv.telemetry.v1` is not yet a
+compatibility promise. gNMI acquisition, shared export machinery, and OTLP and
+Prometheus exporters are unfinished. Redfish catalog discovery, bulk
+`TelemetryService` collection, session handling, and vendor leniency are also
+unfinished. Supply explicit Redfish resource targets to the probe.
+
+## Try the mock probe
+
+Install Git, [Rust with rustup](https://www.rust-lang.org/tools/install), and
+the native linker/build tools for your platform. The checked-in
+[rust-toolchain.toml](rust-toolchain.toml) selects Rust **1.95.0**. CI runs on
+Linux, macOS, and Windows.
+
+Run from a terminal:
+
+```sh
+git clone https://github.com/dsx-ai-factory/nv-telemetry.git
+cd nv-telemetry
+cargo run --locked -p nv-telemetry-probe -- --mode mock --endpoint-id demo --sensor /redfish/v1/Chassis/1U/Sensors/CPU1Temp --count 1 --strict
+```
+
+This uses the checked-in sensor fixture and needs no BMC, credentials, or
+external service. The first build needs network access to download dependencies.
+A successful run prints two `batch:` lines (readings and states), one
+`status:` line with a successful outcome, and exits with status 0. The fixture
+reports CPU temperature **47.5 Cel**. An `issues:` line identifies projection
+issues; `--strict` makes any acquisition failure or projection issue produce
+exit status 1. Invalid arguments produce exit status 2.
+
+For live collection, the probe's HTTP mode requires a reachable Redfish
+endpoint, its resource paths, `PROBE_USERNAME`, and, when needed,
+`PROBE_PASSWORD`. See the [probe usage and driver](examples/probe/src/main.rs) for
+`--base-url`, polling options, and HTTP-only `--event-stream`. Keep TLS
+certificate verification enabled; `--insecure` disables certificate checks.
+
+## Build and test
+
+The mock probe and ordinary Cargo builds do not need `buf` or `protoc`.
+To build API documentation and run the probe checks:
+
+```sh
+cargo doc --locked --workspace --no-deps
+cargo test --locked -p nv-telemetry-probe --test cli --test e2e_mock
+```
+
+The full contribution gate also needs GNU Make, Bash, **buf 1.72.0**, and
+**nightly-2026-06-16** with rustfmt. Install buf from its
+[installation guide](https://buf.build/docs/cli/installation), then run:
+
+```sh
+make rust-install
+make all
+```
+
+`make all` checks formatting, protobuf lint, generated output, Redfish feature
+combinations, clippy, builds, tests, and API documentation. CI uses `make ci`,
+which installs the formatting toolchain before the same checks. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contribution and DCO process.
 
 # Overview
 
@@ -29,14 +106,14 @@ model/                nv-telemetry-model          data plane, generated
 source/               nv-telemetry-source         acquisition contract
 sources/
   redfish/            nv-telemetry-redfish        HTTP/JSON, OData, DMTF schemas
-  gnmi/               nv-telemetry-gnmi           gRPC subscribe, YANG paths
+  gnmi/               nv-telemetry-gnmi           planned gNMI acquisition
 orchestration/        nv-telemetry-orchestration  planner, providers, recipes
 examples/
   probe/              nv-telemetry-probe          demo embedder (not published)
-export/               nv-telemetry-export         shared batch traversal
+export/               nv-telemetry-export         planned shared batch traversal
 exporters/
-  otlp/               nv-telemetry-otlp
-  prometheus/         nv-telemetry-prometheus
+  otlp/               nv-telemetry-otlp           planned
+  prometheus/         nv-telemetry-prometheus     planned
 docs/                 architecture and design notes
 ```
 
@@ -58,13 +135,13 @@ code, of which only the transport is hand-written. A REST API is a transport
 rather than a source, so each vendor API gets its own crate and manifest rather
 than sharing one.
 
-`schema`, `codegen`, `model`, `source`, and `sources/redfish` carry code
-today; the remaining crates are placeholders whose doc comments state what
-belongs in them. The contract's messages exist, every gate runs over them,
-`model` is the generated validated data plane — canonically ordered and
-content-hashable — `source` is the acquisition contract, and the Redfish
-crate's first provider reads one sensor into readings and states batches,
-pinned by a fixture corpus that asserts batches and issue lists together.
+`schema`, `codegen`, `model`, `source`, `sources/redfish`, `orchestration`,
+and `examples/probe` carry code today. The Redfish providers cover sensor,
+chassis, log, firmware, and event acquisition; fixture tests assert batches
+and issue lists together. Orchestration plans polls and streams and builds
+the dispatcher admission stack; the probe owns the runtime and driving loop.
+The gNMI and export crates remain placeholders whose doc comments describe
+the intended boundaries.
 
 Exporters are separate crates because their dependency trees are disjoint;
 `export` holds only what they share, such as joining readings to descriptors
@@ -132,6 +209,14 @@ only transitively, so no manifest entry can pin it and only the lockfile can.
 The cost is that ordinary builds see one resolution, which the scheduled
 `Latest dependencies` workflow exists to offset by building against a fresh
 one every week.
+
+## Support
+
+For bugs and feature requests, open a [GitHub issue](https://github.com/dsx-ai-factory/nv-telemetry/issues).
+Include the revision, command or API call, expected result, and a sanitized error
+or output sample. For design and integration context, start with
+[the architecture](docs/ARCHITECTURE.md) and [the data model](docs/DATA-MODEL.md).
+Use the private process in [SECURITY.md](SECURITY.md) for vulnerabilities.
 
 # Contribution Guidelines
 - Start here: [CONTRIBUTING.md](CONTRIBUTING.md)
