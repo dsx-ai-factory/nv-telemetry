@@ -21,6 +21,8 @@ use std::path::PathBuf;
 
 use prost_reflect::DescriptorPool;
 
+mod gnmi;
+
 pub mod lint;
 pub mod lock;
 pub mod options;
@@ -117,9 +119,9 @@ pub struct Outcome {
     pub written: Vec<PathBuf>,
     /// Files whose content on disk differs from what would be generated.
     pub stale: Vec<PathBuf>,
-    /// Files under a generated directory that no manifest produces anymore.
-    /// Never touched: the operator deletes them — and drops the crate's
-    /// `mod generated;` if the last manifest went with them.
+
+    /// Generated files that are not among the compiler's expected outputs.
+    /// The compiler reports these files but does not delete them.
     pub orphans: Vec<PathBuf>,
 }
 
@@ -138,7 +140,8 @@ pub enum Error {
     Index(projection::IndexError),
     /// A projection manifest declares what the compiler cannot honor.
     Manifests(Vec<projection::Violation>),
-    /// Wire types could not be rendered from the descriptors.
+
+    /// Generating wire types or protocol bindings failed.
     Backend(String),
     /// The workspace root could not be located from the working directory.
     Root(PathBuf),
@@ -257,16 +260,17 @@ pub fn workspace_root() -> Result<PathBuf, Error> {
     }
 }
 
-/// Runs the compiler over the shipped schema and reconciles generated output.
+/// Generates or checks Rust code and the contract lock from the schemas
+/// and projection manifests.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Pool`] if the schema cannot be decoded,
 /// [`Error::Vocabulary`] if the annotations are not as the compiler reads
 /// them, [`Error::Schema`] if the schema breaks an invariant rule,
-/// [`Error::Backend`] if wire types cannot be rendered, [`Error::Root`] if the
-/// workspace root cannot be located, or [`Error::Io`] if a generated file
-/// cannot be read or written.
+/// [`Error::Backend`] if wire types or protocol bindings cannot be generated,
+/// [`Error::Root`] if the workspace root cannot be located, or [`Error::Io`]
+/// if a generated file cannot be read or written.
 pub fn run(mode: Mode) -> Result<Outcome, Error> {
     let pool = pool()?;
     let vocabulary = options::Vocabulary::resolve(&pool).map_err(Error::Vocabulary)?;
@@ -301,6 +305,8 @@ pub fn run(mode: Mode) -> Result<Outcome, Error> {
         (here.join(GENERATED_MOD_PATH), GENERATED_MOD.to_owned()),
     ];
 
+    artifacts.extend(gnmi::generate(here).map_err(Error::Backend)?);
+
     // The CSDL bundle is parsed only when a manifest exists to compile.
     let manifests = projection::load(here, &pool).map_err(Error::ManifestLoad)?;
     if !manifests.is_empty() {
@@ -315,9 +321,7 @@ pub fn run(mode: Mode) -> Result<Outcome, Error> {
         }
     }
 
-    // Artifact paths are distinct by construction: the fixed outputs live
-    // under `model/` and `schema/`, and per-crate module collisions are
-    // already manifest violations.
+    // Use the full output list so orphan detection also recognizes protocol files.
     let artifact_paths: BTreeSet<PathBuf> =
         artifacts.iter().map(|(path, _)| path.clone()).collect();
 
@@ -379,9 +383,8 @@ pub fn run(mode: Mode) -> Result<Outcome, Error> {
     Ok(outcome)
 }
 
-/// Files under `sources/*/src/generated/` that the compiler no longer
-/// produces — a deleted manifest's module would otherwise sit outside the
-/// staleness gate forever. Detection only; nothing is removed.
+/// Finds unexpected files under `sources/*/src/generated/` and its subdirectories.
+/// The caller reports these files; the compiler does not delete them.
 fn generated_orphans(
     root: &Path,
     expected: &BTreeSet<PathBuf>,
@@ -393,10 +396,16 @@ fn generated_orphans(
         Err(error) => return Err((sources, error)),
     };
 
-    let mut orphans = Vec::new();
+    let mut directories = Vec::new();
+
     for entry in crates {
         let entry = entry.map_err(|error| (sources.clone(), error))?;
-        let generated = entry.path().join("src").join("generated");
+        directories.push(entry.path().join("src").join("generated"));
+    }
+
+    let mut orphans = Vec::new();
+
+    while let Some(generated) = directories.pop() {
         let files = match fs::read_dir(&generated) {
             Ok(files) => files,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -405,7 +414,11 @@ fn generated_orphans(
         for file in files {
             let file = file.map_err(|error| (generated.clone(), error))?;
             let path = file.path();
-            if !expected.contains(&path) {
+            let file_type = file.file_type().map_err(|error| (path.clone(), error))?;
+
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if !expected.contains(&path) {
                 orphans.push(path);
             }
         }
