@@ -53,15 +53,21 @@ fn protocol_bindings_coexist_with_manifests_and_share_freshness_checks() {
     assert!(repeated.status.success(), "{repeated:?}");
     assert!(String::from_utf8_lossy(&repeated.stdout).contains("0 file(s) written"));
 
-    let generated = root.join("sources/gnmi/src/generated");
-    let stray = generated.join("protocol/obsolete.rs");
+    let generated = root
+        .join("sources")
+        .join("gnmi")
+        .join("src")
+        .join("generated");
+
+    let protocol = generated.join("protocol");
+    let stray = protocol.join("obsolete.rs");
 
     fs::write(&stray, "// obsolete\n").expect("add a nested orphan");
 
     let output = run("--check");
 
     assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("protocol/obsolete.rs"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(stray.to_string_lossy().as_ref()));
 
     fs::remove_file(stray).expect("remove the nested orphan");
     fs::remove_dir_all(manifests).expect("remove the fixture manifests");
@@ -76,5 +82,8 @@ fn protocol_bindings_coexist_with_manifests_and_share_freshness_checks() {
         "{diagnostic}"
     );
 
-    assert!(!diagnostic.contains("/protocol/"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains(protocol.to_string_lossy().as_ref()),
+        "{diagnostic}"
+    );
 }
