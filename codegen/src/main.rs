@@ -20,8 +20,8 @@ usage: nv-telemetry-codegen <command>
   --check                report whether the generated trees are up to date
 
 Generated output includes the contract lock, validated model and wire types,
-projection modules, and provenance. All are checked in and compared byte for
-byte.
+protocol bindings, projection modules, and provenance. All are checked in and
+compared byte for byte.
 ";
 
 fn main() -> ExitCode {

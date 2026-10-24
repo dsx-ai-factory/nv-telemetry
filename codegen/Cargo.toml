@@ -25,7 +25,9 @@ quote.workspace = true
 prost-build.workspace = true
 prost-reflect.workspace = true
 prost-types.workspace = true
+protox.workspace = true
 syn.workspace = true
+tonic-prost-build.workspace = true
 
 [dev-dependencies]
 # Fixture schemas for compiler tests are compiled in-process; the depth and
@@ -36,7 +38,7 @@ syn.workspace = true
 nv-telemetry-redfish = { path = "../sources/redfish" }
 nv-telemetry-source.workspace = true
 prost.workspace = true
-protox.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

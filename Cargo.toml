@@ -46,6 +46,11 @@ prost-types = "0.14"
 protox = "0.9"
 prost-reflect = { version = "0.16", features = ["text-format"] }
 prost-build = { version = "0.14", features = ["cleanup-markdown"] }
+# The gNMI client uses a caller-supplied transport, so tonic's connection
+# and TLS features are disabled.
+tonic-prost-build = { version = "0.14", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = { version = "0.14", default-features = false }
 
 # Build-time only, and already in the tree through prost-build: the model
 # emitter assembles `quote` token streams, proves they parse as a Rust file

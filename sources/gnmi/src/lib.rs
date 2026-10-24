@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `gNMI` acquisition.
+//! Generated `gNMI` messages and client code.
 //!
-//! `gNMI` is protobuf-native, so decode comes from prost and there is no
-//! vendor-leniency layer. Projection still resolves against a generated index:
-//! the descriptor pool describes the transport envelope, not the data model,
-//! whose paths and types come from YANG.
+//! The bindings are private. Telemetry collection and projection into
+//! observations are not implemented yet.
 //!
-//! Subscriptions are long-lived streams, which makes this the source that
-//! settles how streamed acquisition is admitted by the dispatcher.
+//! Run `make codegen` to regenerate the bindings and `make check-codegen`
+//! to check them. Builds use the checked-in files and do not need `protoc`.
+
+#[path = "generated/protocol/mod.rs"]
+mod protocol;
