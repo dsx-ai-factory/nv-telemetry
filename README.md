@@ -58,13 +58,16 @@ code, of which only the transport is hand-written. A REST API is a transport
 rather than a source, so each vendor API gets its own crate and manifest rather
 than sharing one.
 
-`schema`, `codegen`, `model`, `source`, and `sources/redfish` carry code
-today; the remaining crates are placeholders whose doc comments state what
+`schema`, `codegen`, `model`, `source`, `sources/redfish`, and `sources/gnmi`
+carry code today; the remaining crates are placeholders whose doc comments state what
 belongs in them. The contract's messages exist, every gate runs over them,
 `model` is the generated validated data plane — canonically ordered and
 content-hashable — `source` is the acquisition contract, and the Redfish
 crate's first provider reads one sensor into readings and states batches,
 pinned by a fixture corpus that asserts batches and issue lists together.
+
+`sources/gnmi` contains private generated gNMI messages and a client, but no
+telemetry provider.
 
 Exporters are separate crates because their dependency trees are disjoint;
 `export` holds only what they share, such as joining readings to descriptors
@@ -94,7 +97,8 @@ Extension numbers for the annotation vocabulary are registered in
 Generated output is checked in, so a codegen change is reviewable as a
 schema-shaped diff and no downstream build needs a protobuf compiler. That
 includes `schema/contract.lock`, a sorted record of every declaration in the
-contract. Regenerate and verify with:
+contract, and gNMI bindings generated from the vendored OpenConfig schemas.
+Regenerate and verify with:
 
 ```
 make codegen                  # rewrite generated output and the contract lock
