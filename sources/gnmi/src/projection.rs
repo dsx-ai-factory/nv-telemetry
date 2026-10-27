@@ -19,6 +19,7 @@ use nv_telemetry_model::StateObservation;
 use nv_telemetry_model::States;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
+use nv_telemetry_model::ValueKind;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
@@ -29,10 +30,10 @@ use serde::de::DeserializeOwned;
 use crate::protocol::gnmi;
 use crate::protocol::gnmi::typed_value::Value;
 use crate::spec::MappingKind;
-use crate::spec::StateTarget;
 use crate::spec::StateType;
 use crate::NumericType;
 use crate::PathElement;
+use crate::StateIdentity;
 use crate::SubscriptionPath;
 use crate::SubscriptionSpec;
 
@@ -83,6 +84,20 @@ pub(super) fn project(
             .ok()
             .and_then(|index| spec.mappings.get(index))
         else {
+            if spec
+                .mappings
+                .iter()
+                .any(|mapping| path.contains(&mapping.path))
+            {
+                issues.push(
+                    ProjectionIssue::invalid(
+                        "path",
+                        "update covers mapped leaves; individual leaf updates are required",
+                    )
+                    .at_index("update", index),
+                );
+            }
+
             continue;
         };
 
@@ -92,49 +107,34 @@ pub(super) fn project(
 
         let value = update.val.and_then(|value| value.value);
 
-        let valid = match &mapping.kind {
+        let issue = match &mapping.kind {
             MappingKind::Reading {
                 descriptor,
                 numeric_type,
             } => {
-                if let Some(value) = value.and_then(|value| number(*numeric_type, value)) {
-                    let sample = Reading::builder()
-                        .key(descriptor.key().clone())
-                        .value(value)
-                        .observed_at(observed_at)
-                        .build()
-                        .map_err(|error| model_error(&error))?;
-
+                if let Some(sample) = reading(descriptor, *numeric_type, value, observed_at)? {
                     descriptors
                         .entry(descriptor.key().clone())
                         .or_insert_with(|| descriptor.clone());
 
                     samples.push(sample);
-                    true
+                    None
                 } else {
-                    false
+                    Some("value does not match the declared type or exceeds the model limit")
                 }
             }
             MappingKind::State { target, value_type } => {
-                if let Some(state) = state(target, value_type, value, observed_at)? {
+                if let Some((state, unknown)) = state(target, value_type, value, observed_at)? {
                     states.push(state);
-                    true
+                    unknown.then_some("enum value is not listed; value was collected unchanged")
                 } else {
-                    false
+                    Some("value does not match the declared type or exceeds the model limit")
                 }
             }
         };
 
-        if !valid {
-            issues.push(
-                ProjectionIssue::invalid(
-                    "val",
-                    "value does not match the declared type or accepted values",
-                )
-                .at_index("update", index),
-            );
-
-            continue;
+        if let Some(detail) = issue {
+            issues.push(ProjectionIssue::invalid("val", detail).at_index("update", index));
         }
 
         if samples.len() == readings_limit {
@@ -237,14 +237,14 @@ fn state_payload(
     Ok((coverage, Payload::States(states)))
 }
 
-/// Returns `Ok(None)` when a value does not match the mapping, so the caller can
-/// record a projection issue. Errors building the observation fail the acquisition.
+/// Returns an observation and whether its string is unlisted. A wrong type or
+/// oversized string returns `Ok(None)`; model construction errors fail acquisition.
 fn state(
-    target: &StateTarget,
+    target: &StateIdentity,
     value_type: &StateType,
     value: Option<Value>,
     observed_at: Timestamp,
-) -> Result<Option<StateObservation>, AcquisitionFailure> {
+) -> Result<Option<(StateObservation, bool)>, AcquisitionFailure> {
     let value = match (value_type, value) {
         (StateType::Boolean, Some(Value::BoolVal(value))) => Some(ModelValue::bool(value)),
         (StateType::Boolean, Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes))) => {
@@ -252,7 +252,7 @@ fn state(
                 .ok()
                 .map(ModelValue::bool)
         }
-        (StateType::Enum(values), value) => {
+        (StateType::Enum { .. }, value) => {
             let value = match value {
                 Some(Value::StringVal(value)) => Some(value),
                 Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes)) => {
@@ -261,9 +261,7 @@ fn state(
                 _ => None,
             };
 
-            value
-                .filter(|value| values.binary_search(value).is_ok())
-                .and_then(|value| ModelValue::string(value).ok())
+            value.and_then(|value| ModelValue::string(value).ok())
         }
         _ => None,
     };
@@ -272,19 +270,12 @@ fn state(
         return Ok(None);
     };
 
-    let mut builder = StateObservation::builder()
-        .subject(target.subject.clone())
-        .name(target.name.clone())
-        .value(value)
-        .observed_at(observed_at);
+    let unlisted = matches!((value_type, value.kind()),
+        (StateType::Enum { values, .. }, ValueKind::String(value)) if !values.contains(value));
 
-    if let Some(facet) = &target.facet {
-        builder = builder.facet(facet.clone());
-    }
-
-    builder
-        .build()
-        .map(Some)
+    target
+        .observation(value, Some(observed_at))
+        .map(|state| Some((state, unlisted)))
         .map_err(|error| model_error(&error))
 }
 
@@ -344,8 +335,13 @@ fn conflict(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && a != b
 }
 
-fn number(kind: NumericType, value: Value) -> Option<NumericValue> {
-    match (kind, value) {
+fn reading(
+    descriptor: &SignalDescriptor,
+    kind: NumericType,
+    value: Option<Value>,
+    observed_at: Timestamp,
+) -> Result<Option<Reading>, AcquisitionFailure> {
+    let value = value.and_then(|value| match (kind, value) {
         (NumericType::Int, Value::IntVal(value)) => Some(NumericValue::Int(value)),
         (NumericType::Uint, Value::UintVal(value)) => Some(NumericValue::Uint(value)),
         (NumericType::Double, Value::DoubleVal(value)) => NumericValue::double(value).ok(),
@@ -361,7 +357,19 @@ fn number(kind: NumericType, value: Value) -> Option<NumericValue> {
             }
         },
         _ => None,
-    }
+    });
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    Reading::builder()
+        .key(descriptor.key().clone())
+        .value(value)
+        .observed_at(observed_at)
+        .build()
+        .map(Some)
+        .map_err(|error| model_error(&error))
 }
 
 // Parse directly into N so large i64 and u64 values never pass through f64.

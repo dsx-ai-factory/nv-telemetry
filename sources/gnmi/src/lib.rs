@@ -15,7 +15,10 @@
 //! configures transport security and credentials.
 //!
 //! Mappings accept numeric values, configured enum strings, or booleans. Enum
-//! strings must match exactly and keep their spelling. Boolean values are
+//! strings keep their spelling. Unlisted strings are collected with a projection
+//! issue so consumers can apply their own policy. List known values as the target
+//! sends them for the requested encoding, including identityref module names
+//! in `JSON_IETF` (for example, `openconfig-platform-types:ACTIVE`). Boolean values are
 //! preserved, including `false`. An invalid mapped value produces a projection
 //! issue; valid updates in the same notification are still collected. Readings
 //! and states from the same notification share the same acquisition item.
@@ -26,7 +29,7 @@
 //!
 //! ```
 //! use nv_telemetry_gnmi::{ConfiguredSubscription, Mapping, NumericType,
-//!     PathElement, SubscriptionPath, SubscriptionSpec};
+//!     PathElement, StateIdentity, SubscriptionPath, SubscriptionSpec};
 //! use nv_telemetry_model::{EndpointContext, SignalDescriptor, SignalKey, Subject};
 //!
 //! fn subscription<T>(transport: T) -> Result<ConfiguredSubscription<T>, Box<dyn std::error::Error>> {
@@ -44,15 +47,19 @@
 //!     status.extend(["state", "oper-status"].map(PathElement::new));
 //!     let spec = SubscriptionSpec::new(vec![SubscriptionPath::new(interface)], vec![
 //!         Mapping::new(SubscriptionPath::new(counter), descriptor, NumericType::Uint),
-//!         Mapping::enum_state(SubscriptionPath::new(status), subject, "oper-status",
-//!             None, vec!["UP".into(), "DOWN".into(), "UNKNOWN".into()]),
+//!         Mapping::enum_state(SubscriptionPath::new(status),
+//!             StateIdentity::new(subject, "oper-status"), vec![
+//!                 "UP".into(), "DOWN".into(), "TESTING".into(), "UNKNOWN".into(),
+//!                 "DORMANT".into(), "NOT_PRESENT".into(), "LOWER_LAYER_DOWN".into(),
+//!             ]),
 //!     ])?;
 //!     Ok(ConfiguredSubscription::new(endpoint, transport, spec)?)
 //! }
 //! ```
 //!
 //! The target must send updates for individual leaves, even when the request
-//! selects a parent path. The provider does not traverse JSON subtrees. Use
+//! selects a parent path. Ancestor updates produce projection issues; the provider
+//! does not traverse JSON subtrees. Use
 //! [`Mapping::boolean_state`] to collect a boolean state. A subscription may
 //! contain only state mappings.
 //!
@@ -82,6 +89,7 @@ pub use spec::InvalidSubscription;
 pub use spec::Mapping;
 pub use spec::NumericType;
 pub use spec::PathElement;
+pub use spec::StateIdentity;
 pub use spec::SubscriptionPath;
 pub use spec::SubscriptionSpec;
 use tonic::codegen::Body;

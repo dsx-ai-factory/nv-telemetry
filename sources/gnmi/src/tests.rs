@@ -28,6 +28,8 @@ use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
 use nv_telemetry_orchestration::Clock;
+use nv_telemetry_orchestration::Needs;
+use nv_telemetry_orchestration::StreamNeed;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailureClass as Class;
 use prost::Message;
@@ -337,15 +339,15 @@ fn state_configuration_validates_name_and_facet_byte_bounds() {
     ];
 
     for (index, (name, facet, expected)) in cases.into_iter().enumerate() {
+        let mut identity = StateIdentity::new(subject.clone(), &name);
+
+        if let Some(facet) = facet {
+            identity = identity.with_facet(facet);
+        }
+
         let mappings = [
-            Mapping::enum_state(
-                path(&["leaf"]),
-                subject.clone(),
-                &name,
-                facet.clone(),
-                vec!["UP".into()],
-            ),
-            Mapping::boolean_state(path(&["leaf"]), subject.clone(), name, facet),
+            Mapping::enum_state(path(&["leaf"]), identity.clone(), vec!["UP".into()]),
+            Mapping::boolean_state(path(&["leaf"]), identity),
         ];
 
         for mapping in mappings {
@@ -375,7 +377,11 @@ fn enum_configuration_validates_members_without_normalizing_strings() {
     ];
 
     for (index, (values, expected)) in cases.into_iter().enumerate() {
-        let mapping = Mapping::enum_state(path(&["leaf"]), subject.clone(), "status", None, values);
+        let mapping = Mapping::enum_state(
+            path(&["leaf"]),
+            StateIdentity::new(subject.clone(), "status"),
+            values,
+        );
 
         assert_eq!(
             SubscriptionSpec::new(vec![path(&["leaf"])], vec![mapping]).is_ok(),
@@ -388,16 +394,24 @@ fn enum_configuration_validates_members_without_normalizing_strings() {
 #[test]
 fn declared_state_types_preserve_native_and_json_scalars() {
     let subject = descriptor("a").key().subject().clone();
-    let up = ModelValue::string("oc-if:UP").expect("state string");
+    let up = ModelValue::string("openconfig-platform-types:ACTIVE").expect("state string");
     let lower = ModelValue::string("up").expect("state string");
     let empty = ModelValue::string("").expect("empty value is valid");
     let yes = ModelValue::bool(true);
     let no = ModelValue::bool(false);
 
     let cases = [
-        (true, Value::StringVal("oc-if:UP".into()), &up),
+        (
+            true,
+            Value::StringVal("openconfig-platform-types:ACTIVE".into()),
+            &up,
+        ),
         (true, Value::JsonVal(br#""up""#.to_vec()), &lower),
-        (true, Value::JsonIetfVal(br#""oc-if:UP""#.to_vec()), &up),
+        (
+            true,
+            Value::JsonIetfVal(br#""openconfig-platform-types:ACTIVE""#.to_vec()),
+            &up,
+        ),
         (true, Value::StringVal(String::new()), &empty),
         (false, Value::BoolVal(true), &yes),
         (false, Value::BoolVal(false), &no),
@@ -412,16 +426,24 @@ fn declared_state_types_preserve_native_and_json_scalars() {
             ("enabled", None)
         };
 
+        let mut identity = StateIdentity::new(subject.clone(), name);
+
+        if let Some(facet) = &facet {
+            identity = identity.with_facet(facet);
+        }
+
         let mapping = if is_enum {
             Mapping::enum_state(
                 path(&["leaf"]),
-                subject.clone(),
-                name,
-                facet.clone(),
-                vec!["oc-if:UP".into(), "up".into(), String::new()],
+                identity,
+                vec![
+                    "openconfig-platform-types:ACTIVE".into(),
+                    "up".into(),
+                    String::new(),
+                ],
             )
         } else {
-            Mapping::boolean_state(path(&["leaf"]), subject.clone(), name, facet.clone())
+            Mapping::boolean_state(path(&["leaf"]), identity)
         };
 
         let spec = SubscriptionSpec::new(vec![path(&["leaf"])], vec![mapping])
@@ -461,6 +483,126 @@ fn declared_state_types_preserve_native_and_json_scalars() {
 }
 
 #[test]
+fn unlisted_enum_strings_are_collected_unchanged_with_an_issue() {
+    let subject = descriptor("a").key().subject().clone();
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["leaf"])],
+        vec![Mapping::enum_state(
+            path(&["leaf"]),
+            StateIdentity::new(subject, "status"),
+            vec!["UP".into(), "openconfig-platform-types:ACTIVE".into()],
+        )],
+    )
+    .expect("enum subscription");
+
+    for text in [
+        "LOWER_LAYER_DOWN".to_owned(),
+        "up".into(),
+        "ACTIVE".into(),
+        "future:ACTIVE".into(),
+        "x".repeat(nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize),
+    ] {
+        let json = serde_json::to_vec(&text).expect("JSON string");
+
+        for value in [
+            Value::StringVal(text.clone()),
+            Value::JsonVal(json.clone()),
+            Value::JsonIetfVal(json.clone()),
+        ] {
+            let parts = projection::project(
+                &spec,
+                wire::Notification {
+                    update: vec![update(value)],
+                    ..Default::default()
+                },
+            )
+            .expect("unknown state is still an observation");
+
+            assert_eq!(parts.issues().len(), 1);
+            assert_eq!(parts.issues()[0].path(), "update[0].val");
+
+            assert_eq!(
+                parts.issues()[0].kind(),
+                &nv_telemetry_source::ProjectionIssueKind::Invalid {
+                    detail: "enum value is not listed; value was collected unchanged".into(),
+                }
+            );
+
+            let Payload::States(states) = &parts.payloads()[0].1 else {
+                panic!("state payload")
+            };
+
+            assert_eq!(
+                states.observations()[0].value(),
+                &ModelValue::string(&text).expect("bounded string")
+            );
+        }
+    }
+}
+
+#[test]
+fn ancestor_updates_report_issues_without_traversing_subtrees() {
+    let keyed = SubscriptionPath::new(vec![
+        PathElement::new("interface").with_key("name", "eth0"),
+        PathElement::new("enabled"),
+    ]);
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["interface"])],
+        vec![Mapping::boolean_state(
+            keyed,
+            StateIdentity::new(descriptor("a").key().subject().clone(), "enabled"),
+        )],
+    )
+    .expect("keyed leaf mapping");
+
+    let mut matching = wire_path(&["interface"]);
+    matching.elem[0].key.insert("name".into(), "eth0".into());
+    let mut unrelated = matching.clone();
+    unrelated.elem[0].key.insert("name".into(), "eth1".into());
+
+    for parent in [wire_path(&[]), wire_path(&["interface"]), matching] {
+        for value in [
+            Value::JsonVal(br#"{"enabled":false}"#.to_vec()),
+            Value::JsonIetfVal(br#"{"enabled":false}"#.to_vec()),
+            Value::BoolVal(false),
+        ] {
+            let parts = projection::project(
+                &spec,
+                wire::Notification {
+                    prefix: Some(parent.clone()),
+                    update: vec![wire::Update {
+                        path: Some(wire_path(&[])),
+                        val: Some(wire::TypedValue { value: Some(value) }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .expect("ancestor update issue");
+
+            assert!(parts.payloads().is_empty());
+            assert_eq!(parts.issues().len(), 1);
+            assert_eq!(parts.issues()[0].path(), "update[0].path");
+        }
+    }
+
+    let parts = projection::project(
+        &spec,
+        wire::Notification {
+            prefix: Some(unrelated),
+            update: vec![update(Value::JsonVal(b"{}".to_vec()))],
+            ..Default::default()
+        },
+    )
+    .expect("unrelated update is ignored");
+
+    assert!(parts.payloads().is_empty());
+    assert!(parts.issues().is_empty());
+}
+
+#[test]
 fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
     let subject = descriptor("a").key().subject().clone();
 
@@ -468,19 +610,18 @@ fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
         (
             Mapping::enum_state(
                 path(&["invalid"]),
-                subject.clone(),
-                "status",
-                None,
+                StateIdentity::new(subject.clone(), "status"),
                 vec!["UP".into()],
             ),
             vec![
-                Value::StringVal("up".into()),
-                Value::StringVal("oc-if:UP".into()),
                 Value::BoolVal(true),
+                Value::StringVal("x".repeat(4097)),
+                Value::JsonVal(serde_json::to_vec(&"x".repeat(4097)).expect("JSON string")),
+                Value::JsonIetfVal(serde_json::to_vec(&"x".repeat(4097)).expect("JSON string")),
             ],
         ),
         (
-            Mapping::boolean_state(path(&["invalid"]), subject, "enabled", None),
+            Mapping::boolean_state(path(&["invalid"]), StateIdentity::new(subject, "enabled")),
             vec![
                 Value::StringVal("true".into()),
                 Value::JsonVal(br#""false""#.to_vec()),
@@ -509,14 +650,7 @@ fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
 
         values.extend(mismatches.into_iter().map(Some));
 
-        for json in [
-            b"null".as_slice(),
-            b"{}",
-            b"[]",
-            b"broken",
-            b"1",
-            br#""UNKNOWN""#,
-        ] {
+        for json in [b"null".as_slice(), b"{}", b"[]", b"broken", b"1"] {
             values.push(Some(Value::JsonVal(json.to_vec())));
             values.push(Some(Value::JsonIetfVal(json.to_vec())));
         }
@@ -539,6 +673,15 @@ fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
 
             assert_eq!(parts.issues().len(), 1);
             assert_eq!(parts.issues()[0].path(), "update[1].val");
+
+            assert_eq!(
+                parts.issues()[0].kind(),
+                &nv_telemetry_source::ProjectionIssueKind::Invalid {
+                    detail: "value does not match the declared type or exceeds the model limit"
+                        .into(),
+                }
+            );
+
             assert_eq!(parts.payloads().len(), 1);
 
             let Payload::Readings(readings) = &parts.payloads()[0].1 else {
@@ -554,8 +697,10 @@ fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
 fn state_configuration_separates_reading_keys_from_state_identities() {
     let subject = descriptor("a").key().subject().clone();
 
-    let state =
-        Mapping::boolean_state(path(&["root", "enabled"]), subject.clone(), "enabled", None);
+    let state = Mapping::boolean_state(
+        path(&["root", "enabled"]),
+        StateIdentity::new(subject.clone(), "enabled"),
+    );
 
     assert!(SubscriptionSpec::new(vec![path(&["root"])], vec![state.clone()]).is_ok());
 
@@ -579,7 +724,7 @@ fn state_configuration_separates_reading_keys_from_state_identities() {
             "status",
             subject.clone(),
             "enabled",
-            Some("admin".into()),
+            Some("admin".to_owned()),
             true,
         ),
         (
@@ -593,13 +738,13 @@ fn state_configuration_separates_reading_keys_from_state_identities() {
     ];
 
     for (leaf, subject, name, facet, expected) in cases {
-        let other = Mapping::enum_state(
-            path(&["root", leaf]),
-            subject,
-            name,
-            facet,
-            vec!["UP".into()],
-        );
+        let mut identity = StateIdentity::new(subject, name);
+
+        if let Some(facet) = facet {
+            identity = identity.with_facet(facet);
+        }
+
+        let other = Mapping::enum_state(path(&["root", leaf]), identity, vec!["UP".into()]);
 
         assert_eq!(
             SubscriptionSpec::new(vec![path(&["root"])], vec![state.clone(), other]).is_ok(),
@@ -610,7 +755,11 @@ fn state_configuration_separates_reading_keys_from_state_identities() {
 
     for state_leaf in ["enabled", "outside"] {
         let numeric = Mapping::new(path(&["enabled"]), descriptor("a"), NumericType::Uint);
-        let state = Mapping::boolean_state(path(&[state_leaf]), subject.clone(), "enabled", None);
+
+        let state = Mapping::boolean_state(
+            path(&[state_leaf]),
+            StateIdentity::new(subject.clone(), "enabled"),
+        );
 
         assert!(SubscriptionSpec::new(vec![path(&["enabled"])], vec![numeric, state]).is_err());
     }
@@ -790,9 +939,7 @@ fn duplicate_updates_project_only_the_final_value_and_keep_original_issue_indexe
 fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
     let mapping = Mapping::enum_state(
         path(&["parent", "leaf"]),
-        descriptor("a").key().subject().clone(),
-        "status",
-        None,
+        StateIdentity::new(descriptor("a").key().subject().clone(), "status"),
         vec!["UP".into(), "DOWN".into()],
     );
 
@@ -808,7 +955,11 @@ fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
             Some(Value::StringVal("DOWN".into())),
             Some("DOWN"),
         ),
-        (up.clone(), Some(Value::StringVal("unknown".into())), None),
+        (
+            up.clone(),
+            Some(Value::StringVal("unknown".into())),
+            Some("unknown"),
+        ),
         (invalid.clone(), up.clone(), Some("UP")),
         (invalid, Some(Value::BoolVal(false)), None),
         (up, None, None),
@@ -836,7 +987,11 @@ fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
 
         if let Some(expected) = expected {
             assert_eq!(parts.payloads().len(), 1);
-            assert!(parts.issues().is_empty());
+            assert_eq!(parts.issues().len(), usize::from(expected == "unknown"));
+
+            if expected == "unknown" {
+                assert_eq!(parts.issues()[0].path(), "update[1].val");
+            }
 
             let Payload::States(states) = &parts.payloads()[0].1 else {
                 panic!("state payload")
@@ -916,9 +1071,7 @@ fn prefixes_keys_and_context_resolve_structurally_and_parent_deletes_match() {
         vec![path(&["interface"])],
         vec![Mapping::boolean_state(
             keyed,
-            descriptor("a").key().subject().clone(),
-            "enabled",
-            None,
+            StateIdentity::new(descriptor("a").key().subject().clone(), "enabled"),
         )],
     )
     .expect("parent request")
@@ -1067,9 +1220,7 @@ fn large_state_notifications_split_payloads_and_bound_issues() {
                 let name = format!("leaf-{index}");
                 Mapping::boolean_state(
                     path(&["root", &name]),
-                    descriptor(&name).key().subject().clone(),
-                    "enabled",
-                    None,
+                    StateIdentity::new(descriptor(&name).key().subject().clone(), "enabled"),
                 )
             })
             .collect(),
@@ -1424,8 +1575,11 @@ async fn stream_unit_reports_mixed_notifications_transitions_and_distinct_collec
         vec![path(&["leaf"]), path(&["enabled"]), path(&["invalid"])],
         vec![
             Mapping::new(path(&["leaf"]), descriptor("a"), NumericType::Uint),
-            Mapping::boolean_state(path(&["enabled"]), subject.clone(), "enabled", None),
-            Mapping::boolean_state(path(&["invalid"]), subject, "status", None),
+            Mapping::boolean_state(
+                path(&["enabled"]),
+                StateIdentity::new(subject.clone(), "enabled"),
+            ),
+            Mapping::boolean_state(path(&["invalid"]), StateIdentity::new(subject, "status")),
         ],
     )
     .expect("mixed specification");
@@ -1434,12 +1588,10 @@ async fn stream_unit_reports_mixed_notifications_transitions_and_distinct_collec
         Arc::new(ConfiguredSubscription::new(endpoint(), mock, spec).expect("mixed subscription"));
 
     let plan = nv_telemetry_orchestration::plan(
-        nv_telemetry_orchestration::Needs::default().with_streams([
-            nv_telemetry_orchestration::StreamNeed::new(
-                endpoint(),
-                ConfiguredSubscription::<Mock>::REQUEST_CLASS,
-            ),
-        ]),
+        Needs::default().with_streams([StreamNeed::new(
+            endpoint(),
+            ConfiguredSubscription::<Mock>::REQUEST_CLASS,
+        )]),
         &[ConfiguredSubscription::<Mock>::declaration()],
     )
     .expect("provider declaration");

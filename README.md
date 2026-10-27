@@ -68,8 +68,8 @@ pinned by a fixture corpus that asserts batches and issue lists together.
 
 `sources/gnmi` collects numeric readings and states with enum strings or boolean
 values. Applications supply the transport, paths, and mappings. The
-`gnmi.configured` provider checks values at runtime and accepts enum strings only
-when they exactly match a configured value. It does not validate against YANG or
+`gnmi.configured` provider checks values at runtime. Unlisted enum strings are
+collected with a projection issue. It does not validate against YANG or
 traverse JSON subtrees. See the crate's API documentation for a construction example.
 
 Exporters are separate crates because their dependency trees are disjoint;
