@@ -69,11 +69,11 @@ proc-macro2 = "1"
 # easy inputs.
 heck = "0.5"
 
-# The Redfish client, consumed only by `sources/redfish`: typed DMTF schema
-# models over a transport-agnostic `Bmc` trait. Default features are off so
-# the HTTP stack (reqwest, tokio) enters the tree only where the crate's
-# `bmc-http` feature asks for it; the mock implements the same trait for
-# transport-free tests.
+# The Redfish client: typed DMTF schema models over a transport-agnostic
+# `Bmc` trait. A private dependency of `sources/redfish`, which reads through
+# the embedder's transport, so default features are off and the HTTP stack
+# (reqwest, tokio) enters the tree only for the probe; the mock implements
+# the same trait for transport-free tests.
 nv-redfish = { version = "0.20", default-features = false }
 nv-redfish-bmc-mock = "0.20"
 
@@ -100,9 +100,11 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 # randomness source it pulls in, is this workspace's.
 uuid = { version = "1", features = ["v4"] }
 
-# Dev-only: fixture JSON for the acquisition corpus, and the executor
-# bmc-mock's async trait impl needs under test.
+# Documents and event payloads as `sources/redfish`'s transport hands them
+# over, so part of its public API; also the corpus fixtures' JSON.
 serde_json = "1"
+
+# Dev-only, and the probe's: the executor the async tests run on.
 tempfile = { version = "3", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 

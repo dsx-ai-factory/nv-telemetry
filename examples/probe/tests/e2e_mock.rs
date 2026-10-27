@@ -48,10 +48,12 @@ use nv_telemetry_orchestration::StreamNeed;
 use nv_telemetry_orchestration::StreamReport;
 use nv_telemetry_orchestration::StreamReports;
 use nv_telemetry_orchestration::StreamUnit;
+use nv_telemetry_probe::BmcTransport;
 use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::FirmwareRead;
 use nv_telemetry_redfish::LogRead;
+use nv_telemetry_redfish::RedfishService;
 use nv_telemetry_redfish::SensorRead;
 use serde_json::json;
 use serde_json::Value as Json;
@@ -95,6 +97,15 @@ impl Clock for TestClock {
 }
 
 type PollRuntime = Runtime<AcquisitionReport, EndpointFault, PollMeta>;
+
+/// The endpoint's service over the mock. Its first read classifies the
+/// platform from the service root, so every script opens with one.
+fn service(
+    bmc: &Arc<Bmc<nv_redfish_bmc_mock::Error>>,
+) -> Arc<RedfishService<BmcTransport<Bmc<nv_redfish_bmc_mock::Error>>>> {
+    bmc.expect(Expect::get(SERVICE_ROOT, SERVICE_ROOT_FIXTURE));
+    Arc::new(RedfishService::new(BmcTransport::new(Arc::clone(bmc))))
+}
 
 fn describe(output: Option<&RuntimeOutput<AcquisitionReport, EndpointFault>>) -> &'static str {
     match output {
@@ -282,28 +293,29 @@ fn a_mocked_endpoint_polls_all_providers_end_to_end() {
         .build()
         .expect("a valid endpoint");
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let service = service(&bmc);
     prime_rounds(&bmc, 3);
 
     let plan = mixed_plan(&endpoint);
     let sensor_unit = Arc::new(SensorRead::new(
         endpoint.clone(),
-        plan.polls()[0].target().to_owned().into(),
-        Arc::clone(&bmc),
+        plan.polls()[0].target(),
+        Arc::clone(&service),
     ));
     let chassis_unit = Arc::new(ChassisRead::new(
         endpoint.clone(),
-        plan.polls()[1].target().to_owned().into(),
-        Arc::clone(&bmc),
+        plan.polls()[1].target(),
+        Arc::clone(&service),
     ));
     let log_unit = Arc::new(LogRead::new(
         endpoint.clone(),
-        plan.polls()[2].target().to_owned().into(),
-        Arc::clone(&bmc),
+        plan.polls()[2].target(),
+        Arc::clone(&service),
     ));
     let firmware_unit = Arc::new(FirmwareRead::new(
         endpoint.clone(),
-        plan.polls()[3].target().to_owned().into(),
-        Arc::clone(&bmc),
+        plan.polls()[3].target(),
+        Arc::clone(&service),
     ));
 
     let subtree = endpoint_subtree(
@@ -388,6 +400,7 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
         .build()
         .expect("a valid endpoint");
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let service = service(&bmc);
     // One connect attempt asks for the root, then the event service, then
     // the stream, which the mock ends after its scripted payloads. The
     // reconnect the runtime schedules asks the same three, the stream now
@@ -412,7 +425,7 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
         &[EventStream::<()>::declaration()],
     )
     .expect("the stream is planned");
-    let events = Arc::new(EventStream::new(endpoint, Arc::clone(&bmc)));
+    let events = Arc::new(EventStream::new(endpoint, service));
     let (stream, mut pulls) = StreamUnit::new(
         plan.streams()[0].clone(),
         events,

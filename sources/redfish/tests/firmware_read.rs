@@ -10,6 +10,8 @@
 //! collection is still a complete claim, shipped as an empty batch, and a
 //! collection that lists one member twice, as a GH200's does, is read once.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -49,6 +51,8 @@ const UPDATE_SERVICE: &str = include_str!("fixtures/firmware/update-service.json
 const INVENTORY_TWO: &str = include_str!("fixtures/firmware/inventory-two.json");
 const ITEM_NOMINAL: &str = include_str!("fixtures/firmware/item-nominal.json");
 const ITEM_MINIMAL: &str = include_str!("fixtures/firmware/item-minimal.json");
+const ROOT_DELL: &str = include_str!("fixtures/firmware/service-root-dell.json");
+const ITEM_DELL_RELEASE_DATE: &str = include_str!("fixtures/firmware/item-dell-release-date.json");
 
 /// 2026-01-15T00:00:00Z: the nominal item's `ReleaseDate`.
 const NOMINAL_RELEASE: i64 = 1_768_435_200;
@@ -71,8 +75,20 @@ async fn run(answers: Vec<Expect<Error>>) -> Result<Acquired, AcquisitionFailure
     for answer in answers {
         bmc.expect(answer);
     }
-    let read = FirmwareRead::new(endpoint(), SERVICE.to_string().into(), bmc);
+    let read = FirmwareRead::new(endpoint(), SERVICE, support::service(&bmc));
     run_acquisition(&read, at()).await
+}
+
+/// As [`run`], on the platform the device's service `root` names.
+async fn run_classified(root: &str, pairs: &[(&str, &str)]) -> Acquired {
+    let bmc = Arc::new(Bmc::<Error>::default());
+    for answer in answers(pairs) {
+        bmc.expect(answer);
+    }
+    let read = FirmwareRead::new(endpoint(), SERVICE, support::platform(&bmc, root));
+    run_acquisition(&read, at())
+        .await
+        .expect("the device answered")
 }
 
 fn answers(pairs: &[(&str, &str)]) -> Vec<Expect<Error>> {
@@ -190,22 +206,22 @@ fn state(id: &str, name: &str, value: &str) -> StateObservation {
 
 /// The nominal item, every attribute present: text, a boolean, an instant.
 fn nominal_item() -> InventoryItem {
-    item(
-        "HostBMC_0",
-        BMC,
-        BTreeMap::from([
-            ("lowest-supported-version".to_owned(), text("47.00.00")),
-            ("manufacturer".to_owned(), text("NVIDIA")),
-            ("name".to_owned(), text("Host BMC Firmware")),
-            (
-                "release-date".to_owned(),
-                Value::timestamp(Timestamp::new(NOMINAL_RELEASE, 0).expect("a valid instant")),
-            ),
-            ("software-id".to_owned(), text("BMC-47")),
-            ("updateable".to_owned(), Value::bool(true)),
-            ("version".to_owned(), text("47.20.02")),
-        ]),
-    )
+    item("HostBMC_0", BMC, nominal_attributes())
+}
+
+fn nominal_attributes() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("lowest-supported-version".to_owned(), text("47.00.00")),
+        ("manufacturer".to_owned(), text("NVIDIA")),
+        ("name".to_owned(), text("Host BMC Firmware")),
+        (
+            "release-date".to_owned(),
+            Value::timestamp(Timestamp::new(NOMINAL_RELEASE, 0).expect("a valid instant")),
+        ),
+        ("software-id".to_owned(), text("BMC-47")),
+        ("updateable".to_owned(), Value::bool(true)),
+        ("version".to_owned(), text("47.20.02")),
+    ])
 }
 
 /// A component the device names and nothing more: still a component.
@@ -507,6 +523,57 @@ async fn a_member_claiming_anothers_identity_is_recorded_and_dropped() {
             "claims the identity of Members[0]"
         )]
     );
+}
+
+#[tokio::test]
+async fn a_dell_release_date_is_repaired_by_the_platforms_layer() {
+    // Dell dates every component `00:00:00Z`, which is no instant. The
+    // layer classified from a Dell root removes it, so the component is
+    // read whole but for its date.
+    let acquired = run_classified(
+        ROOT_DELL,
+        &[
+            (SERVICE, UPDATE_SERVICE),
+            (INVENTORY, INVENTORY_TWO),
+            (BMC, ITEM_DELL_RELEASE_DATE),
+            (BIOS, ITEM_MINIMAL),
+        ],
+    )
+    .await;
+
+    let mut undated = nominal_attributes();
+    undated.remove("release-date");
+    assert_eq!(
+        acquired.batches(),
+        [
+            inventory(
+                Completeness::Complete,
+                vec![item("HostBMC_0", BMC, undated), minimal_item()]
+            ),
+            states(Completeness::Complete, nominal_states()),
+        ]
+    );
+    assert_eq!(acquired.issues(), &[]);
+}
+
+#[tokio::test]
+async fn another_platforms_layer_leaves_the_dell_date_unread() {
+    // The repair is Dell's: under any other platform the document stays
+    // as the device sent it, and the component is not read.
+    let acquired = acquire(&[
+        (SERVICE, UPDATE_SERVICE),
+        (INVENTORY, INVENTORY_TWO),
+        (BMC, ITEM_DELL_RELEASE_DATE),
+        (BIOS, ITEM_MINIMAL),
+    ])
+    .await;
+
+    assert_eq!(
+        acquired.batches(),
+        [inventory(Completeness::Partial, vec![minimal_item()])]
+    );
+    assert_eq!(acquired.issues().len(), 1);
+    assert_eq!(acquired.issues()[0].path(), "Members[0]");
 }
 
 #[tokio::test]

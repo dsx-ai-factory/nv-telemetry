@@ -60,6 +60,8 @@ use crate::projection::project_sensor;
 use crate::projection::project_software_inventory;
 use crate::projection::ChassisParts;
 use crate::projection::SensorParts;
+use crate::transport::RedfishService;
+use crate::transport::RedfishTransport;
 use crate::uri;
 
 /// The locator of the issue a walk records when it stops short of the
@@ -76,32 +78,38 @@ pub const IN_FLIGHT_WALK_LOCATOR: &str = "@in-flight";
 pub const FILTER_REFUSED_LOCATOR: &str = "@filter";
 
 mod sealed {
-    pub trait Sealed {}
+    use std::future::Future;
+
+    use nv_telemetry_source::AcquisitionFailure;
+    use nv_telemetry_source::AcquisitionParts;
+
+    use super::Read;
+    use super::ReadKind;
+    use crate::transport::RedfishTransport;
+
+    pub trait Sealed {
+        /// What one read keeps between its acquisitions. `()` for a read
+        /// whose every acquisition stands alone; a log walk keeps
+        /// [`super::LogCursor`], where its previous walk ended. Shared by
+        /// every clone of one [`Read`], so the dispatcher's per-tick clones
+        /// see one position.
+        type State: Default + Send + Sync + 'static;
+
+        /// Performs `read`. Named in public types only, so the transport
+        /// the kind reads through stays out of the public API.
+        fn perform<T: RedfishTransport>(
+            read: &Read<T, Self>,
+        ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send
+        where
+            Self: ReadKind + Sized;
+    }
 }
 
-/// What one kind of read is: its provider identity, and how a target on an
-/// endpoint becomes acquisition parts.
-///
-/// Implementations are this crate's unit types — the trait is sealed, so
-/// the origin bounds every kind's constants must satisfy are pinned by the
-/// tests below and nowhere else. [`Read`] carries the state. The hook
-/// receives the transport, the target, and the requested location string,
-/// which generated subject matchers canonicalize before deriving identity,
-/// so identity never comes from the payload's own claim.
-pub trait ReadKind: sealed::Sealed + Send + Sync + 'static {
-    /// Provider identity, as `Origin.provider` carries it.
-    const PROVIDER: &'static str;
-
-    /// Request class, as dispatcher lanes and breakers key it.
-    const REQUEST_CLASS: &'static str;
-
-    /// What one read keeps between its acquisitions. `()` for a read whose
-    /// every acquisition stands alone; a log walk keeps [`LogCursor`], where
-    /// its previous walk ended. Shared by every clone of one [`Read`], so the
-    /// dispatcher's per-tick clones see one position.
-    type State: Default + Send + Sync + 'static;
-
-    /// Performs the read: fetch, project, assemble.
+/// How a kind reads one target: fetch, project, assemble. The hook receives
+/// the transport, the target, and the requested location string, which
+/// generated subject matchers canonicalize before deriving identity, so
+/// identity never comes from the payload's own claim.
+trait Fetch: ReadKind {
     fn acquire<B>(
         bmc: &B,
         target: &ODataId,
@@ -113,35 +121,58 @@ pub trait ReadKind: sealed::Sealed + Send + Sync + 'static {
         B::Error: ClassifyError;
 }
 
+/// A read through the endpoint's service, its platform classified first.
+async fn perform<T: RedfishTransport, K: Fetch>(
+    read: &Read<T, K>,
+) -> Result<AcquisitionParts, AcquisitionFailure> {
+    let bmc = read.service.compat().await?;
+    K::acquire(&bmc, &read.target, &read.location, read.state.as_ref()).await
+}
+
+/// What one kind of read is: its provider identity, and how a target on an
+/// endpoint becomes acquisition parts.
+///
+/// Implementations are this crate's unit types — the trait is sealed, so
+/// the origin bounds every kind's constants must satisfy are pinned by the
+/// tests below and nowhere else. [`Read`] carries the state.
+pub trait ReadKind: sealed::Sealed + Send + Sync + 'static {
+    /// Provider identity, as `Origin.provider` carries it.
+    const PROVIDER: &'static str;
+
+    /// Request class, as dispatcher lanes and breakers key it.
+    const REQUEST_CLASS: &'static str;
+}
+
 /// One dispatched leaf: the planner names the target, the dispatcher decides
-/// when this runs, and the kind knows how. Generic over the transport so the
-/// same provider runs against HTTP and against the mock the corpus replays
-/// through.
-pub struct Read<B, K: ReadKind> {
+/// when this runs, and the kind knows how. Generic over the embedder's
+/// transport; read through the endpoint's [`RedfishService`], so every
+/// document carries the platform's repairs.
+pub struct Read<T, K: ReadKind> {
     endpoint: EndpointContext,
     origin: Origin,
     target: ODataId,
     /// The requested location string, as the kind's projection expects it.
     location: String,
-    bmc: Arc<B>,
+    service: Arc<RedfishService<T>>,
     state: Arc<K::State>,
     kind: PhantomData<fn() -> K>,
 }
 
-/// One sensor, read over one endpoint's `Bmc`: readings and states.
-pub type SensorRead<B> = Read<B, SensorKind>;
+/// One sensor, read over one endpoint's transport: readings and states.
+pub type SensorRead<T> = Read<T, SensorKind>;
 
-/// One chassis, read over one endpoint's `Bmc`: inventory and states.
-pub type ChassisRead<B> = Read<B, ChassisKind>;
+/// One chassis, read over one endpoint's transport: inventory and states.
+pub type ChassisRead<T> = Read<T, ChassisKind>;
 
-/// One log service's entries, read over one endpoint's `Bmc`: log records.
-pub type LogRead<B> = Read<B, LogKind>;
+/// One log service's entries, read over one endpoint's transport: log
+/// records.
+pub type LogRead<T> = Read<T, LogKind>;
 
 /// One update service's firmware inventory, read over one endpoint's
-/// `Bmc`: inventory and states.
-pub type FirmwareRead<B> = Read<B, FirmwareKind>;
+/// transport: inventory and states.
+pub type FirmwareRead<T> = Read<T, FirmwareKind>;
 
-impl<B, K: ReadKind> fmt::Debug for Read<B, K> {
+impl<T, K: ReadKind> fmt::Debug for Read<T, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // A requested URI may carry query credentials, and a transport may
         // own authentication material. Scheduling identity is sufficient to
@@ -158,21 +189,21 @@ impl<B, K: ReadKind> fmt::Debug for Read<B, K> {
 
 // Sharing a read must not require the transport to be `Clone`, and every
 // clone shares the kind's state: one position per read, not per clone.
-impl<B, K: ReadKind> Clone for Read<B, K> {
+impl<T, K: ReadKind> Clone for Read<T, K> {
     fn clone(&self) -> Self {
         Self {
             endpoint: self.endpoint.clone(),
             origin: self.origin.clone(),
             target: self.target.clone(),
             location: self.location.clone(),
-            bmc: Arc::clone(&self.bmc),
+            service: Arc::clone(&self.service),
             state: Arc::clone(&self.state),
             kind: PhantomData,
         }
     }
 }
 
-impl<B, K: ReadKind> Read<B, K> {
+impl<T, K: ReadKind> Read<T, K> {
     /// Provider identity, as `Origin.provider` carries it.
     pub const PROVIDER: &'static str = K::PROVIDER;
 
@@ -187,7 +218,8 @@ impl<B, K: ReadKind> Read<B, K> {
         ProviderDeclaration::polled(K::PROVIDER, K::REQUEST_CLASS, 1)
     }
 
-    /// A read of `target` on the endpoint `bmc` reaches.
+    /// A read of `target`, the resource's `@odata.id`, on the endpoint
+    /// `service` reaches.
     ///
     /// # Panics
     ///
@@ -195,29 +227,32 @@ impl<B, K: ReadKind> Read<B, K> {
     /// the trait is sealed, and the unit test below pins that every kind's
     /// constants satisfy the origin's bounds.
     #[must_use]
-    pub fn new(endpoint: EndpointContext, target: ODataId, bmc: Arc<B>) -> Self {
+    pub fn new(
+        endpoint: EndpointContext,
+        target: impl Into<String>,
+        service: Arc<RedfishService<T>>,
+    ) -> Self {
         let origin = Origin::builder()
             .provider(K::PROVIDER)
             .request_class(K::REQUEST_CLASS)
             .build()
             .expect("the kind's constants satisfy the origin's bounds");
-        let location = target.to_string();
+        let location = target.into();
         Self {
             endpoint,
             origin,
-            target,
+            target: ODataId::from(location.clone()),
             location,
-            bmc,
+            service,
             state: Arc::new(K::State::default()),
             kind: PhantomData,
         }
     }
 }
 
-impl<B, K> Acquire for Read<B, K>
+impl<T, K> Acquire for Read<T, K>
 where
-    B: Bmc,
-    B::Error: ClassifyError,
+    T: RedfishTransport,
     K: ReadKind,
 {
     type Output = AcquisitionParts;
@@ -231,13 +266,7 @@ where
     }
 
     async fn perform(&self) -> Result<AcquisitionParts, AcquisitionFailure> {
-        K::acquire(
-            self.bmc.as_ref(),
-            &self.target,
-            &self.location,
-            self.state.as_ref(),
-        )
-        .await
+        K::perform(self).await
     }
 }
 
@@ -262,13 +291,22 @@ fn partial_coverage() -> Result<Coverage, Invalid> {
 #[non_exhaustive]
 pub struct SensorKind;
 
-impl sealed::Sealed for SensorKind {}
-
 impl ReadKind for SensorKind {
     const PROVIDER: &'static str = "redfish.sensor.odata";
     const REQUEST_CLASS: &'static str = "sensor-read";
+}
+
+impl sealed::Sealed for SensorKind {
     type State = ();
 
+    fn perform<T: RedfishTransport>(
+        read: &Read<T, Self>,
+    ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send {
+        perform(read)
+    }
+}
+
+impl Fetch for SensorKind {
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
@@ -321,13 +359,22 @@ fn assemble_sensor(parts: SensorParts) -> Result<AcquisitionParts, Invalid> {
 #[non_exhaustive]
 pub struct ChassisKind;
 
-impl sealed::Sealed for ChassisKind {}
-
 impl ReadKind for ChassisKind {
     const PROVIDER: &'static str = "redfish.chassis.odata";
     const REQUEST_CLASS: &'static str = "chassis-read";
+}
+
+impl sealed::Sealed for ChassisKind {
     type State = ();
 
+    fn perform<T: RedfishTransport>(
+        read: &Read<T, Self>,
+    ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send {
+        perform(read)
+    }
+}
+
+impl Fetch for ChassisKind {
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
@@ -389,13 +436,22 @@ fn assemble_chassis(parts: ChassisParts) -> Result<AcquisitionParts, Invalid> {
 #[non_exhaustive]
 pub struct FirmwareKind;
 
-impl sealed::Sealed for FirmwareKind {}
-
 impl ReadKind for FirmwareKind {
     const PROVIDER: &'static str = "redfish.update-service.odata";
     const REQUEST_CLASS: &'static str = "firmware-read";
+}
+
+impl sealed::Sealed for FirmwareKind {
     type State = ();
 
+    fn perform<T: RedfishTransport>(
+        read: &Read<T, Self>,
+    ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send {
+        perform(read)
+    }
+}
+
+impl Fetch for FirmwareKind {
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
@@ -674,8 +730,6 @@ fn assemble_firmware(walk: FirmwareWalk, scope: Subject) -> Result<AcquisitionPa
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LogKind;
-
-impl sealed::Sealed for LogKind {}
 
 /// What one log walk may spend: members visited and wall-clock time. The
 /// members bound also bounds buffering, since every visited member holds at
@@ -1164,8 +1218,19 @@ where
 impl ReadKind for LogKind {
     const PROVIDER: &'static str = "redfish.log-service.odata";
     const REQUEST_CLASS: &'static str = "log-read";
+}
+
+impl sealed::Sealed for LogKind {
     type State = LogCursor;
 
+    fn perform<T: RedfishTransport>(
+        read: &Read<T, Self>,
+    ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send {
+        perform(read)
+    }
+}
+
+impl Fetch for LogKind {
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
@@ -1911,6 +1976,7 @@ mod tests {
     use super::service_scope;
     use super::ChassisKind;
     use super::ChassisRead;
+    use super::Fetch;
     use super::FirmwareKind;
     use super::FirmwareRead;
     use super::LogKind;
@@ -1920,6 +1986,7 @@ mod tests {
     use super::SensorKind;
     use super::SensorRead;
     use super::WalkBudget;
+    use crate::transport::RedfishService;
 
     struct NonCloneBmc;
 
@@ -1939,10 +2006,8 @@ mod tests {
                 .endpoint_id("endpoint-a")
                 .build()
                 .expect("a valid endpoint"),
-            "/redfish/v1/Chassis/1U?token=query-secret"
-                .to_owned()
-                .into(),
-            Arc::new(SensitiveBmc),
+            "/redfish/v1/Chassis/1U?token=query-secret",
+            Arc::new(RedfishService::new(SensitiveBmc)),
         );
         format!("{read:?}")
     }
@@ -2242,7 +2307,7 @@ mod tests {
         // poll that finds it held asks the device nothing — the strict mock
         // would fail it — and reports the overlap instead.
         let in_flight = cursor.position.lock().await;
-        let skipped = <LogKind as ReadKind>::acquire(&bmc, &target, SERVICE, &cursor)
+        let skipped = <LogKind as Fetch>::acquire(&bmc, &target, SERVICE, &cursor)
             .await
             .expect("an overlapping poll is not a failure");
         assert!(skipped.payloads().is_empty());
@@ -2258,7 +2323,7 @@ mod tests {
             )],
         );
         prime(&bmc, &whole_log(0..2));
-        <LogKind as ReadKind>::acquire(&bmc, &target, SERVICE, &cursor)
+        <LogKind as Fetch>::acquire(&bmc, &target, SERVICE, &cursor)
             .await
             .expect("the next poll walks");
         assert!(
@@ -3049,7 +3114,7 @@ mod tests {
         cursor: &super::LogCursor,
     ) -> nv_telemetry_source::AcquisitionParts {
         const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
-        <LogKind as ReadKind>::acquire(bmc, &SERVICE.to_owned().into(), SERVICE, cursor)
+        <LogKind as Fetch>::acquire(bmc, &SERVICE.to_owned().into(), SERVICE, cursor)
             .await
             .expect("the poll completes")
     }

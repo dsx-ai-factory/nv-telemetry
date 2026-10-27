@@ -19,42 +19,17 @@ nv-telemetry-source.workspace = true
 # `event-service` brings EventService, the SSE payload types, and the
 # vendor patches that make some devices' event records deserialize.
 nv-redfish = { workspace = true, features = ["sensors", "chassis", "log-services", "event-service", "update-service"] }
-# Optional so the `bmc-mock` feature can gate a `ClassifyError` impl for the
-# mock's error type; tests pull it unconditionally through dev-dependencies.
-nv-redfish-bmc-mock = { workspace = true, optional = true }
 serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 futures-timer.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
 
-[features]
-# The HTTP transport is the default consumer path; without it this crate is
-# projection and classification over the `Bmc` trait alone, which is what
-# tests compile against.
-default = ["bmc-http"]
-bmc-http = ["nv-redfish/bmc-http"]
-bmc-mock = ["dep:nv-redfish-bmc-mock"]
-
 [dev-dependencies]
 nv-redfish-bmc-mock.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-
-[[test]]
-name = "sensor_read"
-path = "tests/sensor_read.rs"
-required-features = ["bmc-mock"]
-
-[[test]]
-name = "chassis_read"
-path = "tests/chassis_read.rs"
-required-features = ["bmc-mock"]
-
-[[test]]
-name = "log_read"
-path = "tests/log_read.rs"
-required-features = ["bmc-mock"]
 
 [lints]
 workspace = true

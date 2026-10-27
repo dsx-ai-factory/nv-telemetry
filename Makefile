@@ -28,7 +28,7 @@ buf-version ?= 1.72.0
 # being the one that matters. Without this, make sees the directory, decides
 # the target is up to date, and silently does nothing.
 .PHONY: all ci fmt bench codegen check-codegen proto-lint \
-	check-proto-format check-redfish-features require-buf \
+	check-proto-format require-buf \
 	rust-install clean test-bmc-mock
 
 # `--locked` throughout: generated output is byte-compared, and its bytes are
@@ -48,7 +48,6 @@ define build-and-test
 	+$(MAKE) check-proto-format
 	+$(MAKE) proto-lint
 	+$(MAKE) check-codegen
-	+$(MAKE) check-redfish-features
 	cargo clippy $(cargo-locked) --workspace --all-targets -- -D warnings
 	cargo clippy $(cargo-locked) --workspace --all-targets $1 -- -D warnings
 	cargo build $(cargo-locked) --workspace
@@ -98,20 +97,6 @@ check-codegen:
 # point BMC_MOCK_ROOT at its target directory.
 test-bmc-mock:
 	cargo test $(cargo-locked) -p nv-telemetry-probe --test e2e_http -- --ignored --nocapture
-
-# Every transport row the Redfish crate supports is explicit here. Workspace
-# default/all-feature builds cover only the HTTP and combined rows and
-# previously allowed an isolated feature to decay behind dev-dependency
-# feature unification.
-check-redfish-features:
-	cargo clippy $(cargo-locked) -p nv-telemetry-redfish --no-default-features --lib -- -D warnings
-	cargo clippy $(cargo-locked) -p nv-telemetry-redfish --no-default-features --features bmc-mock --lib -- -D warnings
-	cargo clippy $(cargo-locked) -p nv-telemetry-redfish --no-default-features --features bmc-http --lib -- -D warnings
-	cargo clippy $(cargo-locked) -p nv-telemetry-redfish --no-default-features --features bmc-http,bmc-mock --lib -- -D warnings
-	cargo test $(cargo-locked) -p nv-telemetry-redfish --no-default-features --lib
-	cargo test $(cargo-locked) -p nv-telemetry-redfish --no-default-features --features bmc-mock
-	cargo test $(cargo-locked) -p nv-telemetry-redfish --no-default-features --features bmc-http --lib
-	cargo test $(cargo-locked) -p nv-telemetry-redfish --no-default-features --features bmc-http,bmc-mock
 
 # Instruction counts under Valgrind, so results do not depend on machine
 # load. Needs valgrind and a gungraun-runner matching the gungraun version

@@ -14,13 +14,13 @@ nv-redfish-bmc-mock.workspace = true
 nv-redfish-dispatcher.workspace = true
 nv-telemetry-model.workspace = true
 nv-telemetry-orchestration.workspace = true
-nv-telemetry-redfish = { workspace = true, features = ["bmc-mock"] }
+nv-telemetry-redfish.workspace = true
 nv-telemetry-source.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 url.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

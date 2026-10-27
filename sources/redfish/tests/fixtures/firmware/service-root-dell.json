@@ -1,0 +1,9 @@
+{
+  "@odata.id": "/redfish/v1",
+  "@odata.type": "#ServiceRoot.v1_11_0.ServiceRoot",
+  "Id": "RootService",
+  "Name": "Root Service",
+  "Vendor": "Dell",
+  "RedfishVersion": "1.15.0",
+  "UpdateService": { "@odata.id": "/redfish/v1/UpdateService" }
+}
