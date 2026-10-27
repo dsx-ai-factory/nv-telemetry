@@ -52,7 +52,7 @@ public face — so a caller receives a validated type or nothing.
 `source` defines what every protocol implements — source and stage traits,
 capability probes, endpoint access, request classification — so `orchestration`
 can plan against the contract and protocol crates can implement it without
-either depending on the other. Each crate under `sources/` is meant to hold the
+either depending on the other. Schema-backed source crates are meant to hold the
 same three things: transport, projection manifests, and generated projection
 code, of which only the transport is hand-written. A REST API is a transport
 rather than a source, so each vendor API gets its own crate and manifest rather
@@ -66,8 +66,10 @@ content-hashable — `source` is the acquisition contract, and the Redfish
 crate's first provider reads one sensor into readings and states batches,
 pinned by a fixture corpus that asserts batches and issue lists together.
 
-`sources/gnmi` contains private generated gNMI messages and a client, but no
-telemetry provider.
+`sources/gnmi` collects numeric readings using caller-supplied transport, paths,
+and signal mappings. The `gnmi.configured` provider validates scalar values at
+runtime. It does not validate against YANG or project JSON subtrees. See the crate's
+API documentation for a construction example.
 
 Exporters are separate crates because their dependency trees are disjoint;
 `export` holds only what they share, such as joining readings to descriptors

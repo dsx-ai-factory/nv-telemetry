@@ -437,14 +437,15 @@ One notification, two domains again — a counter and a status.
 # Batch 1
   endpoint: { endpoint_id: "switch-3" }
   origin:   { provider: "gnmi.subscribe", request_class: "interface-counters" }
-  window:   { start: 2026-07-30T21:14:03.000000000Z }   # Notification.timestamp
+  window:   { start: 2026-08-01T21:54:03.100000000Z }   # Collector timestamp
   coverage: { completeness: PARTIAL }                   # ON_CHANGE/SAMPLE stream
   readings:
     descriptors: [ { key: { subject: { kind: "interface", scope: ["switch-3"],
                                        id: "Ethernet1/1" },
                             facet: "state/counters/in-octets" },
                      kind: "counter" } ]
-    samples:     [ { key: <same>, value: { uint_value: 91827364554433 } } ]
+    samples:     [ { key: <same>, value: { uint_value: 91827364554433 },
+                     observed_at: 2026-08-01T21:54:03.000000000Z } ] # Notification.timestamp
 
 # Batch 2
   states:
