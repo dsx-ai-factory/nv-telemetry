@@ -9,6 +9,8 @@
 //! transport presents, so a fixture exercises decode plus projection.
 //! Raw-bytes leniency belongs to nv-redfish's own tests.
 
+mod support;
+
 use std::sync::Arc;
 
 use nv_redfish_bmc_mock::Bmc;
@@ -54,7 +56,7 @@ fn endpoint() -> EndpointContext {
 async fn acquire(uri: &str, fixture: &str) -> Acquired {
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
     bmc.expect(Expect::get(uri, fixture));
-    let read = SensorRead::new(endpoint(), uri.to_string().into(), bmc);
+    let read = SensorRead::new(endpoint(), uri, support::service(&bmc));
     run_acquisition(&read, at())
         .await
         .expect("the device answered")
@@ -556,7 +558,7 @@ async fn a_transport_failure_is_classified_never_a_batch() {
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
     // No expectation queued: the mock fails the GET, standing in for any
     // transport failure. A mock error is a harness fault, hence Internal.
-    let read = SensorRead::new(endpoint(), URI.to_string().into(), bmc);
+    let read = SensorRead::new(endpoint(), URI, support::service(&bmc));
     let failure = run_acquisition(&read, at())
         .await
         .expect_err("the transport failed");

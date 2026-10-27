@@ -22,6 +22,8 @@ use nv_redfish::bmc_http::HttpBmc;
 use nv_redfish::bmc_http::HttpClient as _;
 use nv_redfish::core::ModificationResponse;
 use nv_redfish::core::NoRepair;
+use nv_telemetry_probe::BmcTransport;
+use nv_telemetry_redfish::RedfishService;
 use serde_json::json;
 use serde_json::Value;
 use url::Url;
@@ -346,17 +348,24 @@ impl Server {
         )
     }
 
-    pub(crate) fn bmc(&self) -> Arc<Bmc> {
-        self.bmc_with(self.credentials.clone())
+    pub(crate) fn service(&self) -> Arc<RedfishService<BmcTransport<Bmc>>> {
+        self.service_with(self.credentials.clone())
     }
 
-    pub(crate) fn bmc_with(&self, credentials: BmcCredentials) -> Arc<Bmc> {
-        Arc::new(HttpBmc::new(
+    /// A fresh service per call: its first read classifies the platform,
+    /// so a case that stops the server or refuses the credentials fails at
+    /// that read, with the class the read under test would have.
+    pub(crate) fn service_with(
+        &self,
+        credentials: BmcCredentials,
+    ) -> Arc<RedfishService<BmcTransport<Bmc>>> {
+        let bmc = Arc::new(HttpBmc::new(
             self.client.clone(),
             self.base.clone(),
             credentials,
             CacheSettings::default(),
-        ))
+        ));
+        Arc::new(RedfishService::new(BmcTransport::new(bmc)))
     }
 
     pub(crate) async fn probe(

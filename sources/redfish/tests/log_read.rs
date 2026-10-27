@@ -11,6 +11,8 @@
 //! semantics — each entry's issues name their member, and only a failure
 //! that indicts the endpoint or the collector ends the walk.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -70,7 +72,7 @@ async fn run(answers: &[(&str, &str)]) -> Result<Acquired, AcquisitionFailure> {
     for (uri, body) in answers {
         bmc.expect(Expect::get(uri, body));
     }
-    let read = LogRead::new(endpoint(), SERVICE.to_string().into(), bmc);
+    let read = LogRead::new(endpoint(), SERVICE, support::service(&bmc));
     run_acquisition(&read, at()).await
 }
 
@@ -215,7 +217,7 @@ async fn a_read_remembers_where_its_last_walk_ended() {
             bmc.expect(Expect::get(uri, body));
         }
     };
-    let read = LogRead::new(endpoint(), SERVICE.to_string().into(), Arc::clone(&bmc));
+    let read = LogRead::new(endpoint(), SERVICE, support::service(&bmc));
 
     prime(&two_entries());
     let first = run_acquisition(&read, at())
@@ -265,7 +267,7 @@ async fn a_filtering_device_is_asked_only_for_the_cursors_second_onward() {
             bmc.expect(Expect::get(uri, body));
         }
     };
-    let read = LogRead::new(endpoint(), SERVICE.to_string().into(), Arc::clone(&bmc));
+    let read = LogRead::new(endpoint(), SERVICE, support::service(&bmc));
     prime(&two_entries());
     run_acquisition(&read, at())
         .await

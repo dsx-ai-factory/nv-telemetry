@@ -36,7 +36,10 @@
 //! is an issue at [`GAP_LOCATOR`], never a record, and the polled walk fills
 //! the gap. A `MetricReport` payload is not this provider's data; the first
 //! one on a stream is an issue at [`METRIC_REPORT_LOCATOR`] and the rest
-//! yield nothing. The stream ends as the contract requires, with one
+//! yield nothing. A payload that does not decode, even after the platform's
+//! repairs, is an issue at [`PAYLOAD_LOCATOR`] and the stream reads on: the
+//! payloads after it are unaffected, and ending the stream would only
+//! resume into the same payload. The stream ends as the contract requires, with one
 //! terminal failure: the transport's, or, when the device closes it without
 //! one, a retryable `Protocol` failure, so the embedder reconnects either
 //! way.
@@ -51,14 +54,16 @@ use futures_util::stream::unfold;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use futures_util::StreamExt as _;
+use nv_redfish::core::repair::decode;
 use nv_redfish::core::BoxTryStream;
 use nv_redfish::core::NavProperty;
+use nv_redfish::core::RepairError;
 use nv_redfish::core::StreamEvent;
 use nv_redfish::event_service::EventStreamPayload;
+use nv_redfish::quirks::CompatBmc;
 use nv_redfish::schema::event::Event;
 use nv_redfish::schema::event::EventRecord;
 use nv_redfish::Bmc;
-use nv_redfish::ServiceRoot;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Invalid;
 use nv_telemetry_model::Origin;
@@ -70,11 +75,17 @@ use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProjectionIssue;
 use nv_telemetry_source::ProviderDeclaration;
 use nv_telemetry_source::SubscriptionItem;
+use serde_json::Value;
 
 use crate::failure::ClassifyError;
 use crate::projection::project_event_record;
 use crate::provider::assemble_logs;
 use crate::provider::internal_bug;
+use crate::transport::Link;
+use crate::transport::LinkError;
+use crate::transport::RedfishService;
+use crate::transport::RedfishTransport;
+use crate::transport::Root;
 
 /// The issue a stream raises when the device reports that events were
 /// dropped before this stream caught up.
@@ -83,6 +94,9 @@ pub const GAP_LOCATOR: &str = "@gap";
 /// The issue a stream raises, once, when the device sends metric reports
 /// this provider does not carry.
 pub const METRIC_REPORT_LOCATOR: &str = "@metric-report";
+
+/// The issue a stream raises for each payload that does not decode.
+pub const PAYLOAD_LOCATOR: &str = "@payload";
 
 /// The scope's kind for every batch a stream ships.
 const SCOPE_KIND: &str = "event-service";
@@ -227,16 +241,16 @@ fn lock(cursor: &Mutex<Cursor>) -> MutexGuard<'_, Cursor> {
     cursor.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One endpoint's event stream, opened over its `Bmc`: log records from
+/// One endpoint's event stream, opened over its transport: log records from
 /// server-sent events.
-pub struct EventStream<B> {
+pub struct EventStream<T> {
     endpoint: EndpointContext,
     origin: Origin,
-    bmc: Arc<B>,
+    service: Arc<RedfishService<T>>,
     cursor: Arc<Mutex<Cursor>>,
 }
 
-impl<B> EventStream<B> {
+impl<T> EventStream<T> {
     /// Provider identity, as `Origin.provider` carries it.
     pub const PROVIDER: &'static str = "redfish.event-service.sse";
 
@@ -254,8 +268,8 @@ impl<B> EventStream<B> {
         ProviderDeclaration::streamed(Self::PROVIDER, Self::REQUEST_CLASS, Self::COST)
     }
 
-    /// The event stream of the endpoint `bmc` reaches. The service root
-    /// names the event service, so no target is asked for. The first
+    /// The event stream of the endpoint `service` reaches. The service
+    /// root names the event service, so no target is asked for. The first
     /// instance starts live; each later one resumes after the last id read.
     ///
     /// # Panics
@@ -263,7 +277,7 @@ impl<B> EventStream<B> {
     /// Never in practice: the origin is built from this type's own
     /// constants, which satisfy the origin's bounds.
     #[must_use]
-    pub fn new(endpoint: EndpointContext, bmc: Arc<B>) -> Self {
+    pub fn new(endpoint: EndpointContext, service: Arc<RedfishService<T>>) -> Self {
         let origin = Origin::builder()
             .provider(Self::PROVIDER)
             .request_class(Self::REQUEST_CLASS)
@@ -272,7 +286,7 @@ impl<B> EventStream<B> {
         Self {
             endpoint,
             origin,
-            bmc,
+            service,
             cursor: Arc::new(Mutex::new(Cursor::default())),
         }
     }
@@ -298,7 +312,7 @@ impl<B> EventStream<B> {
     }
 }
 
-impl<B> fmt::Debug for EventStream<B> {
+impl<T> fmt::Debug for EventStream<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventStream")
             .field("endpoint_id", &self.endpoint.endpoint_id())
@@ -309,11 +323,7 @@ impl<B> fmt::Debug for EventStream<B> {
     }
 }
 
-impl<B> Acquire for EventStream<B>
-where
-    B: Bmc + 'static,
-    B::Error: ClassifyError + 'static,
-{
+impl<T: RedfishTransport> Acquire for EventStream<T> {
     type Output = BoxStream<'static, SubscriptionItem>;
 
     fn endpoint(&self) -> &EndpointContext {
@@ -325,34 +335,41 @@ where
     }
 
     async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
-        let root = ServiceRoot::new(Arc::clone(&self.bmc))
+        let Root { bmc, document } = self.service.root().await?;
+        let service = document
+            .event_service
+            .as_ref()
+            .ok_or_else(|| unsupported("the service root advertises no EventService"))?
+            .get(&bmc)
             .await
-            .map_err(|error| classify_wrapper(&error))?;
-        let service = root
-            .event_service()
-            .await
-            .map_err(|error| classify_wrapper(&error))?
-            .ok_or_else(|| {
-                AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
-                    .with_retryable(false)
-                    .with_detail("the service root advertises no EventService")
-            })?;
+            .map_err(|error| error.classify())?;
+        let uri = service
+            .server_sent_event_uri
+            .as_ref()
+            .ok_or_else(|| unsupported("the event service advertises no ServerSentEventUri"))?;
         let start = lock(&self.cursor).start();
-        let scope = stream_scope(&service.raw().id, &start.run)?;
-        let events = service
-            .events_from(start.after.as_deref())
+        let scope = stream_scope(&service.id, &start.run)?;
+        // The layer repairs each payload under the SSE id it arrived with;
+        // decoding is left to the items, so a payload that does not decode
+        // still moves the cursor past it.
+        let events = bmc
+            .stream_events::<Value>(uri, start.after.as_deref())
             .await
-            .map_err(|error| {
-                told_against_resume(start.after.as_deref(), classify_wrapper(&error))
-            })?;
+            .map_err(|error| told_against_resume(start.after.as_deref(), error.classify()))?;
         Ok(Box::pin(items(Live {
             events,
-            bmc: Arc::clone(&self.bmc),
+            bmc,
             scope,
             cursor: Arc::clone(&self.cursor),
             metric_reports_seen: false,
         })))
     }
+}
+
+fn unsupported(detail: &'static str) -> AcquisitionFailure {
+    AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
+        .with_retryable(false)
+        .with_detail(detail)
 }
 
 /// A failed open, told against the position it resumed from when there
@@ -374,22 +391,19 @@ fn told_against_resume(after: Option<&str>, failure: AcquisitionFailure) -> Acqu
 }
 
 /// One open stream and what its items are built with.
-struct Live<B: Bmc> {
-    events: BoxTryStream<StreamEvent<EventStreamPayload>, nv_redfish::Error<B>>,
-    bmc: Arc<B>,
+struct Live<T: RedfishTransport> {
+    events: BoxTryStream<StreamEvent<Value>, RepairError<LinkError>>,
+    bmc: CompatBmc<Link<T>>,
     scope: Subject,
     cursor: Arc<Mutex<Cursor>>,
     metric_reports_seen: bool,
 }
 
 /// The payloads as items: one per `Event`, one for the first
-/// `MetricReport`, and one terminal failure that ends the stream. Every
-/// payload's id, of either kind, moves the cursor before the item is built.
-fn items<B>(live: Live<B>) -> impl Stream<Item = SubscriptionItem> + Send
-where
-    B: Bmc + 'static,
-    B::Error: ClassifyError + 'static,
-{
+/// `MetricReport`, one per payload that does not decode, and one terminal
+/// failure that ends the stream. Every payload's id, decoded or not, moves
+/// the cursor before the item is built.
+fn items<T: RedfishTransport>(live: Live<T>) -> impl Stream<Item = SubscriptionItem> + Send {
     unfold(Some(live), |live| async move {
         let mut live = live?;
         loop {
@@ -401,9 +415,22 @@ where
                     if let Some(id) = last_event_id {
                         lock(&live.cursor).advance(id);
                     }
-                    data
+                    match decode::<EventStreamPayload>(data) {
+                        Ok(payload) => payload,
+                        // The path only: serde's message quotes device values.
+                        Err(error) => {
+                            let issue = ProjectionIssue::invalid(
+                                PAYLOAD_LOCATOR,
+                                format!("a payload did not decode at `{}`", error.path()),
+                            );
+                            return Some((
+                                Ok(AcquisitionParts::new(Vec::new(), vec![issue])),
+                                Some(live),
+                            ));
+                        }
+                    }
                 }
-                Some(Err(error)) => return Some((Err(classify_wrapper(&error)), None)),
+                Some(Err(error)) => return Some((Err(error.classify()), None)),
                 None => {
                     let closed = AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
                         .with_retryable(true)
@@ -413,12 +440,10 @@ where
             };
             match payload {
                 EventStreamPayload::Event(event) => {
-                    return Some(
-                        match project_event(&event, live.bmc.as_ref(), &live.scope).await {
-                            Ok(parts) => (Ok(parts), Some(live)),
-                            Err(failure) => (Err(failure), None),
-                        },
-                    );
+                    return Some(match project_event(&event, &live.bmc, &live.scope).await {
+                        Ok(parts) => (Ok(parts), Some(live)),
+                        Err(failure) => (Err(failure), None),
+                    });
                 }
                 EventStreamPayload::MetricReport(_) => {
                     if live.metric_reports_seen {
@@ -512,33 +537,6 @@ fn stream_scope(service_id: &str, run: &StreamRun) -> Result<Subject, Acquisitio
             .with_retryable(false)
             .with_detail("event service identity violates subject bounds")
     })
-}
-
-/// The wrapper's failures as this crate classifies them: the transport's
-/// through its own table; a document that did not decode, the root's, the
-/// service's, or a payload's, as a protocol answer; anything else as a
-/// capability the service lacks.
-fn classify_wrapper<B>(error: &nv_redfish::Error<B>) -> AcquisitionFailure
-where
-    B: Bmc,
-    B::Error: ClassifyError,
-{
-    match error {
-        nv_redfish::Error::Bmc(transport) => transport.classify(),
-        nv_redfish::Error::Json(decode) => {
-            AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
-                .with_retryable(false)
-                .with_detail(format!("document did not decode: {decode}"))
-        }
-        nv_redfish::Error::Decode(decode) => {
-            AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
-                .with_retryable(false)
-                .with_detail(format!("document did not decode: {decode}"))
-        }
-        other => AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
-            .with_retryable(false)
-            .with_detail(other.to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -641,12 +639,12 @@ mod tests {
     #[test]
     fn a_position_handed_in_is_where_the_first_instance_starts() {
         let position = ResumePosition::new("41", run("run-a")).expect("a non-empty id");
-        let stream = EventStream::<()>::new(
+        let stream = EventStream::new(
             EndpointContext::builder()
                 .endpoint_id("bmc-lab-07")
                 .build()
                 .expect("a valid endpoint"),
-            Arc::new(()),
+            Arc::new(RedfishService::new(())),
         )
         .with_resume_position(position.clone());
         assert_eq!(stream.resume_position(), Some(position.clone()));

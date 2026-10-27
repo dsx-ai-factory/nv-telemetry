@@ -22,10 +22,12 @@ use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::NumericValue;
 use nv_telemetry_model::Payload;
 use nv_telemetry_model::Timestamp;
+use nv_telemetry_probe::BmcTransport;
 use nv_telemetry_redfish::ChassisRead;
 use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::FirmwareRead;
 use nv_telemetry_redfish::LogRead;
+use nv_telemetry_redfish::RedfishService;
 use nv_telemetry_redfish::ResumePosition;
 use nv_telemetry_redfish::SensorRead;
 use nv_telemetry_redfish::StreamRun;
@@ -50,9 +52,12 @@ fn endpoint() -> EndpointContext {
         .unwrap()
 }
 
-async fn sensor(bmc: Arc<Bmc>, path: &str) -> Result<Acquired, AcquisitionFailure> {
+async fn sensor(
+    service: Arc<RedfishService<BmcTransport<Bmc>>>,
+    path: &str,
+) -> Result<Acquired, AcquisitionFailure> {
     acquire(
-        &SensorRead::new(endpoint(), path.to_owned().into(), bmc),
+        &SensorRead::new(endpoint(), path, service),
         Timestamp::new(0, 0).unwrap(),
     )
     .await
@@ -60,7 +65,7 @@ async fn sensor(bmc: Arc<Bmc>, path: &str) -> Result<Acquired, AcquisitionFailur
 
 async fn logs(server: &Server, resources: &Resources) -> Result<Acquired, AcquisitionFailure> {
     acquire(
-        &LogRead::new(endpoint(), resources.log.clone().into(), server.bmc()),
+        &LogRead::new(endpoint(), resources.log.as_str(), server.service()),
         Timestamp::new(0, 0).unwrap(),
     )
     .await
@@ -86,16 +91,18 @@ async fn standalone_http_boundary() {
     log_cursor(&server, &resources).await;
     events(&server, &resources).await;
 
+    let slow = json!({"Latency": {"mean": "20s", "jitter": "0ms"}});
     server
-        .rules(&[rule(
-            "deadline",
-            &resources.log,
-            json!({"Latency": {"mean": "35s", "jitter": "0ms"}}),
-        )])
+        .rules(&[
+            rule("deadline-root", "/redfish/v1", slow.clone()),
+            rule("deadline-log", &resources.log, slow),
+        ])
         .await;
     // The walk's deadline is its 30 s time budget plus the headroom for the
-    // request in flight; the injected 35 s latency outlasts both, and the
-    // harness waits a little beyond the deadline for the classified failure.
+    // request in flight, counted from before the fresh service classifies
+    // the platform: the root and the log service, slowed 20 s each, outlast
+    // it together but neither alone, and the harness waits a little beyond
+    // the deadline for the classified failure.
     let started = Instant::now();
     let failure = tokio::time::timeout(Duration::from_secs(40), logs(&server, &resources))
         .await
@@ -105,7 +112,9 @@ async fn standalone_http_boundary() {
     assert!(started.elapsed() >= Duration::from_secs(29));
 
     server.stop();
-    let failure = sensor(server.bmc(), &resources.sensor).await.unwrap_err();
+    let failure = sensor(server.service(), &resources.sensor)
+        .await
+        .unwrap_err();
     assert_eq!(failure.class(), Failure::Connectivity);
     assert_eq!(
         server
@@ -129,7 +138,7 @@ async fn nominal(server: &Server, resources: &Resources) {
             json!({"JsonMerge": {"Reading": reading}}),
         )])
         .await;
-    let result = sensor(server.bmc(), &resources.sensor).await.unwrap();
+    let result = sensor(server.service(), &resources.sensor).await.unwrap();
     assert!(result.issues().is_empty());
     let readings = result
         .batches()
@@ -149,7 +158,7 @@ async fn nominal(server: &Server, resources: &Resources) {
         .iter()
         .any(|batch| matches!(batch.payload(), Payload::States(_))));
     let chassis = acquire(
-        &ChassisRead::new(endpoint(), resources.chassis.clone().into(), server.bmc()),
+        &ChassisRead::new(endpoint(), resources.chassis.as_str(), server.service()),
         Timestamp::new(0, 0).unwrap(),
     )
     .await
@@ -170,8 +179,8 @@ async fn nominal(server: &Server, resources: &Resources) {
     let firmware = acquire(
         &FirmwareRead::new(
             endpoint(),
-            resources.update_service.clone().into(),
-            server.bmc(),
+            resources.update_service.as_str(),
+            server.service(),
         ),
         Timestamp::new(0, 0).unwrap(),
     )
@@ -205,9 +214,9 @@ async fn nominal(server: &Server, resources: &Resources) {
 async fn failures(server: &Server, resources: &Resources) {
     server.rules(&[]).await;
     let wrong_password = format!("{}-invalid", text(&server.fixture, "password"));
-    let bad_bmc = server.bmc_with(server.credentials_with(&wrong_password));
+    let bad_service = server.service_with(server.credentials_with(&wrong_password));
     assert_eq!(
-        sensor(bad_bmc, &resources.sensor)
+        sensor(bad_service, &resources.sensor)
             .await
             .unwrap_err()
             .class(),
@@ -231,7 +240,9 @@ async fn failures(server: &Server, resources: &Resources) {
         server
             .rules(&[rule("failure", &resources.sensor, action)])
             .await;
-        let error = sensor(server.bmc(), &resources.sensor).await.unwrap_err();
+        let error = sensor(server.service(), &resources.sensor)
+            .await
+            .unwrap_err();
         assert_eq!(error.class(), expected);
         if expected == Failure::Device {
             assert_eq!(error.retryable(), Some(true));
@@ -257,7 +268,7 @@ async fn failures(server: &Server, resources: &Resources) {
             json!({"JsonMerge": {"Reading": null}}),
         )])
         .await;
-    let quiet = sensor(server.bmc(), &resources.sensor).await.unwrap();
+    let quiet = sensor(server.service(), &resources.sensor).await.unwrap();
     assert!(quiet.issues().is_empty());
     let readings = quiet
         .batches()
@@ -384,7 +395,7 @@ async fn log_cursor(server: &Server, resources: &Resources) {
     // after growth ships exactly the new entries, and a wipe that refills
     // under reused ids still ships the refill.
     server.rules(&[]).await;
-    let read = LogRead::new(endpoint(), resources.log.clone().into(), server.bmc());
+    let read = LogRead::new(endpoint(), resources.log.as_str(), server.service());
     let at = Timestamp::new(0, 0).unwrap();
     let first = acquire(&read, at).await.unwrap();
     let shipped = entry_ids(&first);
@@ -569,7 +580,7 @@ async fn events(server: &Server, resources: &Resources) {
     // power cycle produces within its latency, each Event payload one logs
     // batch under the event service's scope; the mock closing the stream
     // ends it with one retryable failure, and nothing follows.
-    let stream = EventStream::new(endpoint(), server.bmc());
+    let stream = EventStream::new(endpoint(), server.service());
     let mut items = stream.perform().await.expect("the event stream opens");
     server.grow_log(resources, 1).await;
     let (run, seen) = next_batch(&mut items).await;
@@ -604,7 +615,7 @@ async fn events(server: &Server, resources: &Resources) {
         StreamRun::new(run.clone()).expect("the run the scope named fits"),
     )
     .expect("a non-empty id");
-    let stale = EventStream::new(endpoint(), server.bmc()).with_resume_position(stale_position);
+    let stale = EventStream::new(endpoint(), server.service()).with_resume_position(stale_position);
     let refused = stale
         .perform()
         .await
@@ -625,7 +636,7 @@ async fn events(server: &Server, resources: &Resources) {
         Some("999999999".to_owned()),
         "the position is the embedder's to drop"
     );
-    let fresh = EventStream::new(endpoint(), server.bmc());
+    let fresh = EventStream::new(endpoint(), server.service());
     let mut items = fresh.perform().await.expect("a fresh stream starts live");
     server.grow_log(resources, 1).await;
     let (fresh_run, _) = next_batch(&mut items).await;

@@ -6,6 +6,8 @@
 //! reports and the stream's end are told, and where the stream's identity
 //! comes from.
 
+mod support;
+
 use std::sync::Arc;
 
 use futures_util::StreamExt as _;
@@ -17,8 +19,10 @@ use nv_telemetry_model::Severity;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value;
 use nv_telemetry_redfish::EventStream;
+use nv_telemetry_redfish::RedfishService;
 use nv_telemetry_redfish::GAP_LOCATOR;
 use nv_telemetry_redfish::METRIC_REPORT_LOCATOR;
+use nv_telemetry_redfish::PAYLOAD_LOCATOR;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
@@ -27,6 +31,7 @@ use nv_telemetry_source::ProjectionIssue;
 use nv_telemetry_source::SubscriptionItem;
 use serde_json::json;
 use serde_json::Value as Json;
+use support::MockTransport;
 
 const ROOT: &str = "/redfish/v1";
 const EVENT_SERVICE: &str = "/redfish/v1/EventService";
@@ -37,6 +42,12 @@ fn endpoint() -> EndpointContext {
         .endpoint_id("bmc-lab-07")
         .build()
         .expect("a valid endpoint")
+}
+
+/// The service over `bmc`, the service root scripted too: a stream reads it
+/// on every open.
+fn scripted(bmc: &Arc<Bmc<nv_redfish_bmc_mock::Error>>) -> Arc<RedfishService<MockTransport>> {
+    Arc::new(RedfishService::new(MockTransport::scripted(bmc)))
 }
 
 /// An `Event` payload with one record, as the mock's lifecycle events are
@@ -106,7 +117,7 @@ async fn open(payloads: &[Json]) -> Vec<SubscriptionItem> {
         include_str!("fixtures/events/event-service.json"),
     ));
     bmc.expect(Expect::stream(SSE, Json::Array(payloads.to_vec())));
-    let stream = EventStream::new(endpoint(), bmc);
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     let items = stream.perform().await.expect("the stream opens");
     items.collect().await
 }
@@ -265,12 +276,10 @@ async fn metric_reports_are_said_once_and_otherwise_yield_nothing() {
     failure(&items[2]);
 }
 
-#[tokio::test]
-async fn a_payload_that_does_not_decode_ends_the_stream() {
-    // A record without the required `MemberId`, as bmcweb's event-log
-    // events are shaped when no vendor quirk patches them: the wrapper
-    // cannot decode it, and that is this stream's terminal failure.
-    let undecodable = json!({
+/// A record without the required `MemberId`, as bmcweb's event-log events
+/// are shaped when no vendor quirk patches them.
+fn undecodable() -> Json {
+    json!({
         "@odata.type": "#Event.v1_9_2.Event",
         "Id": "9",
         "Name": "Event Array",
@@ -282,20 +291,46 @@ async fn a_payload_that_does_not_decode_ends_the_stream() {
             "Message": "powered on",
             "Severity": "OK"
         }]
-    });
-    let items = open(&[powered_on(7), undecodable, powered_on(10)]).await;
-    assert_eq!(
-        items.len(),
-        2,
-        "the failure is the last item; nothing follows"
+    })
+}
+
+#[tokio::test]
+async fn a_payload_that_does_not_decode_is_an_issue_and_the_stream_reads_on() {
+    // The payload is reported, and the one after it still ships.
+    let items = open(&[powered_on(7), undecodable(), powered_on(10)]).await;
+    assert_eq!(items.len(), 4, "three payloads, then the stream's end");
+    assert_eq!(parts(&items[0]).payloads().len(), 1);
+    let reported = parts(&items[1]);
+    assert!(reported.payloads().is_empty());
+    assert_eq!(reported.issues().len(), 1);
+    assert_eq!(reported.issues()[0].path(), PAYLOAD_LOCATOR);
+    assert_eq!(parts(&items[2]).payloads().len(), 1);
+    failure(&items[3]);
+}
+
+#[tokio::test]
+async fn a_payload_that_does_not_decode_still_moves_the_resume_position() {
+    // Resuming before it would only replay it.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    expect_connect(
+        &bmc,
+        None,
+        vec![(Some("7"), powered_on(7)), (Some("9"), undecodable())],
     );
-    parts(&items[0]);
-    let end = failure(&items[1]);
-    assert_eq!(end.class(), AcquisitionFailureClass::Protocol);
-    assert_eq!(end.retryable(), Some(false));
-    assert!(end
-        .detail()
-        .is_some_and(|detail| detail.starts_with("document did not decode")));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
+    let items: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream opens")
+        .collect()
+        .await;
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        stream
+            .resume_position()
+            .map(|position| position.last_event_id().to_owned()),
+        Some("9".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -353,7 +388,7 @@ async fn a_reconnect_resumes_after_the_last_id_in_the_same_run() {
         vec![(Some("7"), powered_on(7)), (Some("8"), powered_on(8))],
     );
     expect_connect(&bmc, Some("8"), vec![(Some("9"), powered_on(9))]);
-    let stream = EventStream::new(endpoint(), Arc::clone(&bmc));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     assert_eq!(stream.resume_position(), None, "nothing read yet");
 
     // The first instance starts live; the id in effect after its last
@@ -408,7 +443,7 @@ async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
         ));
         bmc.expect(Expect::stream(SSE, Json::Array(vec![powered_on(7)])));
     }
-    let stream = EventStream::new(endpoint(), Arc::clone(&bmc));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     let first: Vec<SubscriptionItem> = stream
         .perform()
         .await
@@ -427,12 +462,9 @@ async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
 
 #[tokio::test]
 async fn a_root_without_an_event_service_cannot_stream() {
+    // The service's own root names no event service.
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
-    bmc.expect(Expect::get(
-        ROOT,
-        include_str!("../tests/fixtures/logs/service-root.json"),
-    ));
-    let stream = EventStream::new(endpoint(), bmc);
+    let stream = EventStream::new(endpoint(), support::service(&bmc));
     let error = stream
         .perform()
         .await

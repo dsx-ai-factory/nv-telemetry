@@ -105,7 +105,6 @@ Regenerate and verify with:
 ```
 make codegen                  # rewrite generated output and the contract lock
 make check-codegen            # fail if the generated output is stale
-make check-redfish-features  # test every supported Redfish feature row
 ```
 
 `make check-codegen` runs as part of `make ci`, ahead of the build steps, so a

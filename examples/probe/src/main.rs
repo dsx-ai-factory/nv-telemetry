@@ -46,11 +46,13 @@ use nv_telemetry_orchestration::StreamNeed;
 use nv_telemetry_orchestration::StreamReports;
 use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_orchestration::SystemClock;
+use nv_telemetry_probe::BmcTransport;
 use nv_telemetry_redfish::ChassisRead;
-use nv_telemetry_redfish::ClassifyError;
 use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::FirmwareRead;
 use nv_telemetry_redfish::LogRead;
+use nv_telemetry_redfish::RedfishService;
+use nv_telemetry_redfish::RedfishTransport;
 use nv_telemetry_redfish::SensorRead;
 use url::Url;
 
@@ -283,8 +285,9 @@ async fn run(args: &Args) -> Result<(), String> {
         Mode::Mock => {
             let bmc = Arc::new(nv_redfish_bmc_mock::Bmc::<nv_redfish_bmc_mock::Error>::default());
             prime_mock(&bmc, args);
-            let units = units(&plan, &bmc, clock);
-            let streams = streams(&plan, &bmc, clock);
+            let service = Arc::new(RedfishService::new(BmcTransport::new(bmc)));
+            let units = units(&plan, &service, clock);
+            let streams = streams(&plan, &service, clock);
             drive(&endpoint, units, streams, clock, args).await
         }
         Mode::Http => {
@@ -303,16 +306,18 @@ async fn run(args: &Args) -> Result<(), String> {
                 credentials,
                 CacheSettings::default(),
             ));
-            let units = units(&plan, &bmc, clock);
-            let streams = streams(&plan, &bmc, clock);
+            let service = Arc::new(RedfishService::new(BmcTransport::new(bmc)));
+            let units = units(&plan, &service, clock);
+            let streams = streams(&plan, &service, clock);
             drive(&endpoint, units, streams, clock, args).await
         }
     }
 }
 
 /// Mock expectations are one-shot AND strict-FIFO, so priming follows
-/// dispatch order: the ring visits targets in needs order each round, and a
-/// log read asks three times — the service, its entries collection, then
+/// dispatch order: the service root the first read classifies the
+/// endpoint's platform from, then the ring visits targets in needs order
+/// each round, and a log read asks three times — the service, its entries collection, then
 /// each member — plus the service root on its second round, to learn
 /// whether the device filters; a firmware read asks three times too — the
 /// update service, its inventory collection, then each member. The
@@ -327,6 +332,7 @@ fn prime_mock(bmc: &nv_redfish_bmc_mock::Bmc<nv_redfish_bmc_mock::Error>, args: 
     let update_service_fixture = include_str!("../fixtures/update-service.json");
     let firmware_inventory_fixture = include_str!("../fixtures/firmware-inventory.json");
     let firmware_item_fixture = include_str!("../fixtures/firmware-item.json");
+    bmc.expect(Expect::get("/redfish/v1", service_root_fixture));
     for round in 0..args.count {
         for sensor in &args.sensors {
             bmc.expect(Expect::get(sensor, sensor_fixture));
@@ -360,31 +366,27 @@ fn credentials_from_env() -> Result<BmcCredentials, String> {
 /// The class-dispatch point: static wiring from each planned poll's
 /// request class to the provider that declared it — the embedder's role
 /// until provider registries exist.
-fn units<B>(
+fn units<T: RedfishTransport>(
     plan: &nv_telemetry_orchestration::Plan,
-    bmc: &Arc<B>,
+    service: &Arc<RedfishService<T>>,
     clock: SystemClock,
-) -> Vec<PollUnit>
-where
-    B: nv_redfish::Bmc + Send + Sync + 'static,
-    B::Error: ClassifyError,
-{
+) -> Vec<PollUnit> {
     plan.polls()
         .iter()
         .map(|planned| {
             let endpoint = planned.endpoint().clone();
-            let target = planned.target().to_owned().into();
-            if planned.origin().request_class() == SensorRead::<B>::REQUEST_CLASS {
-                let unit = SensorRead::new(endpoint, target, Arc::clone(bmc));
+            let target = planned.target();
+            if planned.origin().request_class() == SensorRead::<T>::REQUEST_CLASS {
+                let unit = SensorRead::new(endpoint, target, Arc::clone(service));
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
-            } else if planned.origin().request_class() == ChassisRead::<B>::REQUEST_CLASS {
-                let unit = ChassisRead::new(endpoint, target, Arc::clone(bmc));
+            } else if planned.origin().request_class() == ChassisRead::<T>::REQUEST_CLASS {
+                let unit = ChassisRead::new(endpoint, target, Arc::clone(service));
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
-            } else if planned.origin().request_class() == LogRead::<B>::REQUEST_CLASS {
-                let unit = LogRead::new(endpoint, target, Arc::clone(bmc));
+            } else if planned.origin().request_class() == LogRead::<T>::REQUEST_CLASS {
+                let unit = LogRead::new(endpoint, target, Arc::clone(service));
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
-            } else if planned.origin().request_class() == FirmwareRead::<B>::REQUEST_CLASS {
-                let unit = FirmwareRead::new(endpoint, target, Arc::clone(bmc));
+            } else if planned.origin().request_class() == FirmwareRead::<T>::REQUEST_CLASS {
+                let unit = FirmwareRead::new(endpoint, target, Arc::clone(service));
                 PollUnit::new(planned.clone(), Arc::new(unit), &clock)
             } else {
                 unreachable!("the plan selects only declared providers")
@@ -396,20 +398,16 @@ where
 /// The streamed half of the class dispatch: each planned stream to the
 /// provider that declared its class, paired with the reports the driving
 /// loop pulls.
-fn streams<B>(
+fn streams<T: RedfishTransport>(
     plan: &nv_telemetry_orchestration::Plan,
-    bmc: &Arc<B>,
+    service: &Arc<RedfishService<T>>,
     clock: SystemClock,
-) -> Vec<(StreamUnit, StreamReports)>
-where
-    B: nv_redfish::Bmc + Send + Sync + 'static,
-    B::Error: ClassifyError + 'static,
-{
+) -> Vec<(StreamUnit, StreamReports)> {
     plan.streams()
         .iter()
         .map(|planned| {
-            if planned.origin().request_class() == EventStream::<B>::REQUEST_CLASS {
-                let unit = EventStream::new(planned.endpoint().clone(), Arc::clone(bmc));
+            if planned.origin().request_class() == EventStream::<T>::REQUEST_CLASS {
+                let unit = EventStream::new(planned.endpoint().clone(), Arc::clone(service));
                 StreamUnit::new(
                     planned.clone(),
                     Arc::new(unit),
