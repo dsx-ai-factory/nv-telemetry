@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Numeric collection from configured `gNMI` subscriptions.
+//! Readings and states from configured `gNMI` subscriptions.
 //!
-//! The caller supplies transport, endpoint identity, and exact leaf mappings.
+//! The caller supplies transport, endpoint identity, and mappings for individual leaves.
 //! [`ConfiguredSubscription`] opens one STREAM subscription per acquisition.
 //! Each notification produces one acquisition item; synchronization messages
 //! produce none. Samples carry the device timestamp in `observed_at`.
@@ -14,9 +14,14 @@
 //! stream cancels the subscription. Orchestration owns reconnects; the caller
 //! configures transport security and credentials.
 //!
-//! Only scalar numeric values are projected. Deletes affecting mapped leaves
-//! produce issues and cannot remove earlier observations. Validation checks
-//! configuration consistency and received values, without a YANG schema.
+//! Mappings accept numeric values, configured enum strings, or booleans. Enum
+//! strings must match exactly and keep their spelling. Boolean values are
+//! preserved, including `false`. An invalid mapped value produces a projection
+//! issue; valid updates in the same notification are still collected. Readings
+//! and states from the same notification share the same acquisition item.
+//! Deletes that affect a mapped leaf produce issues and cannot remove earlier
+//! observations. The provider validates mappings and received values without a
+//! YANG schema.
 //! Unsupported request paths can cause the target to reject Subscribe.
 //!
 //! ```
@@ -27,19 +32,29 @@
 //! fn subscription<T>(transport: T) -> Result<ConfiguredSubscription<T>, Box<dyn std::error::Error>> {
 //!     let endpoint = EndpointContext::builder().endpoint_id("switch-a").build()?;
 //!     let subject = Subject::builder().kind("interface").id("eth0").build()?;
-//!     let key = SignalKey::builder().subject(subject).facet("in-octets").build()?;
+//!     let key = SignalKey::builder().subject(subject.clone()).facet("in-octets").build()?;
 //!     let descriptor = SignalDescriptor::builder().key(key).unit("By").build()?;
-//!     let path = SubscriptionPath::new(vec![
+//!     let interface = vec![
 //!         PathElement::new("interfaces"),
 //!         PathElement::new("interface").with_key("name", "eth0"),
-//!         PathElement::new("state"), PathElement::new("counters"),
-//!         PathElement::new("in-octets"),
-//!     ]);
-//!     let spec = SubscriptionSpec::new(vec![path.clone()],
-//!         vec![Mapping::new(path, descriptor, NumericType::Uint)])?;
+//!     ];
+//!     let mut counter = interface.clone();
+//!     counter.extend(["state", "counters", "in-octets"].map(PathElement::new));
+//!     let mut status = interface.clone();
+//!     status.extend(["state", "oper-status"].map(PathElement::new));
+//!     let spec = SubscriptionSpec::new(vec![SubscriptionPath::new(interface)], vec![
+//!         Mapping::new(SubscriptionPath::new(counter), descriptor, NumericType::Uint),
+//!         Mapping::enum_state(SubscriptionPath::new(status), subject, "oper-status",
+//!             None, vec!["UP".into(), "DOWN".into(), "UNKNOWN".into()]),
+//!     ])?;
 //!     Ok(ConfiguredSubscription::new(endpoint, transport, spec)?)
 //! }
 //! ```
+//!
+//! The target must send updates for individual leaves, even when the request
+//! selects a parent path. The provider does not traverse JSON subtrees. Use
+//! [`Mapping::boolean_state`] to collect a boolean state. A subscription may
+//! contain only state mappings.
 //!
 //! Run `make codegen` to regenerate the bindings and `make check-codegen`
 //! to check them. Builds use the checked-in files and do not need `protoc`.
@@ -74,7 +89,7 @@ use tonic::codegen::Bytes;
 use tonic::codegen::StdError;
 use tonic::Code;
 
-/// A numeric gNMI subscription bound to one endpoint.
+/// A gNMI subscription with configured reading and state mappings for one endpoint.
 ///
 /// The supplied transport must implement tonic's `GrpcService` contract and be
 /// cloneable, `Send`, and `Sync`. Each call to [`Acquire::perform`] clones the

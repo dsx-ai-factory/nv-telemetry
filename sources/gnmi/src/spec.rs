@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 
+use nv_telemetry_model::limits;
 use nv_telemetry_model::SignalDescriptor;
+use nv_telemetry_model::Subject;
+use nv_telemetry_model::Value;
 
 use crate::protocol::gnmi;
 
@@ -112,12 +115,64 @@ impl SubscriptionPath {
     }
 }
 
-/// A mapping from one exact leaf path to a signal and numeric type.
+#[derive(Clone, Debug)]
+pub(super) enum MappingKind {
+    Reading {
+        descriptor: SignalDescriptor,
+        numeric_type: NumericType,
+    },
+    State {
+        target: StateTarget,
+        value_type: StateType,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum StateType {
+    Enum(Vec<String>),
+    Boolean,
+}
+
+impl StateType {
+    fn validate(&mut self) -> Result<(), InvalidSubscription> {
+        let Self::Enum(values) = self else {
+            return Ok(());
+        };
+
+        if values.is_empty() {
+            return Err(InvalidSubscription("enum values must be nonempty"));
+        }
+
+        let mut known = BTreeSet::new();
+
+        for value in values.iter() {
+            if !known.insert(value) || Value::string(value).is_err() {
+                return Err(InvalidSubscription("invalid or duplicate enum value"));
+            }
+        }
+
+        // Keep accepted strings sorted for projection's binary search.
+        values.sort_unstable();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StateTarget {
+    pub subject: Subject,
+    pub name: String,
+    pub facet: Option<String>,
+}
+
+/// A mapping from one exact leaf path to a numeric reading or a named state.
+///
+/// State mappings need no numeric descriptor. Their identity is
+/// `(subject, facet, name)`. An absent facet is not a wildcard over the subject's
+/// signals.
 #[derive(Clone, Debug)]
 pub struct Mapping {
     pub(super) path: SubscriptionPath,
-    pub(super) descriptor: SignalDescriptor,
-    pub(super) numeric_type: NumericType,
+    pub(super) kind: MappingKind,
 }
 
 impl Mapping {
@@ -130,8 +185,63 @@ impl Mapping {
     ) -> Self {
         Self {
             path,
-            descriptor,
-            numeric_type,
+            kind: MappingKind::Reading {
+                descriptor,
+                numeric_type,
+            },
+        }
+    }
+
+    /// Creates a state mapping that accepts only strings listed in `values`.
+    ///
+    /// Accepts native strings and scalar JSON or `JSON_IETF` strings. Matching
+    /// is exact, and the provider preserves the received spelling. Unknown
+    /// strings produce projection issues.
+    /// [`SubscriptionSpec::new`] validates the state identity and rejects an
+    /// empty list, duplicate entries, or strings exceeding the model's byte limit.
+    #[must_use]
+    pub fn enum_state(
+        path: SubscriptionPath,
+        subject: Subject,
+        name: impl Into<String>,
+        facet: Option<String>,
+        values: Vec<String>,
+    ) -> Self {
+        Self {
+            path,
+            kind: MappingKind::State {
+                target: StateTarget {
+                    subject,
+                    name: name.into(),
+                    facet,
+                },
+                value_type: StateType::Enum(values),
+            },
+        }
+    }
+
+    /// Creates a state mapping that preserves boolean values, including `false`.
+    ///
+    /// Accepts native booleans and scalar JSON or `JSON_IETF` booleans. Strings and
+    /// numbers are not converted to booleans.
+    /// [`SubscriptionSpec::new`] validates the state identity.
+    #[must_use]
+    pub fn boolean_state(
+        path: SubscriptionPath,
+        subject: Subject,
+        name: impl Into<String>,
+        facet: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            kind: MappingKind::State {
+                target: StateTarget {
+                    subject,
+                    name: name.into(),
+                    facet,
+                },
+                value_type: StateType::Boolean,
+            },
         }
     }
 }
@@ -139,9 +249,10 @@ impl Mapping {
 /// Validated request paths and signal mappings for one subscription.
 ///
 /// Request paths select what the target sends. Mappings match exact leaf paths
-/// after notification prefixes are applied. A parent request requires separate
-/// updates for mapped leaves; JSON subtrees are not traversed.
-/// Validation checks the configuration, without a YANG schema or target lookup.
+/// after notification prefixes are applied. A parent request is supported when
+/// the target sends updates for individual leaves. The provider does not traverse
+/// JSON subtrees.
+/// Validation checks the configuration without a YANG schema or target lookup.
 #[derive(Clone, Debug)]
 pub struct SubscriptionSpec {
     pub(super) mappings: Vec<Mapping>,
@@ -152,13 +263,16 @@ pub struct SubscriptionSpec {
 }
 
 impl SubscriptionSpec {
-    /// Checks that every mapping is covered by a request path and has a unique
-    /// path and signal key.
+    /// Validates request paths and mappings before acquisition.
+    ///
+    /// Each mapping must be covered by a request path. Mapping paths, reading
+    /// keys, and state identities `(subject, facet, name)` must each be unique.
+    /// A reading and a state may describe the same signal.
     ///
     /// # Errors
     ///
     /// Returns an error for empty requests or mappings, invalid paths, mappings outside
-    /// the requests, or duplicate mapping paths or output signal identities.
+    /// the requests, duplicate paths or output identities, or invalid state configuration.
     pub fn new(
         requests: Vec<SubscriptionPath>,
         mut mappings: Vec<Mapping>,
@@ -179,12 +293,11 @@ impl SubscriptionSpec {
 
         let mut paths = BTreeSet::new();
         let mut keys = BTreeSet::new();
+        let mut state_keys = BTreeSet::new();
 
-        for mapping in &mappings {
-            if !paths.insert(&mapping.path) || !keys.insert(mapping.descriptor.key()) {
-                return Err(InvalidSubscription(
-                    "mapping paths and output signal identities must be unique",
-                ));
+        for mapping in &mut mappings {
+            if !paths.insert(&mapping.path) {
+                return Err(InvalidSubscription("mapping paths must be unique"));
             }
 
             if !requests
@@ -194,6 +307,33 @@ impl SubscriptionSpec {
                 return Err(InvalidSubscription(
                     "every mapping must be below a request path",
                 ));
+            }
+
+            match &mut mapping.kind {
+                MappingKind::Reading { descriptor, .. } => {
+                    if !keys.insert(descriptor.key()) {
+                        return Err(InvalidSubscription("reading signal keys must be unique"));
+                    }
+                }
+                MappingKind::State { target, value_type } => {
+                    if target.name.is_empty()
+                        || target.name.len() > limits::STATEOBSERVATION_NAME_MAX_LEN as usize
+                        || target.facet.as_ref().is_some_and(|facet| {
+                            facet.is_empty()
+                                || facet.len() > limits::STATEOBSERVATION_FACET_MAX_LEN as usize
+                        })
+                    {
+                        return Err(InvalidSubscription("invalid state name or facet"));
+                    }
+
+                    // All updates in a notification share a timestamp. Different paths
+                    // must not produce the same state identity at that timestamp.
+                    if !state_keys.insert((&target.subject, &target.facet, &target.name)) {
+                        return Err(InvalidSubscription("state identities must be unique"));
+                    }
+
+                    value_type.validate()?;
+                }
             }
         }
 

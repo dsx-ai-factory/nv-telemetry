@@ -15,7 +15,10 @@ use nv_telemetry_model::Reading;
 use nv_telemetry_model::Readings;
 use nv_telemetry_model::SignalDescriptor;
 use nv_telemetry_model::SignalKey;
+use nv_telemetry_model::StateObservation;
+use nv_telemetry_model::States;
 use nv_telemetry_model::Timestamp;
+use nv_telemetry_model::Value as ModelValue;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
@@ -25,6 +28,9 @@ use serde::de::DeserializeOwned;
 
 use crate::protocol::gnmi;
 use crate::protocol::gnmi::typed_value::Value;
+use crate::spec::MappingKind;
+use crate::spec::StateTarget;
+use crate::spec::StateType;
 use crate::NumericType;
 use crate::PathElement;
 use crate::SubscriptionPath;
@@ -44,18 +50,24 @@ pub(super) fn project(
     )
     .map_err(|error| model_error(&error))?;
 
-    // Split at the model limits; all payloads still belong to one acquisition item.
-    let chunk_limit =
+    // Readings and states have separate limits, but all chunks from a notification
+    // belong to the same acquisition item.
+    let readings_limit =
         limits::READINGS_SAMPLES_MAX_ITEMS.min(limits::READINGS_DESCRIPTORS_MAX_ITEMS) as usize;
+
+    let states_limit = limits::STATES_OBSERVATIONS_MAX_ITEMS as usize;
 
     let mut payloads = Vec::new();
     let mut descriptors = BTreeMap::new();
     let mut samples = Vec::new();
+    let mut states = Vec::new();
     let mut issues = Vec::new();
     let mut seen = BTreeSet::new();
 
-    // gNMI uses only the final update for each path. Mark the path before parsing
+    // gNMI uses only the final update for each path. Mark it seen before parsing
     // its value so an invalid final value also suppresses earlier updates.
+    // Keep seen paths across payload splits, and enumerate before reversing to
+    // preserve the original update indexes in issues.
     for (index, update) in notification.update.into_iter().enumerate().rev() {
         let path = match resolve(spec, notification.prefix.as_ref(), update.path.as_ref()) {
             Ok(path) => path,
@@ -78,40 +90,62 @@ pub(super) fn project(
             continue;
         }
 
-        let Some(value) = update
-            .val
-            .and_then(|value| value.value)
-            .and_then(|value| number(mapping.numeric_type, value))
-        else {
+        let value = update.val.and_then(|value| value.value);
+
+        let valid = match &mapping.kind {
+            MappingKind::Reading {
+                descriptor,
+                numeric_type,
+            } => {
+                if let Some(value) = value.and_then(|value| number(*numeric_type, value)) {
+                    let sample = Reading::builder()
+                        .key(descriptor.key().clone())
+                        .value(value)
+                        .observed_at(observed_at)
+                        .build()
+                        .map_err(|error| model_error(&error))?;
+
+                    descriptors
+                        .entry(descriptor.key().clone())
+                        .or_insert_with(|| descriptor.clone());
+
+                    samples.push(sample);
+                    true
+                } else {
+                    false
+                }
+            }
+            MappingKind::State { target, value_type } => {
+                if let Some(state) = state(target, value_type, value, observed_at)? {
+                    states.push(state);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if !valid {
             issues.push(
                 ProjectionIssue::invalid(
                     "val",
-                    "value does not match the declared finite numeric type",
+                    "value does not match the declared type or accepted values",
                 )
                 .at_index("update", index),
             );
 
             continue;
-        };
+        }
 
-        let sample = Reading::builder()
-            .key(mapping.descriptor.key().clone())
-            .value(value)
-            .observed_at(observed_at)
-            .build()
-            .map_err(|error| model_error(&error))?;
-
-        descriptors
-            .entry(mapping.descriptor.key().clone())
-            .or_insert_with(|| mapping.descriptor.clone());
-
-        samples.push(sample);
-
-        if samples.len() == chunk_limit {
+        if samples.len() == readings_limit {
             payloads.push(payload(
                 std::mem::take(&mut descriptors),
                 std::mem::take(&mut samples),
             )?);
+        }
+
+        if states.len() == states_limit {
+            payloads.push(state_payload(std::mem::take(&mut states))?);
         }
     }
 
@@ -119,8 +153,30 @@ pub(super) fn project(
         payloads.push(payload(descriptors, samples)?);
     }
 
-    for (index, delete) in notification.delete.iter().enumerate() {
-        match resolve(spec, notification.prefix.as_ref(), Some(delete)) {
+    if !states.is_empty() {
+        payloads.push(state_payload(states)?);
+    }
+
+    delete_issues(
+        spec,
+        notification.prefix.as_ref(),
+        &notification.delete,
+        &mut issues,
+    );
+
+    Ok(AcquisitionParts::new(payloads, issues))
+}
+
+/// Reports deletes that name a mapped leaf or one of its ancestors.
+/// The model has no deletion observation, so deletes produce issues only.
+fn delete_issues(
+    spec: &SubscriptionSpec,
+    prefix: Option<&gnmi::Path>,
+    deletes: &[gnmi::Path],
+    issues: &mut Vec<ProjectionIssue>,
+) {
+    for (index, delete) in deletes.iter().enumerate() {
+        match resolve(spec, prefix, Some(delete)) {
             Ok(path)
                 if spec
                     .mappings
@@ -138,8 +194,6 @@ pub(super) fn project(
             Ok(_) => {}
         }
     }
-
-    Ok(AcquisitionParts::new(payloads, issues))
 }
 
 fn payload(
@@ -164,6 +218,74 @@ fn model_error(error: &Invalid) -> AcquisitionFailure {
     AcquisitionFailure::new(AcquisitionFailureClass::Internal)
         .with_retryable(false)
         .with_detail(format!("gNMI projection model error: {error}"))
+}
+
+fn state_payload(
+    observations: Vec<StateObservation>,
+) -> Result<(Coverage, Payload), AcquisitionFailure> {
+    let states = States::builder()
+        .observations(observations)
+        .build()
+        .map_err(|error| model_error(&error))?;
+
+    // A notification can omit unchanged leaves, so its state coverage is partial.
+    let coverage = Coverage::builder()
+        .completeness(Completeness::Partial)
+        .build()
+        .map_err(|error| model_error(&error))?;
+
+    Ok((coverage, Payload::States(states)))
+}
+
+/// Returns `Ok(None)` when a value does not match the mapping, so the caller can
+/// record a projection issue. Errors building the observation fail the acquisition.
+fn state(
+    target: &StateTarget,
+    value_type: &StateType,
+    value: Option<Value>,
+    observed_at: Timestamp,
+) -> Result<Option<StateObservation>, AcquisitionFailure> {
+    let value = match (value_type, value) {
+        (StateType::Boolean, Some(Value::BoolVal(value))) => Some(ModelValue::bool(value)),
+        (StateType::Boolean, Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes))) => {
+            serde_json::from_slice::<bool>(&bytes)
+                .ok()
+                .map(ModelValue::bool)
+        }
+        (StateType::Enum(values), value) => {
+            let value = match value {
+                Some(Value::StringVal(value)) => Some(value),
+                Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes)) => {
+                    serde_json::from_slice::<String>(&bytes).ok()
+                }
+                _ => None,
+            };
+
+            value
+                .filter(|value| values.binary_search(value).is_ok())
+                .and_then(|value| ModelValue::string(value).ok())
+        }
+        _ => None,
+    };
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let mut builder = StateObservation::builder()
+        .subject(target.subject.clone())
+        .name(target.name.clone())
+        .value(value)
+        .observed_at(observed_at);
+
+    if let Some(facet) = &target.facet {
+        builder = builder.facet(facet.clone());
+    }
+
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| model_error(&error))
 }
 
 fn resolve(
