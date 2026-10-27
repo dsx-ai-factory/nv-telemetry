@@ -15,10 +15,11 @@
 //! into logs batches under the event service's own scope.
 //!
 //! Transport is the embedder's: it implements [`RedfishTransport`] over its
-//! own HTTP client and classifies its own failures, and every provider of
-//! one endpoint reads through that endpoint's [`RedfishService`]. nv-redfish
-//! decodes, navigates, and repairs behind it, its platform classified once
-//! per endpoint, and none of its types is part of this crate's API, so its
+//! own HTTP client, reporting what went wrong as a [`TransportFault`] whose
+//! meaning is this crate's policy, and every provider of one endpoint reads
+//! through that endpoint's [`RedfishService`]. nv-redfish decodes,
+//! navigates, and repairs behind it, its platform classified per endpoint
+//! and again after the endpoint fails, and none of its types is part of this crate's API, so its
 //! releases never force one of this crate's.
 //!
 //! Projection is *declared* in `manifests/` and compiled into
@@ -40,7 +41,7 @@ mod stream;
 mod transport;
 mod uri;
 
-pub use failure::classify_status;
+pub use failure::TransportFault;
 pub use provider::ChassisKind;
 pub use provider::ChassisRead;
 pub use provider::FirmwareKind;

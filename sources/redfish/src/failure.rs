@@ -5,10 +5,10 @@
 //!
 //! The contract owns the class *semantics* (connectivity and authentication
 //! may trip the endpoint breaker; unsupported and protocol failures scope
-//! to their request class). The embedder's transport classifies its own
-//! client's failures, with the HTTP status table here; this module
-//! classifies what happens past the transport: a document that does not
-//! match its type, and nv-redfish's own refusals.
+//! to their request class). The embedder's transport says what happened, as
+//! a [`TransportFault`]; this module decides what it means, and classifies
+//! what happens past the transport: a document that does not match its
+//! type, and nv-redfish's own refusals.
 
 use nv_redfish::core::RepairError;
 use nv_telemetry_source::AcquisitionFailure;
@@ -23,8 +23,118 @@ pub(crate) trait ClassifyError {
     fn classify(&self) -> AcquisitionFailure;
 }
 
-/// Classifies an HTTP status the endpoint answered with: the table a
-/// [`crate::RedfishTransport`] uses for its client's status errors.
+/// What went wrong between a [`crate::RedfishTransport`] and the service:
+/// the facts an embedder's client knows. Their class, retryability, and
+/// detail are this crate's policy, so every embedder's failures trip the
+/// endpoint breaker, and only those, the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportFault {
+    /// No connection: refused, unreachable, or a failed TLS handshake.
+    Connect,
+    /// The request or its response did not finish in time.
+    Timeout,
+    /// The service answered with this HTTP error status.
+    Status(u16),
+    /// The response broke off partway.
+    Transfer,
+    /// The service's redirects could not be followed.
+    Redirect,
+    /// The response body was not JSON.
+    Body,
+    /// The request was never sent: the client's own construction, state,
+    /// or credentials failed.
+    Client,
+    /// The client's cache lost the entry a 304 revalidated.
+    CacheMiss,
+    /// The event stream's framing could not be decoded.
+    StreamDecode,
+    /// An event exceeded the client's frame bound.
+    StreamFrameTooLarge,
+    /// The event stream was silent past the client's idle window.
+    StreamIdle,
+}
+
+impl TransportFault {
+    /// The fault as the dispatcher acts on it.
+    // Arms that share an outcome stay separate: each carries its own
+    // rationale, and an embedder's fault must reach exactly one of them.
+    #[allow(clippy::match_same_arms)]
+    #[must_use]
+    pub fn classify(self) -> AcquisitionFailure {
+        let with = |class, retryable: bool, detail: &'static str| {
+            AcquisitionFailure::new(class)
+                .with_retryable(retryable)
+                .with_detail(detail)
+        };
+        match self {
+            Self::Connect => with(
+                AcquisitionFailureClass::Connectivity,
+                true,
+                "Redfish endpoint connection failed",
+            ),
+            Self::Timeout => with(
+                AcquisitionFailureClass::Timeout,
+                true,
+                "Redfish request timed out",
+            ),
+            Self::Status(status) => classify_status(status),
+            // Mid-body failures are plausibly transient.
+            Self::Transfer => with(
+                AcquisitionFailureClass::Protocol,
+                true,
+                "Redfish HTTP transfer failed",
+            ),
+            // A redirect loop is device misbehavior a retry repeats.
+            Self::Redirect => with(
+                AcquisitionFailureClass::Protocol,
+                false,
+                "Redfish redirect handling failed",
+            ),
+            Self::Body => with(
+                AcquisitionFailureClass::Protocol,
+                false,
+                "Redfish response was not JSON",
+            ),
+            Self::Client => with(
+                AcquisitionFailureClass::Internal,
+                false,
+                "Redfish client failed before sending",
+            ),
+            // A retry re-fetches and succeeds, but the cause is the
+            // client's cache sizing.
+            Self::CacheMiss => with(
+                AcquisitionFailureClass::Internal,
+                true,
+                "Redfish cache entry was unavailable",
+            ),
+            // None of the stream rows is endpoint-scoped: a stream that
+            // misbehaves says nothing about the endpoint's other request
+            // classes. An unfinished frame is retried by reopening; a frame
+            // over the client's bound comes back identical on resume.
+            Self::StreamDecode => with(
+                AcquisitionFailureClass::Protocol,
+                true,
+                "Redfish event stream could not be decoded",
+            ),
+            Self::StreamFrameTooLarge => with(
+                AcquisitionFailureClass::Protocol,
+                false,
+                "Redfish event exceeded the client's frame bound",
+            ),
+            // Heartbeat comments do not reset the idle clock, so an alive
+            // but quiet stream ends here too: the client's policy, not the
+            // endpoint's health.
+            Self::StreamIdle => with(
+                AcquisitionFailureClass::Protocol,
+                true,
+                "Redfish event stream idle beyond the client's window",
+            ),
+        }
+    }
+}
+
+/// An HTTP status the endpoint answered with.
 ///
 /// The one policy-laden row: **404 is `Unsupported`, not `Device`**.
 /// The right reaction to a planned URI vanishing is request-class demotion
@@ -35,8 +145,7 @@ pub(crate) trait ClassifyError {
 // Rows that share an outcome stay separate rows: each carries its own
 // rationale, and merging them would hide which statuses were considered.
 #[allow(clippy::match_same_arms)]
-#[must_use]
-pub fn classify_status(status: u16) -> AcquisitionFailure {
+fn classify_status(status: u16) -> AcquisitionFailure {
     let (class, retryable) = match status {
         401 | 403 => (AcquisitionFailureClass::Authentication, false),
         404 | 405 | 406 | 410 | 501 => (AcquisitionFailureClass::Unsupported, false),
@@ -59,17 +168,17 @@ pub fn classify_status(status: u16) -> AcquisitionFailure {
         .with_detail(format!("HTTP {status}"))
 }
 
-/// The link's failures: the embedder's classification stands, a document
-/// that did not match its type is a protocol answer, and a refused
-/// operation is this crate's bug.
+/// The link's failures: the transport's fault as its table says, a
+/// document that did not match its type as a protocol answer, and a refused
+/// write as this crate's bug.
 impl ClassifyError for LinkError {
     fn classify(&self) -> AcquisitionFailure {
         match self {
-            Self::Transport(failure) => failure.clone(),
+            Self::Transport(fault) => fault.classify(),
             Self::Decode(_) => schema_mismatch(),
             Self::Refused(_) => AcquisitionFailure::new(AcquisitionFailureClass::Internal)
                 .with_retryable(false)
-                .with_detail("a read asked the transport for an operation it never performs"),
+                .with_detail("a write was asked of a read-only Redfish transport"),
         }
     }
 }
@@ -167,17 +276,46 @@ mod tests {
         use nv_redfish::core::RepairError;
 
         use super::ClassifyError;
+        use super::TransportFault;
         use crate::transport::LinkError;
 
-        // The embedder's classification stands.
-        let refused = classify_status(501);
-        let transport = RepairError::Transport(LinkError::Transport(refused.clone())).classify();
-        assert_eq!(transport, refused);
+        let transport =
+            RepairError::Transport(LinkError::Transport(TransportFault::Status(501))).classify();
+        assert_eq!(transport, classify_status(501));
 
         let undecodable = decode::<u32>(serde_json::json!("not a number")).unwrap_err();
         let decode = RepairError::<LinkError>::Decode(undecodable).classify();
         assert_eq!(decode.class(), AcquisitionFailureClass::Protocol);
         assert_eq!(decode.retryable(), Some(false));
         assert!(!decode.class().is_endpoint_scoped());
+    }
+
+    #[test]
+    fn only_an_unreachable_endpoint_trips_its_breaker() {
+        use super::TransportFault;
+
+        for fault in [
+            TransportFault::Connect,
+            TransportFault::Timeout,
+            TransportFault::Status(401),
+        ] {
+            assert!(fault.classify().class().is_endpoint_scoped(), "{fault:?}");
+        }
+        // A stream that ends, overflows, or idles out says nothing about the
+        // endpoint's other request classes.
+        for fault in [
+            TransportFault::StreamDecode,
+            TransportFault::StreamFrameTooLarge,
+            TransportFault::StreamIdle,
+            TransportFault::Transfer,
+            TransportFault::Client,
+        ] {
+            assert!(!fault.classify().class().is_endpoint_scoped(), "{fault:?}");
+        }
+        assert_eq!(
+            TransportFault::StreamFrameTooLarge.classify().retryable(),
+            Some(false),
+            "the same frame comes back on resume"
+        );
     }
 }

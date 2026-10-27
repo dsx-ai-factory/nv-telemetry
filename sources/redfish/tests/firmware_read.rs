@@ -340,7 +340,7 @@ async fn a_member_the_device_would_not_serve_is_recorded_and_the_batch_is_partia
         acquired.issues(),
         &[ProjectionIssue::invalid(
             "Members[1]",
-            "member not read (Unsupported): Redfish mock answered not supported"
+            "member not read (Unsupported): HTTP 501"
         )]
     );
 }
@@ -574,6 +574,53 @@ async fn another_platforms_layer_leaves_the_dell_date_unread() {
     );
     assert_eq!(acquired.issues().len(), 1);
     assert_eq!(acquired.issues()[0].path(), "Members[0]");
+}
+
+#[tokio::test]
+async fn an_endpoint_that_failed_is_classified_again() {
+    // A BMC back from a reboot may run new firmware, so once the endpoint
+    // itself failed, the next read classifies it from its root afresh.
+    let bmc = Arc::new(Bmc::<Error>::default());
+    let round = [
+        (SERVICE, UPDATE_SERVICE),
+        (INVENTORY, INVENTORY_TWO),
+        (BMC, ITEM_DELL_RELEASE_DATE),
+        (BIOS, ITEM_MINIMAL),
+    ];
+    for answer in answers(&round) {
+        bmc.expect(answer);
+    }
+    bmc.expect(Expect {
+        request: ExpectedRequest::Get {
+            id: SERVICE.to_owned().into(),
+        },
+        response: Err(Error::HttpStatus(401)),
+    });
+    bmc.expect(Expect::get(
+        "/redfish/v1",
+        include_str!("fixtures/logs/service-root.json"),
+    ));
+    for answer in answers(&round) {
+        bmc.expect(answer);
+    }
+    let read = FirmwareRead::new(endpoint(), SERVICE, support::platform(&bmc, ROOT_DELL));
+
+    let dell = run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+    assert_eq!(dell.issues(), &[], "Dell's repair applies");
+
+    let denied = run_acquisition(&read, at())
+        .await
+        .expect_err("the credentials were refused");
+    assert_eq!(denied.class(), AcquisitionFailureClass::Authentication);
+
+    // The root now names no vendor, so Dell's repair no longer applies.
+    let after = run_acquisition(&read, at())
+        .await
+        .expect("the device answered");
+    assert_eq!(after.issues().len(), 1);
+    assert_eq!(after.issues()[0].path(), "Members[0]");
 }
 
 #[tokio::test]

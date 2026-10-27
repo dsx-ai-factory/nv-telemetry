@@ -14,8 +14,7 @@ use nv_telemetry_redfish::EventFrames;
 use nv_telemetry_redfish::RedfishService;
 use nv_telemetry_redfish::RedfishTransport;
 use nv_telemetry_redfish::SseEvent;
-use nv_telemetry_source::AcquisitionFailure;
-use nv_telemetry_source::AcquisitionFailureClass;
+use nv_telemetry_redfish::TransportFault;
 use serde_json::Value;
 
 /// A service root naming no vendor: a platform without repairs.
@@ -44,26 +43,22 @@ pub(crate) fn platform(bmc: &Arc<Bmc<Error>>, root: &str) -> Arc<RedfishService<
     }))
 }
 
-/// A mock failure is a harness failure, `Internal`, except a response
-/// scripted as `NotSupported`, which stands for the device answering 501.
-fn classify(error: &Error) -> AcquisitionFailure {
-    if let Error::ErrorResponse(inner) = error {
-        let refused = inner
-            .downcast_ref::<Error>()
-            .is_some_and(|error| matches!(error, Error::NotSupported));
-        if refused {
-            return AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
-                .with_retryable(false)
-                .with_detail("Redfish mock answered not supported");
-        }
+/// A scripted status is the service answering it, `NotSupported` stands
+/// for a 501, and any other mock failure is the harness's own.
+fn fault(error: &Error) -> TransportFault {
+    let scripted = match error {
+        Error::ErrorResponse(inner) => inner.downcast_ref::<Error>(),
+        other => Some(other),
+    };
+    match scripted {
+        Some(Error::HttpStatus(status)) => TransportFault::Status(*status),
+        Some(Error::NotSupported) => TransportFault::Status(501),
+        _ => TransportFault::Client,
     }
-    AcquisitionFailure::new(AcquisitionFailureClass::Internal)
-        .with_retryable(false)
-        .with_detail("Redfish mock transport failed")
 }
 
 impl RedfishTransport for MockTransport {
-    async fn get(&self, uri: &str) -> Result<Value, AcquisitionFailure> {
+    async fn get(&self, uri: &str) -> Result<Value, TransportFault> {
         if uri == "/redfish/v1" {
             let root = self.root.lock().expect("not poisoned").take();
             if let Some(root) = root {
@@ -74,7 +69,7 @@ impl RedfishTransport for MockTransport {
             .bmc
             .get::<Raw>(&ODataId::from(uri.to_owned()))
             .await
-            .map_err(|error| classify(&error))?;
+            .map_err(|error| fault(&error))?;
         Ok(raw.value().clone())
     }
 
@@ -82,16 +77,16 @@ impl RedfishTransport for MockTransport {
         &self,
         uri: &str,
         last_event_id: Option<&str>,
-    ) -> Result<EventFrames, AcquisitionFailure> {
+    ) -> Result<EventFrames, TransportFault> {
         let events = self
             .bmc
             .stream_events::<Value>(uri, last_event_id)
             .await
-            .map_err(|error| classify(&error))?;
+            .map_err(|error| fault(&error))?;
         Ok(Box::pin(events.map(|event| {
             event
                 .map(|event| SseEvent::new(event.last_event_id, event.data))
-                .map_err(|error| classify(&error))
+                .map_err(|error| fault(&error))
         })))
     }
 }
