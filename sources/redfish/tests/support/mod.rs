@@ -20,12 +20,24 @@ use serde_json::Value;
 /// A service root naming no vendor: a platform without repairs.
 const SPEC_ROOT: &str = include_str!("../fixtures/logs/service-root.json");
 
-/// The scripted mock as an embedder's transport. The first service root
-/// read, the one that classifies the platform, is answered out of the
-/// script, so each test scripts only what its provider reads.
+/// The scripted mock as an embedder's transport. Over a [`platform`], the
+/// first service root read, the one that classifies the platform, is
+/// answered out of the script, so each test scripts only what its provider
+/// reads.
 pub(crate) struct MockTransport {
     bmc: Arc<Bmc<Error>>,
     root: Mutex<Option<Value>>,
+}
+
+impl MockTransport {
+    /// Every read scripted, the service root included: an event stream
+    /// classifies from the root each open reads.
+    pub(crate) fn scripted(bmc: &Arc<Bmc<Error>>) -> Self {
+        Self {
+            bmc: Arc::clone(bmc),
+            root: Mutex::new(None),
+        }
+    }
 }
 
 /// The service over `bmc`, on a platform without repairs.
@@ -35,12 +47,10 @@ pub(crate) fn service(bmc: &Arc<Bmc<Error>>) -> Arc<RedfishService<MockTransport
 
 /// The service over `bmc`, on the platform `root` names.
 pub(crate) fn platform(bmc: &Arc<Bmc<Error>>, root: &str) -> Arc<RedfishService<MockTransport>> {
-    Arc::new(RedfishService::new(MockTransport {
-        bmc: Arc::clone(bmc),
-        root: Mutex::new(Some(
-            serde_json::from_str(root).expect("a service root fixture is JSON"),
-        )),
-    }))
+    let transport = MockTransport::scripted(bmc);
+    *transport.root.lock().expect("not poisoned") =
+        Some(serde_json::from_str(root).expect("a service root fixture is JSON"));
+    Arc::new(RedfishService::new(transport))
 }
 
 /// A scripted status is the service answering it, `NotSupported` stands

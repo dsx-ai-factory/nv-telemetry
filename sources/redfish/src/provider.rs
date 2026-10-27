@@ -106,15 +106,22 @@ mod sealed {
 }
 
 /// How a kind reads one target: fetch, project, assemble. The hook receives
-/// the transport, the target, and the requested location string, which
-/// generated subject matchers canonicalize before deriving identity, so
-/// identity never comes from the payload's own claim.
+/// the transport, the target, the requested location string, and when the
+/// acquisition started. Generated subject matchers canonicalize the location
+/// before deriving identity, so identity never comes from the payload's own
+/// claim.
 trait Fetch: ReadKind {
+    /// Whether the kind walks a collection under [`WalkBudget::DEFAULT`],
+    /// whose deadline then bounds the whole acquisition. A read of one
+    /// document is bounded by its transport.
+    const WALKS: bool = false;
+
     fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         location: &str,
         state: &Self::State,
+        started: Instant,
     ) -> impl Future<Output = Result<AcquisitionParts, AcquisitionFailure>> + Send
     where
         B: Bmc,
@@ -122,11 +129,28 @@ trait Fetch: ReadKind {
 }
 
 /// A read through the endpoint's service, its platform classified first.
+/// A walk's budget and deadline count from before the classification, so a
+/// slow service root shortens the walk instead of outlasting the deadline.
 async fn perform<T: RedfishTransport, K: Fetch>(
     read: &Read<T, K>,
 ) -> Result<AcquisitionParts, AcquisitionFailure> {
-    let bmc = read.service.compat().await?;
-    K::acquire(&bmc, &read.target, &read.location, read.state.as_ref()).await
+    let started = Instant::now();
+    let acquisition = async {
+        let bmc = read.service.compat().await?;
+        K::acquire(
+            &bmc,
+            &read.target,
+            &read.location,
+            read.state.as_ref(),
+            started,
+        )
+        .await
+    };
+    if K::WALKS {
+        with_deadline(WalkBudget::DEFAULT.deadline(), acquisition).await
+    } else {
+        acquisition.await
+    }
 }
 
 /// What one kind of read is: its provider identity, and how a target on an
@@ -312,6 +336,7 @@ impl Fetch for SensorKind {
         target: &ODataId,
         location: &str,
         (): &(),
+        _: Instant,
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
@@ -380,6 +405,7 @@ impl Fetch for ChassisKind {
         target: &ODataId,
         location: &str,
         (): &(),
+        _: Instant,
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
@@ -452,35 +478,33 @@ impl sealed::Sealed for FirmwareKind {
 }
 
 impl Fetch for FirmwareKind {
+    const WALKS: bool = true;
+
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         _location: &str,
         (): &(),
+        started: Instant,
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
         B::Error: ClassifyError,
     {
-        let budget = WalkBudget::DEFAULT;
-        with_deadline(budget.deadline(), async {
-            let started = Instant::now();
-            let service = bmc
-                .get::<UpdateService>(target)
-                .await
-                .map_err(|error| error.classify())?;
-            let scope = update_service_scope(&service.id)?;
-            let Some(collection) = &service.firmware_inventory else {
-                return Err(
-                    AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
-                        .with_retryable(false)
-                        .with_detail("update service has no firmware inventory"),
-                );
-            };
-            let walk = walk_firmware(bmc, collection.id(), budget, started).await?;
-            assemble_firmware(walk, scope).map_err(|error| internal_bug(&error))
-        })
-        .await
+        let service = bmc
+            .get::<UpdateService>(target)
+            .await
+            .map_err(|error| error.classify())?;
+        let scope = update_service_scope(&service.id)?;
+        let Some(collection) = &service.firmware_inventory else {
+            return Err(
+                AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
+                    .with_retryable(false)
+                    .with_detail("update service has no firmware inventory"),
+            );
+        };
+        let walk = walk_firmware(bmc, collection.id(), WalkBudget::DEFAULT, started).await?;
+        assemble_firmware(walk, scope).map_err(|error| internal_bug(&error))
     }
 }
 
@@ -717,7 +741,7 @@ fn assemble_firmware(walk: FirmwareWalk, scope: Subject) -> Result<AcquisitionPa
 /// Neither bound covers the collection response the transport decodes; that
 /// is the transport's response-size limit, which nv-redfish 0.16's typed API
 /// does not expose here. A successful batch is `PARTIAL`, and the next poll
-/// starts where this one ended: the read keeps a [`LogCursor`], so a poll
+/// starts where this one ended: the read keeps a cursor, so a poll
 /// ships the entries that arrived since the last one shipped, and the budget
 /// caps how many new entries one poll may carry. Records ride one `Logs`
 /// batch per bound's worth; the issues envelope's own bound is kept by
@@ -1231,17 +1255,19 @@ impl sealed::Sealed for LogKind {
 }
 
 impl Fetch for LogKind {
+    const WALKS: bool = true;
+
     async fn acquire<B>(
         bmc: &B,
         target: &ODataId,
         location: &str,
         cursor: &LogCursor,
+        started: Instant,
     ) -> Result<AcquisitionParts, AcquisitionFailure>
     where
         B: Bmc,
         B::Error: ClassifyError,
     {
-        let started = Instant::now();
         // One walk of this read at a time. A poll that finds one in flight
         // does not queue behind it, holding the endpoint's admission slot
         // for the other walk's duration: it ships nothing, says so, and the
@@ -1255,69 +1281,66 @@ impl Fetch for LogKind {
                 )],
             ));
         };
-        with_deadline(WalkBudget::DEFAULT.deadline(), async {
-            // Whether the device filters is worth asking only once there is
-            // a stamp to filter by: the first walk reads the whole window
-            // regardless.
-            let filter = if position.is_some() {
-                cursor.filter_support(bmc).await?
-            } else {
-                FilterSupport::Unknown
-            };
-            let service = bmc
-                .get::<LogService>(target)
-                .await
-                .map_err(|error| error.classify())?;
-            // A service without an entries collection cannot serve what was
-            // asked of it: a request-scoped fact about this resource, not a
-            // document field that failed to project.
-            let Some(entries) = &service.entries else {
-                return Err(
-                    AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
-                        .with_retryable(false)
-                        .with_detail("the log service carries no Entries collection"),
-                );
-            };
-            let scope = service_scope(location, &service.id)?;
-            // A filter by stamp presumes the device's clock has not moved
-            // back past the cursor's second. A service whose own clock reads
-            // earlier says it has, and this poll walks the head, which
-            // places by position; the cursor then follows what shipped, so
-            // the next filter asks from the stepped-back time.
-            let filter = if clock_behind(&service, position.as_ref()) {
-                FilterSupport::Absent
-            } else {
-                filter
-            };
-            let mut walk = walk_entries(
-                bmc,
-                entries.id(),
-                WalkBudget::DEFAULT,
-                started,
-                position.as_ref(),
-                filter,
-            )
-            .await?;
-            if walk.filter_refused {
-                // Said once, on the poll that learned it: the read stops
-                // asking, and an operator can tell the fallback from a
-                // device that never advertised.
-                cursor.refuse_filter();
-                walk.issues.push(ProjectionIssue::invalid(
-                    FILTER_REFUSED_LOCATOR,
-                    "the device refused the $filter its service root advertises; this log is \
-                     read by $skip from now on",
-                ));
-            }
-            let parts = assemble_logs(walk.records, walk.issues, scope)
-                .map_err(|error| internal_bug(&error))?;
-            // The acquisition is now certain to ship; a walk that failed or
-            // was cancelled before this point leaves the cursor where the
-            // last shipped walk put it.
-            *position = walk.position;
-            Ok(parts)
-        })
-        .await
+        // Whether the device filters is worth asking only once there is
+        // a stamp to filter by: the first walk reads the whole window
+        // regardless.
+        let filter = if position.is_some() {
+            cursor.filter_support(bmc).await?
+        } else {
+            FilterSupport::Unknown
+        };
+        let service = bmc
+            .get::<LogService>(target)
+            .await
+            .map_err(|error| error.classify())?;
+        // A service without an entries collection cannot serve what was
+        // asked of it: a request-scoped fact about this resource, not a
+        // document field that failed to project.
+        let Some(entries) = &service.entries else {
+            return Err(
+                AcquisitionFailure::new(AcquisitionFailureClass::Unsupported)
+                    .with_retryable(false)
+                    .with_detail("the log service carries no Entries collection"),
+            );
+        };
+        let scope = service_scope(location, &service.id)?;
+        // A filter by stamp presumes the device's clock has not moved
+        // back past the cursor's second. A service whose own clock reads
+        // earlier says it has, and this poll walks the head, which
+        // places by position; the cursor then follows what shipped, so
+        // the next filter asks from the stepped-back time.
+        let filter = if clock_behind(&service, position.as_ref()) {
+            FilterSupport::Absent
+        } else {
+            filter
+        };
+        let mut walk = walk_entries(
+            bmc,
+            entries.id(),
+            WalkBudget::DEFAULT,
+            started,
+            position.as_ref(),
+            filter,
+        )
+        .await?;
+        if walk.filter_refused {
+            // Said once, on the poll that learned it: the read stops
+            // asking, and an operator can tell the fallback from a
+            // device that never advertised.
+            cursor.refuse_filter();
+            walk.issues.push(ProjectionIssue::invalid(
+                FILTER_REFUSED_LOCATOR,
+                "the device refused the $filter its service root advertises; this log is \
+                 read by $skip from now on",
+            ));
+        }
+        let parts = assemble_logs(walk.records, walk.issues, scope)
+            .map_err(|error| internal_bug(&error))?;
+        // The acquisition is now certain to ship; a walk that failed or
+        // was cancelled before this point leaves the cursor where the
+        // last shipped walk put it.
+        *position = walk.position;
+        Ok(parts)
     }
 }
 
@@ -1872,9 +1895,10 @@ impl Position {
     }
 }
 
-/// Cancels the whole acquisition, including initial GETs, when its deadline
-/// expires. The timer is executor-independent. As with any async timeout, a
-/// transport must yield; synchronous decoding cannot be preempted here.
+/// Cancels the whole acquisition, the platform's classification and initial
+/// GETs included, when its deadline expires. The timer is
+/// executor-independent. As with any async timeout, a transport must yield;
+/// synchronous decoding cannot be preempted here.
 async fn with_deadline<T>(
     elapsed: Duration,
     work: impl Future<Output = Result<T, AcquisitionFailure>>,
@@ -2307,9 +2331,10 @@ mod tests {
         // poll that finds it held asks the device nothing — the strict mock
         // would fail it — and reports the overlap instead.
         let in_flight = cursor.position.lock().await;
-        let skipped = <LogKind as Fetch>::acquire(&bmc, &target, SERVICE, &cursor)
-            .await
-            .expect("an overlapping poll is not a failure");
+        let skipped =
+            <LogKind as Fetch>::acquire(&bmc, &target, SERVICE, &cursor, std::time::Instant::now())
+                .await
+                .expect("an overlapping poll is not a failure");
         assert!(skipped.payloads().is_empty());
         assert_eq!(skipped.issues().len(), 1);
         assert_eq!(skipped.issues()[0].path(), super::IN_FLIGHT_WALK_LOCATOR);
@@ -2323,7 +2348,7 @@ mod tests {
             )],
         );
         prime(&bmc, &whole_log(0..2));
-        <LogKind as Fetch>::acquire(&bmc, &target, SERVICE, &cursor)
+        <LogKind as Fetch>::acquire(&bmc, &target, SERVICE, &cursor, std::time::Instant::now())
             .await
             .expect("the next poll walks");
         assert!(
@@ -3114,9 +3139,15 @@ mod tests {
         cursor: &super::LogCursor,
     ) -> nv_telemetry_source::AcquisitionParts {
         const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
-        <LogKind as Fetch>::acquire(bmc, &SERVICE.to_owned().into(), SERVICE, cursor)
-            .await
-            .expect("the poll completes")
+        <LogKind as Fetch>::acquire(
+            bmc,
+            &SERVICE.to_owned().into(),
+            SERVICE,
+            cursor,
+            std::time::Instant::now(),
+        )
+        .await
+        .expect("the poll completes")
     }
 
     /// `acquire_parts`, as how many payloads shipped.

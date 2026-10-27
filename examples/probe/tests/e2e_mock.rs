@@ -400,7 +400,9 @@ fn a_mocked_endpoint_streams_events_end_to_end() {
         .build()
         .expect("a valid endpoint");
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
-    let service = service(&bmc);
+    // The root a connect reads classifies the platform too, so the script
+    // holds no separate one.
+    let service = Arc::new(RedfishService::new(BmcTransport::new(Arc::clone(&bmc))));
     // One connect attempt asks for the root, then the event service, then
     // the stream, which the mock ends after its scripted payloads. The
     // reconnect the runtime schedules asks the same three, the stream now

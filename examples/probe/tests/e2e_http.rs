@@ -91,16 +91,18 @@ async fn standalone_http_boundary() {
     log_cursor(&server, &resources).await;
     events(&server, &resources).await;
 
+    let slow = json!({"Latency": {"mean": "20s", "jitter": "0ms"}});
     server
-        .rules(&[rule(
-            "deadline",
-            &resources.log,
-            json!({"Latency": {"mean": "35s", "jitter": "0ms"}}),
-        )])
+        .rules(&[
+            rule("deadline-root", "/redfish/v1", slow.clone()),
+            rule("deadline-log", &resources.log, slow),
+        ])
         .await;
     // The walk's deadline is its 30 s time budget plus the headroom for the
-    // request in flight; the injected 35 s latency outlasts both, and the
-    // harness waits a little beyond the deadline for the classified failure.
+    // request in flight, counted from before the fresh service classifies
+    // the platform: the root and the log service, slowed 20 s each, outlast
+    // it together but neither alone, and the harness waits a little beyond
+    // the deadline for the classified failure.
     let started = Instant::now();
     let failure = tokio::time::timeout(Duration::from_secs(40), logs(&server, &resources))
         .await

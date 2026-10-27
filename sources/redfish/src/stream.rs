@@ -57,14 +57,12 @@ use futures_util::StreamExt as _;
 use nv_redfish::core::repair::decode;
 use nv_redfish::core::BoxTryStream;
 use nv_redfish::core::NavProperty;
-use nv_redfish::core::ODataId;
 use nv_redfish::core::RepairError;
 use nv_redfish::core::StreamEvent;
 use nv_redfish::event_service::EventStreamPayload;
 use nv_redfish::quirks::CompatBmc;
 use nv_redfish::schema::event::Event;
 use nv_redfish::schema::event::EventRecord;
-use nv_redfish::schema::service_root::ServiceRoot;
 use nv_redfish::Bmc;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Invalid;
@@ -87,6 +85,7 @@ use crate::transport::Link;
 use crate::transport::LinkError;
 use crate::transport::RedfishService;
 use crate::transport::RedfishTransport;
+use crate::transport::Root;
 
 /// The issue a stream raises when the device reports that events were
 /// dropped before this stream caught up.
@@ -336,12 +335,8 @@ impl<T: RedfishTransport> Acquire for EventStream<T> {
     }
 
     async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
-        let bmc = self.service.compat().await?;
-        let root = bmc
-            .get::<ServiceRoot>(&ODataId::service_root())
-            .await
-            .map_err(|error| error.classify())?;
-        let service = root
+        let Root { bmc, document } = self.service.root().await?;
+        let service = document
             .event_service
             .as_ref()
             .ok_or_else(|| unsupported("the service root advertises no EventService"))?

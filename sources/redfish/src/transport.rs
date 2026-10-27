@@ -41,6 +41,8 @@ use nv_redfish::core::StreamEvent;
 use nv_redfish::core::UploadReader;
 use nv_redfish::quirks::BmcQuirks;
 use nv_redfish::quirks::CompatBmc;
+use nv_redfish::quirks::RootEvidence;
+use nv_redfish::schema::service_root::ServiceRoot;
 use nv_redfish::Bmc;
 use nv_telemetry_source::AcquisitionFailure;
 use serde::Deserialize;
@@ -55,8 +57,9 @@ use crate::failure::TransportFault;
 ///
 /// URIs are the service's own `@odata.id` references, relative to the
 /// service, query options included as written (`$expand=*($levels=1)`,
-/// `$filter=Created gt '…'`): the client encodes them for the wire. A failure is reported as the fault the
-/// client saw; what it means for the endpoint is this crate's to decide.
+/// `$filter=Created gt '…'`): the client encodes them for the wire. A
+/// failure is reported as the fault the client saw; what it means for the
+/// endpoint is this crate's to decide.
 pub trait RedfishTransport: Send + Sync + 'static {
     /// The document at `uri`, as the service sent it.
     fn get(&self, uri: &str) -> impl Future<Output = Result<Value, TransportFault>> + Send;
@@ -65,7 +68,11 @@ pub trait RedfishTransport: Send + Sync + 'static {
     /// `last_event_id` (sent as `Last-Event-ID`) when one is given.
     ///
     /// Each item is one event's `data` with the SSE id in effect after it.
-    /// A failed item ends the stream for the provider reading it.
+    /// A failed item ends the stream for the provider reading it. Once the
+    /// stream is open its failures are its own: a body that breaks off is
+    /// [`TransportFault::Transfer`], and silence past the client's window is
+    /// [`TransportFault::StreamIdle`], never [`TransportFault::Timeout`],
+    /// which would trip the endpoint's breaker for every request class.
     fn events(
         &self,
         uri: &str,
@@ -106,7 +113,8 @@ impl SseEvent {
 /// read's failure, and the next read tries again. A fault that indicts the
 /// endpoint — unreachable, timed out, or refusing the credentials — drops
 /// the classification, so the first read after a BMC comes back, perhaps on
-/// new firmware, classifies it afresh.
+/// new firmware, classifies it afresh; so does every event stream open, from
+/// the root it reads anyway.
 pub struct RedfishService<T> {
     link: Arc<Link<T>>,
 }
@@ -134,12 +142,42 @@ impl<T: RedfishTransport> RedfishService<T> {
         // an unreachable endpoint fail together rather than each waiting out
         // the one before it; two that both classify agree. The root is read
         // raw: a root that does not fully decode still names its vendor.
-        let compat = CompatBmc::classify(Arc::clone(&self.link))
+        let root = self
+            .link
+            .document(&ODataId::service_root())
             .await
             .map_err(|error| error.classify())?;
-        self.link.platform.set(Arc::clone(compat.quirks()));
-        Ok(compat)
+        Ok(self.classified(&root))
     }
+
+    /// The service root, read once: the platform is classified afresh from
+    /// it, and it is then repaired for that platform like any other document.
+    pub(crate) async fn root(&self) -> Result<Root<T>, AcquisitionFailure> {
+        let root = self
+            .link
+            .document(&ODataId::service_root())
+            .await
+            .map_err(|error| error.classify())?;
+        let bmc = self.classified(&root);
+        let document = bmc
+            .decode(root)
+            .map_err(|error| LinkError::Decode(error).classify())?;
+        Ok(Root { bmc, document })
+    }
+
+    /// The layer for the platform `root` names, kept for the reads after.
+    fn classified(&self, root: &Value) -> CompatBmc<Link<T>> {
+        let quirks = Arc::new(BmcQuirks::classify(&RootEvidence::from_root(root)));
+        self.link.platform.set(Arc::clone(&quirks));
+        CompatBmc::new(Arc::clone(&self.link), quirks)
+    }
+}
+
+/// The service root, decoded for its platform, and the layer that platform
+/// puts over the transport.
+pub(crate) struct Root<T: RedfishTransport> {
+    pub(crate) bmc: CompatBmc<Link<T>>,
+    pub(crate) document: ServiceRoot,
 }
 
 impl<T> fmt::Debug for RedfishService<T> {

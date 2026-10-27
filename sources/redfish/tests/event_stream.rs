@@ -19,6 +19,7 @@ use nv_telemetry_model::Severity;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value;
 use nv_telemetry_redfish::EventStream;
+use nv_telemetry_redfish::RedfishService;
 use nv_telemetry_redfish::GAP_LOCATOR;
 use nv_telemetry_redfish::METRIC_REPORT_LOCATOR;
 use nv_telemetry_redfish::PAYLOAD_LOCATOR;
@@ -30,6 +31,7 @@ use nv_telemetry_source::ProjectionIssue;
 use nv_telemetry_source::SubscriptionItem;
 use serde_json::json;
 use serde_json::Value as Json;
+use support::MockTransport;
 
 const ROOT: &str = "/redfish/v1";
 const EVENT_SERVICE: &str = "/redfish/v1/EventService";
@@ -40,6 +42,12 @@ fn endpoint() -> EndpointContext {
         .endpoint_id("bmc-lab-07")
         .build()
         .expect("a valid endpoint")
+}
+
+/// The service over `bmc`, the service root scripted too: a stream reads it
+/// on every open.
+fn scripted(bmc: &Arc<Bmc<nv_redfish_bmc_mock::Error>>) -> Arc<RedfishService<MockTransport>> {
+    Arc::new(RedfishService::new(MockTransport::scripted(bmc)))
 }
 
 /// An `Event` payload with one record, as the mock's lifecycle events are
@@ -109,7 +117,7 @@ async fn open(payloads: &[Json]) -> Vec<SubscriptionItem> {
         include_str!("fixtures/events/event-service.json"),
     ));
     bmc.expect(Expect::stream(SSE, Json::Array(payloads.to_vec())));
-    let stream = EventStream::new(endpoint(), support::service(&bmc));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     let items = stream.perform().await.expect("the stream opens");
     items.collect().await
 }
@@ -309,7 +317,7 @@ async fn a_payload_that_does_not_decode_still_moves_the_resume_position() {
         None,
         vec![(Some("7"), powered_on(7)), (Some("9"), undecodable())],
     );
-    let stream = EventStream::new(endpoint(), support::service(&bmc));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     let items: Vec<SubscriptionItem> = stream
         .perform()
         .await
@@ -380,7 +388,7 @@ async fn a_reconnect_resumes_after_the_last_id_in_the_same_run() {
         vec![(Some("7"), powered_on(7)), (Some("8"), powered_on(8))],
     );
     expect_connect(&bmc, Some("8"), vec![(Some("9"), powered_on(9))]);
-    let stream = EventStream::new(endpoint(), support::service(&bmc));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     assert_eq!(stream.resume_position(), None, "nothing read yet");
 
     // The first instance starts live; the id in effect after its last
@@ -435,7 +443,7 @@ async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
         ));
         bmc.expect(Expect::stream(SSE, Json::Array(vec![powered_on(7)])));
     }
-    let stream = EventStream::new(endpoint(), support::service(&bmc));
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
     let first: Vec<SubscriptionItem> = stream
         .perform()
         .await
@@ -454,11 +462,8 @@ async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
 
 #[tokio::test]
 async fn a_root_without_an_event_service_cannot_stream() {
+    // The service's own root names no event service.
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
-    bmc.expect(Expect::get(
-        ROOT,
-        include_str!("../tests/fixtures/logs/service-root.json"),
-    ));
     let stream = EventStream::new(endpoint(), support::service(&bmc));
     let error = stream
         .perform()

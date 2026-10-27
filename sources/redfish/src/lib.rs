@@ -46,7 +46,6 @@ pub use provider::ChassisKind;
 pub use provider::ChassisRead;
 pub use provider::FirmwareKind;
 pub use provider::FirmwareRead;
-pub use provider::LogCursor;
 pub use provider::LogKind;
 pub use provider::LogRead;
 pub use provider::Read;
