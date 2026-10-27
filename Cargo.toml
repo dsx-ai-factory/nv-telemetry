@@ -89,6 +89,7 @@ futures-timer = "3"
 # `lock::Mutex` runs the polls of one log read one at a time without binding
 # the library to a runtime; the crate is already in the graph via nv-redfish.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http-body-util = "0.1"
 url = "2"
 
 # The one hand-written Redfish document shape: a raw entries page, read for

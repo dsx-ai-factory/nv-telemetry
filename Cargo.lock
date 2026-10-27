@@ -1090,10 +1090,17 @@ dependencies = [
 name = "nv-telemetry-gnmi"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "http-body-util",
+ "nv-redfish-dispatcher",
  "nv-telemetry-model",
+ "nv-telemetry-orchestration",
  "nv-telemetry-source",
  "prost",
  "prost-types",
+ "serde",
+ "serde_json",
+ "tokio",
  "tonic",
  "tonic-prost",
 ]

@@ -698,8 +698,9 @@ case that shows the difference. Its descriptor pool describes the transport
 envelope — `Notification`, `Update`, `Path`, `TypedValue` — not the data
 model. A path such as `/interfaces/interface[name=eth0]/state/counters`
 is defined by a YANG module, and the value's type comes from YANG rather than
-from the proto, so gNMI needs a generated index exactly as Redfish does. The
-descriptor-pool backend applies where the messages themselves are the model:
+from the proto, so schema-backed gNMI projections need a generated index exactly
+as Redfish does. The descriptor-pool backend applies where the messages themselves
+are the model:
 a subscription negotiated with PROTO encoding against generated types, or a
 gRPC telemetry API whose responses are the schema. Only there is type checking
 total.
@@ -1046,8 +1047,8 @@ the aggregate endpoints; they do not prove isolated features, because Cargo
 feature unification can otherwise hide unused code, missing dependencies, or a
 test-only feature leak.
 
-Every source crate has the same three parts — transport, projection manifests,
-and generated projection code — and only the first is hand-written. Its size
+Each schema-backed source crate has three parts: transport, projection manifests,
+and generated projection code. Only transport is hand-written. The crate's size
 tracks how messy the protocol is, which is why Redfish is the large one and a
 proto-described source is small.
 
