@@ -705,6 +705,11 @@ a subscription negotiated with PROTO encoding against generated types, or a
 gRPC telemetry API whose responses are the schema. Only there is type checking
 total.
 
+`gnmi.configured` uses caller-supplied paths, value types, and identities. Collection
+mappings can take subject components from received list keys. Configuration checks
+and model validation run without a YANG index; they do not establish path support
+or schema correctness. The provider requires leaf-addressed scalar updates.
+
 What being proto-native does buy is real but narrower: decode comes from the
 protobuf runtime rather than hand-written parsing, there is no vendor-leniency
 layer, and capability probing is a native call rather than an inference from

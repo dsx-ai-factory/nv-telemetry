@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -17,6 +18,7 @@ use nv_telemetry_model::SignalDescriptor;
 use nv_telemetry_model::SignalKey;
 use nv_telemetry_model::StateObservation;
 use nv_telemetry_model::States;
+use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
 use nv_telemetry_model::ValueKind;
@@ -29,8 +31,10 @@ use serde::de::DeserializeOwned;
 
 use crate::protocol::gnmi;
 use crate::protocol::gnmi::typed_value::Value;
+use crate::spec::CollectionTarget;
 use crate::spec::MappingKind;
 use crate::spec::StateType;
+use crate::Mapping;
 use crate::NumericType;
 use crate::PathElement;
 use crate::StateIdentity;
@@ -51,24 +55,12 @@ pub(super) fn project(
     )
     .map_err(|error| model_error(&error))?;
 
-    // Readings and states have separate limits, but all chunks from a notification
-    // belong to the same acquisition item.
-    let readings_limit =
-        limits::READINGS_SAMPLES_MAX_ITEMS.min(limits::READINGS_DESCRIPTORS_MAX_ITEMS) as usize;
-
-    let states_limit = limits::STATES_OBSERVATIONS_MAX_ITEMS as usize;
-
-    let mut payloads = Vec::new();
-    let mut descriptors = BTreeMap::new();
-    let mut samples = Vec::new();
-    let mut states = Vec::new();
     let mut issues = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut candidates = BTreeMap::new();
 
-    // gNMI uses only the final update for each path. Mark it seen before parsing
-    // its value so an invalid final value also suppresses earlier updates.
-    // Keep seen paths across payload splits, and enumerate before reversing to
-    // preserve the original update indexes in issues.
+    // Mark full concrete paths before decoding: an invalid final value suppresses
+    // earlier updates for that entry, without suppressing other list entries.
     for (index, update) in notification.update.into_iter().enumerate().rev() {
         let path = match resolve(spec, notification.prefix.as_ref(), update.path.as_ref()) {
             Ok(path) => path,
@@ -78,17 +70,8 @@ pub(super) fn project(
             }
         };
 
-        let Some(mapping) = spec
-            .mappings
-            .binary_search_by(|mapping| mapping.path.cmp(&path))
-            .ok()
-            .and_then(|index| spec.mappings.get(index))
-        else {
-            if spec
-                .mappings
-                .iter()
-                .any(|mapping| path.contains(&mapping.path))
-            {
+        let Some(mapping) = spec.mapping(&path) else {
+            if spec.mappings.iter().any(|mapping| mapping.covers(&path)) {
                 issues.push(
                     ProjectionIssue::invalid(
                         "path",
@@ -101,51 +84,190 @@ pub(super) fn project(
             continue;
         };
 
-        if !seen.insert(&mapping.path) {
+        if !seen.insert(path.clone()) {
             continue;
         }
 
-        let value = update.val.and_then(|value| value.value);
-
-        let issue = match &mapping.kind {
-            MappingKind::Reading {
-                descriptor,
-                numeric_type,
-            } => {
-                if let Some(sample) = reading(descriptor, *numeric_type, value, observed_at)? {
-                    descriptors
-                        .entry(descriptor.key().clone())
-                        .or_insert_with(|| descriptor.clone());
-
-                    samples.push(sample);
-                    None
-                } else {
-                    Some("value does not match the declared type or exceeds the model limit")
-                }
-            }
-            MappingKind::State { target, value_type } => {
-                if let Some((state, unknown)) = state(target, value_type, value, observed_at)? {
-                    states.push(state);
-                    unknown.then_some("enum value is not listed; value was collected unchanged")
-                } else {
-                    Some("value does not match the declared type or exceeds the model limit")
-                }
-            }
+        let Some(projected) = project_value(
+            mapping,
+            &path,
+            update.val.and_then(|value| value.value),
+            observed_at,
+            index,
+            &mut issues,
+        )?
+        else {
+            continue;
         };
 
-        if let Some(detail) = issue {
-            issues.push(ProjectionIssue::invalid("val", detail).at_index("update", index));
-        }
+        // Resolve collisions before splitting payloads. A None entry keeps an
+        // identity excluded if another path produces it.
+        match candidates.entry(projected.identity()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some((index, projected)));
+            }
+            Entry::Occupied(mut entry) => {
+                if let Some((previous, _)) = entry.get_mut().take() {
+                    issues.push(
+                        ProjectionIssue::invalid(
+                            "path",
+                            "different paths produce the same observation identity",
+                        )
+                        .at_index("update", previous),
+                    );
+                }
 
-        if samples.len() == readings_limit {
-            payloads.push(payload(
-                std::mem::take(&mut descriptors),
-                std::mem::take(&mut samples),
-            )?);
+                issues.push(
+                    ProjectionIssue::invalid(
+                        "path",
+                        "different paths produce the same observation identity",
+                    )
+                    .at_index("update", index),
+                );
+            }
         }
+    }
 
-        if states.len() == states_limit {
-            payloads.push(state_payload(std::mem::take(&mut states))?);
+    let payloads = split_payloads(candidates.into_values().flatten().map(|(_, value)| value))?;
+
+    delete_issues(
+        spec,
+        notification.prefix.as_ref(),
+        &notification.delete,
+        &mut issues,
+    );
+
+    Ok(AcquisitionParts::new(payloads, issues))
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum OutputIdentity {
+    Reading(SignalKey),
+    State(Subject, Option<String>, String),
+}
+
+enum ProjectedObservation {
+    Reading(SignalDescriptor, Reading),
+    State(StateObservation),
+}
+
+impl ProjectedObservation {
+    fn identity(&self) -> OutputIdentity {
+        match self {
+            Self::Reading(descriptor, _) => OutputIdentity::Reading(descriptor.key().clone()),
+            Self::State(state) => OutputIdentity::State(
+                state.subject().clone(),
+                state.facet().map(str::to_owned),
+                state.name().to_owned(),
+            ),
+        }
+    }
+}
+
+fn project_value(
+    mapping: &Mapping,
+    path: &SubscriptionPath,
+    value: Option<Value>,
+    observed_at: Timestamp,
+    index: usize,
+    issues: &mut Vec<ProjectionIssue>,
+) -> Result<Option<ProjectedObservation>, AcquisitionFailure> {
+    let result = match &mapping.kind {
+        MappingKind::Reading {
+            descriptor,
+            numeric_type,
+        } => reading(descriptor, *numeric_type, value, observed_at)?.map(|sample| {
+            (
+                ProjectedObservation::Reading(descriptor.clone(), sample),
+                false,
+            )
+        }),
+        MappingKind::State { target, value_type } => state(target, value_type, value, observed_at)?
+            .map(|(state, unknown)| (ProjectedObservation::State(state), unknown)),
+        MappingKind::Collection {
+            subject: subject_template,
+            target,
+        } => {
+            let subject = match subject_template.build_subject(path, false) {
+                Ok(subject) => subject,
+                Err(detail) => {
+                    issues.push(ProjectionIssue::invalid("path", detail).at_index("update", index));
+                    return Ok(None);
+                }
+            };
+
+            match target {
+                CollectionTarget::Reading(template) => {
+                    let descriptor = template
+                        .descriptor(subject)
+                        .map_err(|error| model_error(&error))?;
+
+                    reading(&descriptor, template.numeric_type, value, observed_at)?
+                        .map(|sample| (ProjectedObservation::Reading(descriptor, sample), false))
+                }
+                CollectionTarget::State {
+                    template,
+                    value_type,
+                } => {
+                    let target = StateIdentity {
+                        subject,
+                        template: template.clone(),
+                    };
+
+                    state(&target, value_type, value, observed_at)?
+                        .map(|(state, unknown)| (ProjectedObservation::State(state), unknown))
+                }
+            }
+        }
+    };
+
+    let detail = match &result {
+        None => Some("value does not match the declared type or exceeds the model limit"),
+        Some((_, true)) => Some("enum value is not listed; value was collected unchanged"),
+        Some((_, false)) => None,
+    };
+
+    if let Some(detail) = detail {
+        issues.push(ProjectionIssue::invalid("val", detail).at_index("update", index));
+    }
+
+    Ok(result.map(|(projected, _)| projected))
+}
+
+fn split_payloads(
+    candidates: impl Iterator<Item = ProjectedObservation>,
+) -> Result<Vec<(Coverage, Payload)>, AcquisitionFailure> {
+    let readings_limit =
+        limits::READINGS_SAMPLES_MAX_ITEMS.min(limits::READINGS_DESCRIPTORS_MAX_ITEMS) as usize;
+
+    let states_limit = limits::STATES_OBSERVATIONS_MAX_ITEMS as usize;
+
+    let mut payloads = Vec::new();
+    let mut descriptors = BTreeMap::new();
+    let mut samples = Vec::new();
+    let mut states = Vec::new();
+
+    // Reading and state limits are independent; every chunk belongs to one item.
+    for candidate in candidates {
+        match candidate {
+            ProjectedObservation::Reading(descriptor, sample) => {
+                descriptors.insert(descriptor.key().clone(), descriptor);
+                samples.push(sample);
+
+                if samples.len() == readings_limit {
+                    payloads.push(payload(
+                        std::mem::take(&mut descriptors),
+                        std::mem::take(&mut samples),
+                    )?);
+                }
+            }
+            ProjectedObservation::State(state) => {
+                states.push(state);
+
+                if states.len() == states_limit {
+                    payloads.push(state_payload(std::mem::take(&mut states))?);
+                }
+            }
         }
     }
 
@@ -157,14 +279,7 @@ pub(super) fn project(
         payloads.push(state_payload(states)?);
     }
 
-    delete_issues(
-        spec,
-        notification.prefix.as_ref(),
-        &notification.delete,
-        &mut issues,
-    );
-
-    Ok(AcquisitionParts::new(payloads, issues))
+    Ok(payloads)
 }
 
 /// Reports deletes that name a mapped leaf or one of its ancestors.
@@ -177,12 +292,7 @@ fn delete_issues(
 ) {
     for (index, delete) in deletes.iter().enumerate() {
         match resolve(spec, prefix, Some(delete)) {
-            Ok(path)
-                if spec
-                    .mappings
-                    .iter()
-                    .any(|mapping| path.contains(&mapping.path)) =>
-            {
+            Ok(path) if spec.mappings.iter().any(|mapping| mapping.covers(&path)) => {
                 issues.push(
                     ProjectionIssue::invalid("", "mapped delete cannot remove prior observations")
                         .at_index("delete", index),

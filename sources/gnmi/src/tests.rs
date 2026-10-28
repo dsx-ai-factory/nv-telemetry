@@ -1665,3 +1665,699 @@ async fn stream_unit_reports_mixed_notifications_transitions_and_distinct_collec
         assert_eq!(state_count, usize::from(expected.is_some()));
     }
 }
+
+#[test]
+fn collection_subjects_use_full_path_keys_and_preserve_descriptor_metadata() {
+    let subject = SubjectTemplate::new("interface", IdentityValue::path_key(1, "name"))
+        .with_scope(vec![IdentityValue::literal("switch-a")]);
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["interfaces"])],
+        vec![Mapping::collection_reading(
+            path(&["interfaces", "interface", "state", "in-octets"]),
+            subject,
+            ReadingTemplate::new(NumericType::Uint)
+                .with_facet("in-octets")
+                .with_unit("By"),
+        )],
+    )
+    .expect("collection spec");
+
+    let updates = ["eth0", "eth1"].map(|name| {
+        let mut path = wire_path(&["interface", "state", "in-octets"]);
+        path.elem[0].key.insert("name".into(), name.into());
+        path.elem[0].key.insert("extra".into(), "ignored".into());
+
+        wire::Update {
+            path: Some(path),
+            val: Some(wire::TypedValue {
+                value: Some(Value::UintVal(u64::MAX)),
+            }),
+            ..Default::default()
+        }
+    });
+
+    let parts = projection::project(
+        &spec,
+        wire::Notification {
+            prefix: Some(wire_path(&["interfaces"])),
+            timestamp: 7_000_000_123,
+            update: updates.into(),
+            ..Default::default()
+        },
+    )
+    .expect("projection");
+
+    assert!(parts.issues().is_empty());
+
+    let Payload::Readings(readings) = &parts.payloads()[0].1 else {
+        panic!("readings")
+    };
+
+    assert_eq!(readings.samples().len(), 2);
+
+    let ids: BTreeSet<_> = readings
+        .descriptors()
+        .iter()
+        .map(|descriptor| {
+            assert_eq!(descriptor.unit(), Some("By"));
+            assert_eq!(descriptor.key().facet(), Some("in-octets"));
+            assert_eq!(descriptor.key().subject().scope(), &["switch-a"]);
+
+            descriptor.key().subject().id()
+        })
+        .collect();
+
+    assert_eq!(ids, BTreeSet::from(["eth0", "eth1"]));
+
+    assert!(readings
+        .samples()
+        .iter()
+        .all(|sample| sample.value() == &NumericValue::Uint(u64::MAX)
+            && sample.observed_at() == Some(&Timestamp::new(7, 123).unwrap())));
+}
+
+#[test]
+fn collection_configuration_rejects_bad_templates_and_overlapping_rules() {
+    let leaf = path(&["interfaces", "interface", "enabled"]);
+    let subject = SubjectTemplate::new("interface", IdentityValue::path_key(1, "name"));
+
+    let mapping = Mapping::collection_boolean_state(
+        leaf.clone(),
+        subject.clone(),
+        StateTemplate::new("enabled"),
+    );
+
+    let validate = |mappings| SubscriptionSpec::new(vec![path(&["interfaces"])], mappings);
+
+    for subject in [
+        SubjectTemplate::new("interface", IdentityValue::literal("fixed")),
+        SubjectTemplate::new("interface", IdentityValue::path_key(3, "name")),
+        SubjectTemplate::new("interface", IdentityValue::path_key(1, "")),
+        SubjectTemplate::new("interface", IdentityValue::path_key(1, "*")),
+        SubjectTemplate::new("", IdentityValue::path_key(1, "name")),
+        subject.clone().with_scope(vec![IdentityValue::literal("")]),
+        subject
+            .clone()
+            .with_scope(vec![IdentityValue::literal("a".repeat(257))]),
+        subject
+            .clone()
+            .with_scope(vec![IdentityValue::literal("a"); 17]),
+    ] {
+        assert!(validate(vec![Mapping::collection_boolean_state(
+            leaf.clone(),
+            subject,
+            StateTemplate::new("enabled")
+        )])
+        .is_err());
+    }
+
+    for state in [
+        StateTemplate::new(""),
+        StateTemplate::new("enabled").with_facet(""),
+    ] {
+        assert!(validate(vec![Mapping::collection_boolean_state(
+            leaf.clone(),
+            subject.clone(),
+            state
+        )])
+        .is_err());
+    }
+
+    for reading in [
+        ReadingTemplate::new(NumericType::Int).with_unit(""),
+        ReadingTemplate::new(NumericType::Int).with_kind(""),
+        ReadingTemplate::new(NumericType::Int).with_facet(""),
+    ] {
+        assert!(validate(vec![Mapping::collection_reading(
+            leaf.clone(),
+            subject.clone(),
+            reading
+        )])
+        .is_err());
+    }
+
+    for values in [
+        vec![],
+        vec!["UP".into(), "UP".into()],
+        vec!["x".repeat(4097)],
+    ] {
+        assert!(validate(vec![Mapping::collection_enum_state(
+            leaf.clone(),
+            subject.clone(),
+            StateTemplate::new("status"),
+            values
+        )])
+        .is_err());
+    }
+
+    let filtered = |name: &str| {
+        SubscriptionPath::new(vec![
+            PathElement::new("interfaces"),
+            PathElement::new("interface").with_key("name", name),
+            PathElement::new("enabled"),
+        ])
+    };
+
+    let exact = Mapping::boolean_state(
+        filtered("eth0"),
+        StateIdentity::new(descriptor("a").key().subject().clone(), "enabled"),
+    );
+
+    assert!(validate(vec![mapping.clone(), exact.clone()]).is_err());
+    assert!(validate(vec![exact, mapping.clone()]).is_err());
+
+    let filtered_mapping = |name| {
+        Mapping::collection_boolean_state(
+            filtered(name),
+            subject.clone(),
+            StateTemplate::new("enabled"),
+        )
+    };
+
+    assert!(validate(vec![mapping.clone(), filtered_mapping("eth0")]).is_err());
+    assert!(validate(vec![filtered_mapping("eth0"), filtered_mapping("eth1")]).is_ok());
+    assert!(SubscriptionSpec::new(vec![filtered("eth0")], vec![mapping]).is_err());
+}
+
+fn nested_collection() -> (SubscriptionSpec, wire::Path) {
+    let leaf = SubscriptionPath::new(vec![
+        PathElement::new("list"),
+        PathElement::new("entry").with_key("group", "a"),
+        PathElement::new("entry"),
+        PathElement::new("enabled"),
+    ]);
+
+    let subject =
+        SubjectTemplate::new("port", IdentityValue::path_key(2, "name")).with_scope(vec![
+            IdentityValue::path_key(1, "name"),
+            IdentityValue::literal("switch-a"),
+        ]);
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["list"])],
+        vec![Mapping::collection_boolean_state(
+            leaf,
+            subject,
+            StateTemplate::new("enabled").with_facet("link"),
+        )],
+    )
+    .unwrap();
+
+    let mut valid = wire_path(&["list", "entry", "entry", "enabled"]);
+    valid.elem[1]
+        .key
+        .extend([("group".into(), "a".into()), ("name".into(), "rack".into())]);
+
+    valid.elem[2].key.insert("name".into(), "eth0".into());
+
+    (spec, valid)
+}
+
+#[test]
+fn collection_prefix_splits_resolve_nested_key_selectors() {
+    let (spec, valid) = nested_collection();
+
+    // All prefix splits must use the same absolute selector positions.
+    for split in 0..=valid.elem.len() {
+        let parts = projection::project(
+            &spec,
+            wire::Notification {
+                prefix: Some(wire::Path {
+                    elem: valid.elem[..split].to_vec(),
+                    origin: "openconfig".into(),
+                    target: "switch-a".into(),
+                    ..Default::default()
+                }),
+                update: vec![wire::Update {
+                    path: Some(wire::Path {
+                        elem: valid.elem[split..].to_vec(),
+                        ..Default::default()
+                    }),
+                    ..update(Value::BoolVal(false))
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(parts.issues().is_empty(), "split {split}");
+
+        let Payload::States(states) = &parts.payloads()[0].1 else {
+            panic!("states")
+        };
+
+        let state = &states.observations()[0];
+
+        assert_eq!(state.subject().id(), "eth0");
+        assert_eq!(state.subject().scope(), &["rack", "switch-a"]);
+        assert_eq!(state.facet(), Some("link"));
+        assert_eq!(state.value(), &ModelValue::bool(false));
+    }
+}
+
+#[test]
+fn collection_filters_keys_and_reports_invalid_keys_and_ancestors() {
+    let (spec, valid) = nested_collection();
+
+    let mut other_group = valid.clone();
+    other_group.elem[1].key.insert("group".into(), "b".into());
+
+    let mut missing = valid.clone();
+    missing.elem[2].key.clear();
+
+    let mut empty = valid.clone();
+    empty.elem[2].key.insert("name".into(), String::new());
+
+    let mut oversized = valid.clone();
+    oversized.elem[2].key.insert("name".into(), "a".repeat(257));
+
+    let mut wrong_ancestor = other_group;
+    wrong_ancestor.elem.truncate(2);
+
+    let mut ancestor = valid.clone();
+    ancestor.elem.truncate(2);
+
+    let paths = [
+        missing,
+        empty,
+        oversized,
+        ancestor.clone(),
+        wrong_ancestor.clone(),
+    ];
+
+    let parts = projection::project(
+        &spec,
+        wire::Notification {
+            update: paths
+                .into_iter()
+                .map(|path| wire::Update {
+                    path: Some(path),
+                    ..update(Value::BoolVal(true))
+                })
+                .collect(),
+            delete: vec![ancestor, wrong_ancestor],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(parts.payloads().is_empty());
+
+    let issues: BTreeSet<_> = parts
+        .issues()
+        .iter()
+        .map(nv_telemetry_source::ProjectionIssue::path)
+        .collect();
+
+    assert_eq!(
+        issues,
+        BTreeSet::from([
+            "update[0].path",
+            "update[1].path",
+            "update[2].path",
+            "update[3].path",
+            "delete[0]"
+        ])
+    );
+}
+
+#[test]
+fn collection_duplicates_keep_last_values_per_concrete_entry() {
+    let spec = SubscriptionSpec::new(
+        vec![path(&["entry"])],
+        vec![Mapping::collection_enum_state(
+            path(&["entry", "status"]),
+            SubjectTemplate::new("port", IdentityValue::path_key(0, "name")),
+            StateTemplate::new("status"),
+            vec!["UP".into()],
+        )],
+    )
+    .unwrap();
+
+    let make = |name: &str, value| {
+        let mut path = wire_path(&["entry", "status"]);
+        path.elem[0].key.insert("name".into(), name.into());
+
+        wire::Update {
+            path: Some(path),
+            ..update(value)
+        }
+    };
+
+    let parts = projection::project(
+        &spec,
+        wire::Notification {
+            update: vec![
+                make("a", Value::StringVal("UP".into())),
+                make("b", Value::StringVal("UP".into())),
+                make("a", Value::UintVal(1)),
+                make("b", Value::StringVal("NEW".into())),
+                make("c", Value::StringVal("UP".into())),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let Payload::States(states) = &parts.payloads()[0].1 else {
+        panic!("states")
+    };
+
+    let observed: std::collections::BTreeMap<_, _> = states
+        .observations()
+        .iter()
+        .map(|state| (state.subject().id(), state.value().clone()))
+        .collect();
+
+    assert_eq!(
+        observed,
+        std::collections::BTreeMap::from([
+            ("b", ModelValue::string("NEW").unwrap()),
+            ("c", ModelValue::string("UP").unwrap())
+        ])
+    );
+
+    let issues: BTreeSet<_> = parts
+        .issues()
+        .iter()
+        .map(nv_telemetry_source::ProjectionIssue::path)
+        .collect();
+
+    assert_eq!(issues, BTreeSet::from(["update[2].val", "update[3].val"]));
+}
+
+#[test]
+fn collection_identity_collisions_suppress_all_valid_candidates_and_keep_siblings() {
+    let subject = SubjectTemplate::new("sensor", IdentityValue::path_key(0, "name"));
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["entry"]), path(&["exact"])],
+        vec![
+            Mapping::collection_reading(
+                path(&["entry", "counter"]),
+                subject.clone(),
+                ReadingTemplate::new(NumericType::Uint),
+            ),
+            Mapping::new(path(&["exact"]), descriptor("fixed"), NumericType::Uint),
+            Mapping::collection_enum_state(
+                path(&["entry", "status"]),
+                subject.clone(),
+                StateTemplate::new("status"),
+                vec!["UP".into()],
+            ),
+            Mapping::collection_boolean_state(
+                path(&["entry", "other"]),
+                subject,
+                StateTemplate::new("status"),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let make = |name: &str, extra: &str, leaf: &str, value| {
+        let mut path = wire_path(&["entry", leaf]);
+        path.elem[0]
+            .key
+            .extend([("name".into(), name.into()), ("extra".into(), extra.into())]);
+
+        wire::Update {
+            path: Some(path),
+            ..update(value)
+        }
+    };
+
+    let parts = projection::project(
+        &spec,
+        wire::Notification {
+            update: vec![
+                make("fixed", "a", "counter", Value::UintVal(1)),
+                wire::Update {
+                    path: Some(wire_path(&["exact"])),
+                    ..update(Value::UintVal(2))
+                },
+                make("bad", "a", "counter", Value::StringVal("bad".into())),
+                make("bad", "b", "counter", Value::UintVal(3)),
+                make("state", "a", "status", Value::StringVal("NEW".into())),
+                make("state", "b", "other", Value::BoolVal(false)),
+                make("state", "c", "status", Value::StringVal("UP".into())),
+                make("good", "a", "status", Value::StringVal("UP".into())),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(parts.payloads().len(), 2);
+
+    for (_, payload) in parts.payloads() {
+        match payload {
+            Payload::Readings(readings) => {
+                assert_eq!(readings.samples().len(), 1);
+                assert_eq!(readings.samples()[0].key().subject().id(), "bad");
+                assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(3));
+            }
+            Payload::States(states) => {
+                assert_eq!(states.observations().len(), 1);
+                assert_eq!(states.observations()[0].subject().id(), "good");
+            }
+            _ => panic!("readings or states"),
+        }
+    }
+
+    let issues: BTreeSet<_> = parts
+        .issues()
+        .iter()
+        .map(nv_telemetry_source::ProjectionIssue::path)
+        .collect();
+
+    assert_eq!(
+        issues,
+        BTreeSet::from([
+            "update[0].path",
+            "update[1].path",
+            "update[2].val",
+            "update[4].val",
+            "update[4].path",
+            "update[5].path",
+            "update[6].path"
+        ])
+    );
+}
+
+#[test]
+fn collection_colliding_observations_are_omitted_before_payloads_are_built() {
+    let limit = nv_telemetry_model::limits::READINGS_SAMPLES_MAX_ITEMS as usize;
+
+    for numeric in [true, false] {
+        let subject = SubjectTemplate::new("port", IdentityValue::path_key(0, "name"));
+
+        let mapping = if numeric {
+            Mapping::collection_reading(
+                path(&["entry", "leaf"]),
+                subject,
+                ReadingTemplate::new(NumericType::Uint),
+            )
+        } else {
+            Mapping::collection_boolean_state(
+                path(&["entry", "leaf"]),
+                subject,
+                StateTemplate::new("enabled"),
+            )
+        };
+
+        let spec = SubscriptionSpec::new(vec![path(&["entry"])], vec![mapping]).unwrap();
+
+        let mut updates: Vec<_> = (0..limit + 2)
+            .map(|index| {
+                let mut path = wire_path(&["entry", "leaf"]);
+                path.elem[0].key.insert("name".into(), index.to_string());
+
+                wire::Update {
+                    path: Some(path),
+                    ..update(if numeric {
+                        Value::UintVal(u64::MAX)
+                    } else {
+                        Value::BoolVal(false)
+                    })
+                }
+            })
+            .collect();
+
+        let mut collision = updates[0].clone();
+        collision.path.as_mut().unwrap().elem[0]
+            .key
+            .insert("extra".into(), "different-path".into());
+
+        updates.push(collision);
+
+        let parts = projection::project(
+            &spec,
+            wire::Notification {
+                update: updates,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(parts.payloads().len(), 2);
+        assert_eq!(parts.issues().len(), 2);
+
+        let mut total = 0;
+
+        for (coverage, payload) in parts.payloads() {
+            assert_eq!(coverage.completeness(), Completeness::Partial);
+
+            match payload {
+                Payload::Readings(readings) => {
+                    assert!(readings.samples().len() <= limit);
+                    assert_eq!(readings.samples().len(), readings.descriptors().len());
+
+                    let keys: BTreeSet<_> = readings
+                        .descriptors()
+                        .iter()
+                        .map(SignalDescriptor::key)
+                        .collect();
+
+                    for sample in readings.samples() {
+                        assert_ne!(sample.key().subject().id(), "0");
+                        assert!(keys.contains(sample.key()));
+                        assert_eq!(sample.value(), &NumericValue::Uint(u64::MAX));
+                    }
+
+                    total += readings.samples().len();
+                }
+                Payload::States(states) => {
+                    assert!(states.observations().len() <= limit);
+
+                    for state in states.observations() {
+                        assert_ne!(state.subject().id(), "0");
+                        assert_eq!(state.value(), &ModelValue::bool(false));
+                    }
+
+                    total += states.observations().len();
+                }
+                _ => panic!("reading or state"),
+            }
+        }
+
+        assert_eq!(total, limit + 1);
+    }
+}
+
+#[tokio::test]
+async fn collection_stream_reports_interfaces_components_and_issues_in_one_acquisition() {
+    let mut interface = wire_path(&["interfaces", "interface", "counter"]);
+    interface.elem[1].key.insert("name".into(), "eth0".into());
+
+    let mut component = wire_path(&["components", "component", "status"]);
+    component.elem[1].key.insert("name".into(), "fan0".into());
+
+    let mut second_component = component.clone();
+    second_component.elem[1]
+        .key
+        .insert("name".into(), "fan1".into());
+
+    let mut invalid = interface.clone();
+    invalid.elem[1].key.insert("name".into(), "eth1".into());
+
+    let mock = Mock::new(Script {
+        responses: vec![notification(vec![
+            wire::Update {
+                path: Some(interface),
+                ..update(Value::UintVal(42))
+            },
+            wire::Update {
+                path: Some(component),
+                ..update(Value::JsonIetfVal(br#""module:NEW""#.to_vec()))
+            },
+            wire::Update {
+                path: Some(second_component),
+                ..update(Value::StringVal("module:ACTIVE".into()))
+            },
+            wire::Update {
+                path: Some(invalid),
+                ..update(Value::BoolVal(true))
+            },
+        ])],
+        ..Default::default()
+    });
+
+    let spec = SubscriptionSpec::new(
+        vec![
+            path(&["interfaces", "interface"]),
+            path(&["components", "component"]),
+        ],
+        vec![
+            Mapping::collection_reading(
+                path(&["interfaces", "interface", "counter"]),
+                SubjectTemplate::new("interface", IdentityValue::path_key(1, "name")),
+                ReadingTemplate::new(NumericType::Uint),
+            ),
+            Mapping::collection_enum_state(
+                path(&["components", "component", "status"]),
+                SubjectTemplate::new("component", IdentityValue::path_key(1, "name")),
+                StateTemplate::new("status"),
+                vec!["module:ACTIVE".into()],
+            ),
+        ],
+    )
+    .unwrap()
+    .with_encoding(Encoding::JsonIetf);
+
+    let unit = Arc::new(ConfiguredSubscription::new(endpoint(), mock, spec).unwrap());
+
+    let plan = nv_telemetry_orchestration::plan(
+        Needs::default().with_streams([StreamNeed::new(
+            endpoint(),
+            ConfiguredSubscription::<Mock>::REQUEST_CLASS,
+        )]),
+        &[ConfiguredSubscription::<Mock>::declaration()],
+    )
+    .unwrap();
+
+    let (mut leaf, mut reports) = nv_telemetry_orchestration::StreamUnit::new(
+        plan.streams()[0].clone(),
+        unit,
+        nv_telemetry_orchestration::ReconnectPolicy::default(),
+        FixedClock,
+    );
+
+    assert!(leaf.update_ready(Instant::now()).ready);
+    assert!(leaf.take_next().unwrap().payload.await.unwrap().is_empty());
+
+    let report = reports.next().await.unwrap().unwrap();
+
+    assert_eq!(report.status().outcome(), Outcome::Succeeded);
+    assert_eq!(report.batches().len(), 2);
+    assert_eq!(report.issues().unwrap().issues().len(), 2);
+
+    for batch in report.batches() {
+        assert_eq!(batch.window().start().seconds(), 99);
+        assert_eq!(batch.endpoint(), &endpoint());
+
+        match batch.payload() {
+            Payload::Readings(readings) => {
+                assert_eq!(readings.samples().len(), 1);
+                assert_eq!(readings.samples()[0].key().subject().id(), "eth0");
+                assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(42));
+            }
+            Payload::States(states) => {
+                let values: std::collections::BTreeMap<_, _> = states
+                    .observations()
+                    .iter()
+                    .map(|state| (state.subject().id(), state.value().clone()))
+                    .collect();
+
+                assert_eq!(
+                    values,
+                    std::collections::BTreeMap::from([
+                        ("fan0", ModelValue::string("module:NEW").unwrap()),
+                        ("fan1", ModelValue::string("module:ACTIVE").unwrap()),
+                    ])
+                );
+            }
+            _ => panic!("reading or state"),
+        }
+    }
+}
