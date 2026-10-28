@@ -21,7 +21,6 @@ use nv_telemetry_model::States;
 use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
-use nv_telemetry_model::ValueKind;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
@@ -176,19 +175,16 @@ fn project_value(
         MappingKind::Reading {
             descriptor,
             numeric_type,
-        } => reading(descriptor, *numeric_type, value, observed_at)?.map(|sample| {
-            (
-                ProjectedObservation::Reading(descriptor.clone(), sample),
-                false,
-            )
-        }),
-        MappingKind::State { target, value_type } => state(target, value_type, value, observed_at)?
-            .map(|(state, unknown)| (ProjectedObservation::State(state), unknown)),
+        } => reading(descriptor, *numeric_type, value, observed_at)?
+            .map(|sample| ProjectedObservation::Reading(descriptor.clone(), sample)),
+        MappingKind::State { target, value_type } => {
+            state(target, *value_type, value, observed_at)?.map(ProjectedObservation::State)
+        }
         MappingKind::Collection {
             subject: subject_template,
             target,
         } => {
-            let subject = match subject_template.build_subject(path, false) {
+            let subject = match subject_template.subject(path) {
                 Ok(subject) => subject,
                 Err(detail) => {
                     issues.push(ProjectionIssue::invalid("path", detail).at_index("update", index));
@@ -203,7 +199,7 @@ fn project_value(
                         .map_err(|error| model_error(&error))?;
 
                     reading(&descriptor, template.numeric_type, value, observed_at)?
-                        .map(|sample| (ProjectedObservation::Reading(descriptor, sample), false))
+                        .map(|sample| ProjectedObservation::Reading(descriptor, sample))
                 }
                 CollectionTarget::State {
                     template,
@@ -214,24 +210,24 @@ fn project_value(
                         template: template.clone(),
                     };
 
-                    state(&target, value_type, value, observed_at)?
-                        .map(|(state, unknown)| (ProjectedObservation::State(state), unknown))
+                    state(&target, *value_type, value, observed_at)?
+                        .map(ProjectedObservation::State)
                 }
             }
         }
     };
 
-    let detail = match &result {
-        None => Some("value does not match the declared type or exceeds the model limit"),
-        Some((_, true)) => Some("enum value is not listed; value was collected unchanged"),
-        Some((_, false)) => None,
-    };
-
-    if let Some(detail) = detail {
-        issues.push(ProjectionIssue::invalid("val", detail).at_index("update", index));
+    if result.is_none() {
+        issues.push(
+            ProjectionIssue::invalid(
+                "val",
+                "value does not match the declared type or exceeds the model limit",
+            )
+            .at_index("update", index),
+        );
     }
 
-    Ok(result.map(|(projected, _)| projected))
+    Ok(result)
 }
 
 fn split_payloads(
@@ -347,14 +343,14 @@ fn state_payload(
     Ok((coverage, Payload::States(states)))
 }
 
-/// Returns an observation and whether its string is unlisted. A wrong type or
-/// oversized string returns `Ok(None)`; model construction errors fail acquisition.
+/// A wrong type or oversized string returns `Ok(None)`; model construction errors
+/// fail acquisition.
 fn state(
     target: &StateIdentity,
-    value_type: &StateType,
+    value_type: StateType,
     value: Option<Value>,
     observed_at: Timestamp,
-) -> Result<Option<(StateObservation, bool)>, AcquisitionFailure> {
+) -> Result<Option<StateObservation>, AcquisitionFailure> {
     let value = match (value_type, value) {
         (StateType::Boolean, Some(Value::BoolVal(value))) => Some(ModelValue::bool(value)),
         (StateType::Boolean, Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes))) => {
@@ -362,7 +358,7 @@ fn state(
                 .ok()
                 .map(ModelValue::bool)
         }
-        (StateType::Enum { .. }, value) => {
+        (StateType::String, value) => {
             let value = match value {
                 Some(Value::StringVal(value)) => Some(value),
                 Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes)) => {
@@ -380,12 +376,9 @@ fn state(
         return Ok(None);
     };
 
-    let unlisted = matches!((value_type, value.kind()),
-        (StateType::Enum { values, .. }, ValueKind::String(value)) if !values.contains(value));
-
     target
         .observation(value, Some(observed_at))
-        .map(|state| Some((state, unlisted)))
+        .map(Some)
         .map_err(|error| model_error(&error))
 }
 

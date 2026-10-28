@@ -14,12 +14,11 @@
 //! stream cancels the subscription. Orchestration owns reconnects; the caller
 //! configures transport security and credentials.
 //!
-//! Mappings accept numeric values, configured enum strings, or booleans. Enum
-//! strings keep their spelling. Unlisted strings are collected with a projection
-//! issue so consumers can apply their own policy. List known values as the target
-//! sends them for the requested encoding, including identityref module names
-//! in `JSON_IETF` (for example, `openconfig-platform-types:ACTIVE`). Boolean values are
-//! preserved, including `false`. An invalid mapped value produces a projection
+//! Mappings accept numeric values, strings, or booleans. Strings keep the spelling
+//! the target sends for the requested encoding, including identityref module names
+//! in `JSON_IETF` (for example, `openconfig-platform-types:ACTIVE`); classifying them
+//! is the consumer's policy. Boolean values are preserved, including `false`.
+//! An invalid mapped value produces a projection
 //! issue; valid updates in the same notification are still collected. Readings
 //! and states from the same notification share the same acquisition item.
 //! Deletes that affect a mapped leaf produce issues and cannot remove earlier
@@ -47,11 +46,8 @@
 //!     status.extend(["state", "oper-status"].map(PathElement::new));
 //!     let spec = SubscriptionSpec::new(vec![SubscriptionPath::new(interface)], vec![
 //!         Mapping::new(SubscriptionPath::new(counter), descriptor, NumericType::Uint),
-//!         Mapping::enum_state(SubscriptionPath::new(status),
-//!             StateIdentity::new(subject, "oper-status"), vec![
-//!                 "UP".into(), "DOWN".into(), "TESTING".into(), "UNKNOWN".into(),
-//!                 "DORMANT".into(), "NOT_PRESENT".into(), "LOWER_LAYER_DOWN".into(),
-//!             ]),
+//!         Mapping::string_state(SubscriptionPath::new(status),
+//!             StateIdentity::new(subject, "oper-status")),
 //!     ])?;
 //!     Ok(ConfiguredSubscription::new(endpoint, transport, spec)?)
 //! }

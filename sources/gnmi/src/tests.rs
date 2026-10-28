@@ -346,7 +346,7 @@ fn state_configuration_validates_name_and_facet_byte_bounds() {
         }
 
         let mappings = [
-            Mapping::enum_state(path(&["leaf"]), identity.clone(), vec!["UP".into()]),
+            Mapping::string_state(path(&["leaf"]), identity.clone()),
             Mapping::boolean_state(path(&["leaf"]), identity),
         ];
 
@@ -357,37 +357,6 @@ fn state_configuration_validates_name_and_facet_byte_bounds() {
                 "case {index}"
             );
         }
-    }
-}
-
-#[test]
-fn enum_configuration_validates_members_without_normalizing_strings() {
-    let subject = descriptor("a").key().subject().clone();
-    let limit = nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize;
-
-    let cases = [
-        (vec![], false),
-        (vec![String::new()], true),
-        (vec!["UP".into(), "UP".into()], false),
-        (vec!["UP".into(), "up".into()], true),
-        (vec!["x".repeat(limit)], true),
-        (vec!["UP".into(), "x".repeat(limit + 1)], false),
-        (vec!["\u{00e9}".repeat(limit / 2)], true),
-        (vec!["\u{00e9}".repeat(limit / 2 + 1)], false),
-    ];
-
-    for (index, (values, expected)) in cases.into_iter().enumerate() {
-        let mapping = Mapping::enum_state(
-            path(&["leaf"]),
-            StateIdentity::new(subject.clone(), "status"),
-            values,
-        );
-
-        assert_eq!(
-            SubscriptionSpec::new(vec![path(&["leaf"])], vec![mapping]).is_ok(),
-            expected,
-            "case {index}"
-        );
     }
 }
 
@@ -419,8 +388,8 @@ fn declared_state_types_preserve_native_and_json_scalars() {
         (false, Value::JsonIetfVal(b"true".to_vec()), &yes),
     ];
 
-    for (is_enum, value, expected) in cases {
-        let (name, facet) = if is_enum {
+    for (is_string, value, expected) in cases {
+        let (name, facet) = if is_string {
             ("status", Some("link".to_owned()))
         } else {
             ("enabled", None)
@@ -432,16 +401,8 @@ fn declared_state_types_preserve_native_and_json_scalars() {
             identity = identity.with_facet(facet);
         }
 
-        let mapping = if is_enum {
-            Mapping::enum_state(
-                path(&["leaf"]),
-                identity,
-                vec![
-                    "openconfig-platform-types:ACTIVE".into(),
-                    "up".into(),
-                    String::new(),
-                ],
-            )
+        let mapping = if is_string {
+            Mapping::string_state(path(&["leaf"]), identity)
         } else {
             Mapping::boolean_state(path(&["leaf"]), identity)
         };
@@ -479,65 +440,6 @@ fn declared_state_types_preserve_native_and_json_scalars() {
             observation.observed_at(),
             Some(&Timestamp::new(-1, 999_999_999).expect("device timestamp"))
         );
-    }
-}
-
-#[test]
-fn unlisted_enum_strings_are_collected_unchanged_with_an_issue() {
-    let subject = descriptor("a").key().subject().clone();
-
-    let spec = SubscriptionSpec::new(
-        vec![path(&["leaf"])],
-        vec![Mapping::enum_state(
-            path(&["leaf"]),
-            StateIdentity::new(subject, "status"),
-            vec!["UP".into(), "openconfig-platform-types:ACTIVE".into()],
-        )],
-    )
-    .expect("enum subscription");
-
-    for text in [
-        "LOWER_LAYER_DOWN".to_owned(),
-        "up".into(),
-        "ACTIVE".into(),
-        "future:ACTIVE".into(),
-        "x".repeat(nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize),
-    ] {
-        let json = serde_json::to_vec(&text).expect("JSON string");
-
-        for value in [
-            Value::StringVal(text.clone()),
-            Value::JsonVal(json.clone()),
-            Value::JsonIetfVal(json.clone()),
-        ] {
-            let parts = projection::project(
-                &spec,
-                wire::Notification {
-                    update: vec![update(value)],
-                    ..Default::default()
-                },
-            )
-            .expect("unknown state is still an observation");
-
-            assert_eq!(parts.issues().len(), 1);
-            assert_eq!(parts.issues()[0].path(), "update[0].val");
-
-            assert_eq!(
-                parts.issues()[0].kind(),
-                &nv_telemetry_source::ProjectionIssueKind::Invalid {
-                    detail: "enum value is not listed; value was collected unchanged".into(),
-                }
-            );
-
-            let Payload::States(states) = &parts.payloads()[0].1 else {
-                panic!("state payload")
-            };
-
-            assert_eq!(
-                states.observations()[0].value(),
-                &ModelValue::string(&text).expect("bounded string")
-            );
-        }
     }
 }
 
@@ -608,10 +510,9 @@ fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
 
     let cases = [
         (
-            Mapping::enum_state(
+            Mapping::string_state(
                 path(&["invalid"]),
                 StateIdentity::new(subject.clone(), "status"),
-                vec!["UP".into()],
             ),
             vec![
                 Value::BoolVal(true),
@@ -744,7 +645,7 @@ fn state_configuration_separates_reading_keys_from_state_identities() {
             identity = identity.with_facet(facet);
         }
 
-        let other = Mapping::enum_state(path(&["root", leaf]), identity, vec!["UP".into()]);
+        let other = Mapping::string_state(path(&["root", leaf]), identity);
 
         assert_eq!(
             SubscriptionSpec::new(vec![path(&["root"])], vec![state.clone(), other]).is_ok(),
@@ -937,10 +838,9 @@ fn duplicate_updates_project_only_the_final_value_and_keep_original_issue_indexe
 
 #[test]
 fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
-    let mapping = Mapping::enum_state(
+    let mapping = Mapping::string_state(
         path(&["parent", "leaf"]),
         StateIdentity::new(descriptor("a").key().subject().clone(), "status"),
-        vec!["UP".into(), "DOWN".into()],
     );
 
     let spec =
@@ -954,11 +854,6 @@ fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
             up.clone(),
             Some(Value::StringVal("DOWN".into())),
             Some("DOWN"),
-        ),
-        (
-            up.clone(),
-            Some(Value::StringVal("unknown".into())),
-            Some("unknown"),
         ),
         (invalid.clone(), up.clone(), Some("UP")),
         (invalid, Some(Value::BoolVal(false)), None),
@@ -987,11 +882,7 @@ fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
 
         if let Some(expected) = expected {
             assert_eq!(parts.payloads().len(), 1);
-            assert_eq!(parts.issues().len(), usize::from(expected == "unknown"));
-
-            if expected == "unknown" {
-                assert_eq!(parts.issues()[0].path(), "update[1].val");
-            }
+            assert!(parts.issues().is_empty());
 
             let Payload::States(states) = &parts.payloads()[0].1 else {
                 panic!("state payload")
@@ -1001,7 +892,7 @@ fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
 
             assert_eq!(
                 states.observations()[0].value(),
-                &ModelValue::string(expected).expect("known value")
+                &ModelValue::string(expected).expect("state string")
             );
         } else {
             assert!(parts.payloads().is_empty());
@@ -1797,19 +1688,36 @@ fn collection_configuration_rejects_bad_templates_and_overlapping_rules() {
         .is_err());
     }
 
-    for values in [
-        vec![],
-        vec!["UP".into(), "UP".into()],
-        vec!["x".repeat(4097)],
-    ] {
-        assert!(validate(vec![Mapping::collection_enum_state(
-            leaf.clone(),
+    let counter = |leaf: &str, reading: ReadingTemplate| {
+        Mapping::collection_reading(
+            path(&["interfaces", "interface", "state", "counters", leaf]),
             subject.clone(),
-            StateTemplate::new("status"),
-            values
-        )])
-        .is_err());
-    }
+            reading,
+        )
+    };
+
+    let uint = || ReadingTemplate::new(NumericType::Uint);
+
+    // Without facets, both counters of every interface share one signal key.
+    assert!(validate(vec![
+        counter("in-octets", uint()),
+        counter("out-octets", uint())
+    ])
+    .is_err());
+
+    assert!(validate(vec![
+        counter("in-octets", uint().with_facet("in-octets")),
+        counter("out-octets", uint().with_facet("out-octets")),
+    ])
+    .is_ok());
+
+    let status = Mapping::collection_string_state(
+        path(&["interfaces", "interface", "status"]),
+        subject.clone(),
+        StateTemplate::new("enabled"),
+    );
+
+    assert!(validate(vec![mapping.clone(), status]).is_err());
 
     let filtered = |name: &str| {
         SubscriptionPath::new(vec![
@@ -1986,11 +1894,10 @@ fn collection_filters_keys_and_reports_invalid_keys_and_ancestors() {
 fn collection_duplicates_keep_last_values_per_concrete_entry() {
     let spec = SubscriptionSpec::new(
         vec![path(&["entry"])],
-        vec![Mapping::collection_enum_state(
+        vec![Mapping::collection_string_state(
             path(&["entry", "status"]),
             SubjectTemplate::new("port", IdentityValue::path_key(0, "name")),
             StateTemplate::new("status"),
-            vec!["UP".into()],
         )],
     )
     .unwrap();
@@ -2044,7 +1951,7 @@ fn collection_duplicates_keep_last_values_per_concrete_entry() {
         .map(nv_telemetry_source::ProjectionIssue::path)
         .collect();
 
-    assert_eq!(issues, BTreeSet::from(["update[2].val", "update[3].val"]));
+    assert_eq!(issues, BTreeSet::from(["update[2].val"]));
 }
 
 #[test]
@@ -2060,14 +1967,8 @@ fn collection_identity_collisions_suppress_all_valid_candidates_and_keep_sibling
                 ReadingTemplate::new(NumericType::Uint),
             ),
             Mapping::new(path(&["exact"]), descriptor("fixed"), NumericType::Uint),
-            Mapping::collection_enum_state(
+            Mapping::collection_string_state(
                 path(&["entry", "status"]),
-                subject.clone(),
-                StateTemplate::new("status"),
-                vec!["UP".into()],
-            ),
-            Mapping::collection_boolean_state(
-                path(&["entry", "other"]),
                 subject,
                 StateTemplate::new("status"),
             ),
@@ -2099,7 +2000,6 @@ fn collection_identity_collisions_suppress_all_valid_candidates_and_keep_sibling
                 make("bad", "a", "counter", Value::StringVal("bad".into())),
                 make("bad", "b", "counter", Value::UintVal(3)),
                 make("state", "a", "status", Value::StringVal("NEW".into())),
-                make("state", "b", "other", Value::BoolVal(false)),
                 make("state", "c", "status", Value::StringVal("UP".into())),
                 make("good", "a", "status", Value::StringVal("UP".into())),
             ],
@@ -2137,10 +2037,8 @@ fn collection_identity_collisions_suppress_all_valid_candidates_and_keep_sibling
             "update[0].path",
             "update[1].path",
             "update[2].val",
-            "update[4].val",
             "update[4].path",
-            "update[5].path",
-            "update[6].path"
+            "update[5].path"
         ])
     );
 }
@@ -2294,11 +2192,10 @@ async fn collection_stream_reports_interfaces_components_and_issues_in_one_acqui
                 SubjectTemplate::new("interface", IdentityValue::path_key(1, "name")),
                 ReadingTemplate::new(NumericType::Uint),
             ),
-            Mapping::collection_enum_state(
+            Mapping::collection_string_state(
                 path(&["components", "component", "status"]),
                 SubjectTemplate::new("component", IdentityValue::path_key(1, "name")),
                 StateTemplate::new("status"),
-                vec!["module:ACTIVE".into()],
             ),
         ],
     )
@@ -2330,7 +2227,7 @@ async fn collection_stream_reports_interfaces_components_and_issues_in_one_acqui
 
     assert_eq!(report.status().outcome(), Outcome::Succeeded);
     assert_eq!(report.batches().len(), 2);
-    assert_eq!(report.issues().unwrap().issues().len(), 2);
+    assert_eq!(report.issues().unwrap().issues().len(), 1);
 
     for batch in report.batches() {
         assert_eq!(batch.window().start().seconds(), 99);

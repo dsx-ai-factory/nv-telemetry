@@ -66,6 +66,15 @@ impl PathElement {
         self.keys.insert(key.into(), value.into());
         self
     }
+
+    // Elements are compatible when names match and shared keys have equal values.
+    fn compatible(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self
+                .keys
+                .iter()
+                .all(|(key, value)| other.keys.get(key).is_none_or(|other| other == value))
+    }
 }
 
 /// An absolute path using the subscription's origin and target.
@@ -87,6 +96,10 @@ impl SubscriptionPath {
                         .iter()
                         .all(|(key, value)| b.keys.get(key) == Some(value))
             })
+    }
+
+    fn compatible_prefix(&self, other: &Self) -> bool {
+        self.0.iter().zip(&other.0).all(|(a, b)| a.compatible(b))
     }
 
     fn valid(&self) -> bool {
@@ -120,26 +133,27 @@ impl SubscriptionPath {
 }
 
 /// One subject component, supplied literally or taken from a received path key.
-#[derive(Clone, Debug)]
-pub enum IdentityValue {
-    /// A fixed component, preserved as supplied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityValue(Component);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Component {
     Literal(String),
+    PathKey(KeySelector),
+}
 
-    /// A key's value from a path element at a zero-based position.
-    PathKey {
-        /// Position in the full path, including the notification prefix.
-        element: usize,
-
-        /// Name of the key on that element.
-        key: String,
-    },
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeySelector {
+    // Position in the full path, including the notification prefix.
+    element: usize,
+    key: String,
 }
 
 impl IdentityValue {
     /// Creates a fixed subject component.
     #[must_use]
     pub fn literal(value: impl Into<String>) -> Self {
-        Self::Literal(value.into())
+        Self(Component::Literal(value.into()))
     }
 
     /// Uses a key's value from the path element at the given zero-based position.
@@ -148,36 +162,10 @@ impl IdentityValue {
     /// validates the selector.
     #[must_use]
     pub fn path_key(element: usize, key: impl Into<String>) -> Self {
-        Self::PathKey {
+        Self(Component::PathKey(KeySelector {
             element,
             key: key.into(),
-        }
-    }
-
-    fn resolve(
-        &self,
-        path: &SubscriptionPath,
-        allow_placeholder_values: bool,
-    ) -> Result<String, &'static str> {
-        match self {
-            Self::Literal(value) => Ok(value.clone()),
-            Self::PathKey { element, key } => {
-                let element = path
-                    .0
-                    .get(*element)
-                    .ok_or("subject key element is outside the path")?;
-
-                if !concrete(key) {
-                    return Err("subject key name must be concrete and nonempty");
-                }
-
-                match element.keys.get(key) {
-                    Some(value) => Ok(value.clone()),
-                    None if allow_placeholder_values => Ok("key".into()),
-                    None => Err("subject key is missing from the received path"),
-                }
-            }
-        }
+        }))
     }
 }
 
@@ -187,7 +175,7 @@ impl IdentityValue {
 /// or the ID must select a path key. Values are preserved without normalization.
 /// [`SubscriptionSpec::new`] validates literals and selectors. Selected values are
 /// checked against the model's subject limits when projecting each update.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubjectTemplate {
     kind: String,
     scope: Vec<IdentityValue>,
@@ -212,25 +200,71 @@ impl SubjectTemplate {
         self
     }
 
-    pub(super) fn build_subject(
+    pub(super) fn subject(&self, path: &SubscriptionPath) -> Result<Subject, &'static str> {
+        self.build(|selector| {
+            path.0
+                .get(selector.element)
+                .and_then(|element| element.keys.get(&selector.key))
+                .cloned()
+                .ok_or("subject key is missing from the received path")
+        })
+    }
+
+    fn validate(&self, path: &SubscriptionPath) -> Result<Subject, InvalidSubscription> {
+        if self.selectors().next().is_none() {
+            return Err(InvalidSubscription(
+                "collection subjects must select at least one path key",
+            ));
+        }
+
+        // Received values are checked per update. A literal key filter or a
+        // placeholder stands in for them so the model checks the configured parts.
+        self.build(|selector| {
+            if !concrete(&selector.key) {
+                return Err("subject key name must be concrete and nonempty");
+            }
+
+            let element = path
+                .0
+                .get(selector.element)
+                .ok_or("subject key element is outside the path")?;
+
+            Ok(element
+                .keys
+                .get(&selector.key)
+                .cloned()
+                .unwrap_or_else(|| "key".into()))
+        })
+        .map_err(InvalidSubscription)
+    }
+
+    fn build(
         &self,
-        path: &SubscriptionPath,
-        allow_placeholder_values: bool,
+        key: impl Fn(&KeySelector) -> Result<String, &'static str>,
     ) -> Result<Subject, &'static str> {
-        // Configuration checks use representative values for unbound keys.
-        // Received values selected for the subject are checked again by the model.
-        let scope = self
-            .scope
-            .iter()
-            .map(|value| value.resolve(path, allow_placeholder_values))
-            .collect::<Result<_, _>>()?;
+        let component = |value: &IdentityValue| match &value.0 {
+            Component::Literal(value) => Ok(value.clone()),
+            Component::PathKey(selector) => key(selector),
+        };
+
+        let scope = self.scope.iter().map(component).collect::<Result<_, _>>()?;
 
         Subject::builder()
             .kind(self.kind.clone())
             .scope(scope)
-            .id(self.id.resolve(path, allow_placeholder_values)?)
+            .id(component(&self.id)?)
             .build()
             .map_err(|_| "subject components are empty or exceed model limits")
+    }
+
+    fn selectors(&self) -> impl Iterator<Item = &KeySelector> {
+        self.scope
+            .iter()
+            .chain(std::iter::once(&self.id))
+            .filter_map(|value| match &value.0 {
+                Component::Literal(_) => None,
+                Component::PathKey(selector) => Some(selector),
+            })
     }
 }
 
@@ -370,6 +404,19 @@ pub(super) enum CollectionTarget {
     },
 }
 
+impl CollectionTarget {
+    // Readings are keyed by facet, states by facet and name; the two never collide.
+    fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Reading(a), Self::Reading(b)) => a.facet == b.facet,
+            (Self::State { template: a, .. }, Self::State { template: b, .. }) => {
+                a.facet == b.facet && a.name == b.name
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum MappingKind {
     Collection {
@@ -386,46 +433,10 @@ pub(super) enum MappingKind {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum StateType {
-    Enum {
-        values: BTreeSet<String>,
-        has_duplicates: bool,
-    },
+    String,
     Boolean,
-}
-
-impl StateType {
-    fn enumeration(values: Vec<String>) -> Self {
-        let count = values.len();
-        let values: BTreeSet<_> = values.into_iter().collect();
-        let has_duplicates = values.len() != count;
-
-        Self::Enum {
-            values,
-            has_duplicates,
-        }
-    }
-
-    fn validate(&self) -> Result<(), InvalidSubscription> {
-        let Self::Enum {
-            values,
-            has_duplicates,
-        } = self
-        else {
-            return Ok(());
-        };
-
-        if values.is_empty() {
-            return Err(InvalidSubscription("enum values must be nonempty"));
-        }
-
-        if *has_duplicates || values.iter().any(|value| Value::string(value).is_err()) {
-            return Err(InvalidSubscription("invalid or duplicate enum value"));
-        }
-
-        Ok(())
-    }
 }
 
 /// The subject, name, and optional signal facet of a state observation.
@@ -498,28 +509,20 @@ impl Mapping {
         }
     }
 
-    /// Creates a string state mapping with a list of known values.
+    /// Creates a state mapping that preserves string values as received.
     ///
-    /// Accepts native strings and scalar JSON or `JSON_IETF` strings. Matching
-    /// is exact, and the provider preserves the received spelling. Unlisted
-    /// strings are collected with a projection issue. Values that exceed the
-    /// model's string limit produce an issue without an observation.
-    /// List values as the target sends them for the requested encoding, including
-    /// identityref module names such as `openconfig-platform-types:ACTIVE` in
-    /// `JSON_IETF`. Module names are not stripped.
-    /// [`SubscriptionSpec::new`] validates the state identity and rejects an
-    /// empty list, duplicate entries, or strings exceeding the model's byte limit.
+    /// Accepts native strings and scalar JSON or `JSON_IETF` strings. Values are
+    /// not normalized or classified: identityref values keep module names, such as
+    /// `openconfig-platform-types:ACTIVE` in `JSON_IETF`. Strings that exceed the
+    /// model's limit produce an issue without an observation.
+    /// [`SubscriptionSpec::new`] validates the state identity.
     #[must_use]
-    pub fn enum_state(
-        path: SubscriptionPath,
-        identity: StateIdentity,
-        values: Vec<String>,
-    ) -> Self {
+    pub fn string_state(path: SubscriptionPath, identity: StateIdentity) -> Self {
         Self {
             path,
             kind: MappingKind::State {
                 target: identity,
-                value_type: StateType::enumeration(values),
+                value_type: StateType::String,
             },
         }
     }
@@ -556,14 +559,13 @@ impl Mapping {
         }
     }
 
-    /// Maps string states across list entries. Unlisted strings are collected
-    /// unchanged with an issue, using the same rules as [`Self::enum_state`].
+    /// Maps string states across list entries, using the same rules as
+    /// [`Self::string_state`].
     #[must_use]
-    pub fn collection_enum_state(
+    pub fn collection_string_state(
         path: SubscriptionPath,
         subject: SubjectTemplate,
         state: StateTemplate,
-        values: Vec<String>,
     ) -> Self {
         Self {
             path,
@@ -571,7 +573,7 @@ impl Mapping {
                 subject,
                 target: CollectionTarget::State {
                     template: state,
-                    value_type: StateType::enumeration(values),
+                    value_type: StateType::String,
                 },
             },
         }
@@ -601,7 +603,38 @@ impl Mapping {
             return ancestor.contains(&self.path);
         }
 
-        ancestor.0.len() <= self.path.0.len() && compatible_path_prefixes(ancestor, &self.path)
+        ancestor.0.len() <= self.path.0.len() && ancestor.compatible_prefix(&self.path)
+    }
+
+    // Collections with the same output template over compatible keyed elements
+    // produce the same identity for every entry both receive.
+    fn same_collection_identity(&self, other: &Self) -> bool {
+        let (
+            MappingKind::Collection { subject, target },
+            MappingKind::Collection {
+                subject: other_subject,
+                target: other_target,
+            },
+        ) = (&self.kind, &other.kind)
+        else {
+            return false;
+        };
+
+        let keyed_prefix = subject
+            .selectors()
+            .map(|selector| selector.element + 1)
+            .max()
+            .unwrap_or_default();
+
+        subject == other_subject
+            && target.same_identity(other_target)
+            && self
+                .path
+                .0
+                .iter()
+                .zip(&other.path.0)
+                .take(keyed_prefix)
+                .all(|(a, b)| a.compatible(b))
     }
 }
 
@@ -627,15 +660,17 @@ impl SubscriptionSpec {
     ///
     /// Each mapping must be covered by a request path, and mapping paths must not
     /// overlap. Fixed reading keys and state identities `(subject, facet, name)`
-    /// must be unique. A reading and a state may describe the same signal.
+    /// must be unique. Collection mappings with the same subject template, facet,
+    /// and state name are rejected unless literal key filters keep their entries
+    /// apart. A reading and a state may describe the same signal.
     /// Collection subjects are checked again against received keys. Output identity
     /// collisions between concrete paths are reported when projecting a notification.
     ///
     /// # Errors
     ///
     /// Returns an error for empty requests or mappings, invalid paths, mappings
-    /// outside the requests, overlapping paths, duplicate fixed output identities,
-    /// or invalid templates or states.
+    /// outside the requests, overlapping paths, duplicate output identities,
+    /// or invalid templates or state identities.
     pub fn new(
         requests: Vec<SubscriptionPath>,
         mut mappings: Vec<Mapping>,
@@ -657,6 +692,7 @@ impl SubscriptionSpec {
         let mut paths = BTreeSet::new();
         let mut keys = BTreeSet::new();
         let mut state_keys = BTreeSet::new();
+        let mut collection_mappings: Vec<&Mapping> = Vec::new();
 
         for mapping in &mappings {
             if !paths.insert(&mapping.path) {
@@ -677,20 +713,7 @@ impl SubscriptionSpec {
                     subject: subject_template,
                     target,
                 } => {
-                    if !subject_template
-                        .scope
-                        .iter()
-                        .chain(std::iter::once(&subject_template.id))
-                        .any(|value| matches!(value, IdentityValue::PathKey { .. }))
-                    {
-                        return Err(InvalidSubscription(
-                            "collection subjects must select at least one path key",
-                        ));
-                    }
-
-                    let subject = subject_template
-                        .build_subject(&mapping.path, true)
-                        .map_err(InvalidSubscription)?;
+                    let subject = subject_template.validate(&mapping.path)?;
 
                     match target {
                         CollectionTarget::Reading(template) => {
@@ -698,24 +721,30 @@ impl SubscriptionSpec {
                                 .descriptor(subject)
                                 .map_err(|_| InvalidSubscription("invalid reading template"))?;
                         }
-                        CollectionTarget::State {
-                            template,
-                            value_type,
-                        } => {
+                        CollectionTarget::State { template, .. } => {
                             template
                                 .observation(subject, Value::bool(false), None)
                                 .map_err(|_| InvalidSubscription("invalid state template"))?;
-
-                            value_type.validate()?;
                         }
                     }
+
+                    if collection_mappings
+                        .iter()
+                        .any(|other| mapping.same_collection_identity(other))
+                    {
+                        return Err(InvalidSubscription(
+                            "collection output identities must be unique",
+                        ));
+                    }
+
+                    collection_mappings.push(mapping);
                 }
                 MappingKind::Reading { descriptor, .. } => {
                     if !keys.insert(descriptor.key()) {
                         return Err(InvalidSubscription("reading signal keys must be unique"));
                     }
                 }
-                MappingKind::State { target, value_type } => {
+                MappingKind::State { target, .. } => {
                     target
                         .observation(Value::bool(false), None)
                         .map_err(|_| InvalidSubscription("invalid state identity"))?;
@@ -729,8 +758,6 @@ impl SubscriptionSpec {
                     )) {
                         return Err(InvalidSubscription("state identities must be unique"));
                     }
-
-                    value_type.validate()?;
                 }
             }
         }
@@ -838,17 +865,6 @@ fn concrete(value: &str) -> bool {
     !value.is_empty() && !value.contains('*') && value != "..."
 }
 
-// Path prefixes are compatible when element names match and shared keys have
-// equal literal values.
-fn compatible_path_prefixes(a: &SubscriptionPath, b: &SubscriptionPath) -> bool {
-    a.0.iter().zip(&b.0).all(|(a, b)| {
-        a.name == b.name
-            && a.keys
-                .iter()
-                .all(|(key, value)| b.keys.get(key).is_none_or(|other| other == value))
-    })
-}
-
 fn collection_index(
     mappings: &[Mapping],
 ) -> Result<BTreeMap<Vec<String>, Vec<usize>>, InvalidSubscription> {
@@ -887,7 +903,7 @@ fn collection_index(
             .filter_map(|other| (*other != index).then(|| mappings.get(*other)).flatten())
         {
             let overlaps = if matches!(mapping.kind, MappingKind::Collection { .. }) {
-                compatible_path_prefixes(&mapping.path, &other.path)
+                mapping.path.compatible_prefix(&other.path)
             } else {
                 other.path.contains(&mapping.path)
             };
