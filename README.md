@@ -68,7 +68,8 @@ pinned by a fixture corpus that asserts batches and issue lists together.
 
 `sources/gnmi` collects numeric readings and states with enum strings or boolean
 values. Applications supply the transport, paths, and mappings. The
-`gnmi.configured` provider checks values at runtime. Unlisted enum strings are
+`gnmi.configured` provider supports exact leaf mappings and collection mappings
+that derive subjects from list keys. It checks values at runtime. Unlisted enum strings are
 collected with a projection issue. It does not validate against YANG or
 traverse JSON subtrees. See the crate's API documentation for a construction example.
 

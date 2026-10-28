@@ -57,6 +57,43 @@
 //! }
 //! ```
 //!
+//! A collection mapping projects the same leaf across list entries, using keys
+//! from each received path to build the subject:
+//!
+//! ```
+//! use nv_telemetry_gnmi::{IdentityValue, Mapping, NumericType, PathElement,
+//!     ReadingTemplate, StateTemplate, SubjectTemplate, SubscriptionPath, SubscriptionSpec};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let path = |names: &[&str]| SubscriptionPath::new(
+//!     names.iter().map(|name| PathElement::new(*name)).collect());
+//!
+//! // Element 1 is "interface" in the full path, including any notification prefix.
+//! let subject = SubjectTemplate::new("interface", IdentityValue::path_key(1, "name"))
+//!     .with_scope(vec![IdentityValue::literal("switch-a")]);
+//!
+//! let spec = SubscriptionSpec::new(vec![path(&["interfaces", "interface"])], vec![
+//!     Mapping::collection_reading(path(&["interfaces", "interface", "state", "counters", "in-octets"]),
+//!         subject.clone(), ReadingTemplate::new(NumericType::Uint)
+//!             .with_facet("in-octets").with_unit("By")),
+//!     Mapping::collection_boolean_state(path(&["interfaces", "interface", "state", "enabled"]),
+//!         subject, StateTemplate::new("enabled")),
+//! ])?;
+//!
+//! // Use spec with ConfiguredSubscription::new(endpoint, transport, spec).
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Collection paths have fixed element names and optional literal key filters.
+//! Extra response keys are allowed. Selected keys must be present, nonempty, and
+//! within the model's subject limits; invalid keys produce issues for that update.
+//! Within a notification, only the final update for each complete keyed path is
+//! projected. Different paths collide when they produce the same reading key or
+//! state `(subject, facet, name)`. All observations for a colliding identity are
+//! omitted with projection issues. Invalid values do not participate in collisions.
+//! Each notification is projected independently.
+//!
 //! The target must send updates for individual leaves, even when the request
 //! selects a parent path. Ancestor updates produce projection issues; the provider
 //! does not traverse JSON subtrees. Use
@@ -85,11 +122,15 @@ use nv_telemetry_source::AcquisitionFailureClass as Class;
 use nv_telemetry_source::ProviderDeclaration;
 use nv_telemetry_source::SubscriptionItem;
 pub use spec::Encoding;
+pub use spec::IdentityValue;
 pub use spec::InvalidSubscription;
 pub use spec::Mapping;
 pub use spec::NumericType;
 pub use spec::PathElement;
+pub use spec::ReadingTemplate;
 pub use spec::StateIdentity;
+pub use spec::StateTemplate;
+pub use spec::SubjectTemplate;
 pub use spec::SubscriptionPath;
 pub use spec::SubscriptionSpec;
 use tonic::codegen::Body;
