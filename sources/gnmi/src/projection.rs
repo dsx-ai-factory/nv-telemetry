@@ -15,7 +15,11 @@ use nv_telemetry_model::Reading;
 use nv_telemetry_model::Readings;
 use nv_telemetry_model::SignalDescriptor;
 use nv_telemetry_model::SignalKey;
+use nv_telemetry_model::StateObservation;
+use nv_telemetry_model::States;
 use nv_telemetry_model::Timestamp;
+use nv_telemetry_model::Value as ModelValue;
+use nv_telemetry_model::ValueKind;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
@@ -25,8 +29,11 @@ use serde::de::DeserializeOwned;
 
 use crate::protocol::gnmi;
 use crate::protocol::gnmi::typed_value::Value;
+use crate::spec::MappingKind;
+use crate::spec::StateType;
 use crate::NumericType;
 use crate::PathElement;
+use crate::StateIdentity;
 use crate::SubscriptionPath;
 use crate::SubscriptionSpec;
 
@@ -44,18 +51,24 @@ pub(super) fn project(
     )
     .map_err(|error| model_error(&error))?;
 
-    // Split at the model limits; all payloads still belong to one acquisition item.
-    let chunk_limit =
+    // Readings and states have separate limits, but all chunks from a notification
+    // belong to the same acquisition item.
+    let readings_limit =
         limits::READINGS_SAMPLES_MAX_ITEMS.min(limits::READINGS_DESCRIPTORS_MAX_ITEMS) as usize;
+
+    let states_limit = limits::STATES_OBSERVATIONS_MAX_ITEMS as usize;
 
     let mut payloads = Vec::new();
     let mut descriptors = BTreeMap::new();
     let mut samples = Vec::new();
+    let mut states = Vec::new();
     let mut issues = Vec::new();
     let mut seen = BTreeSet::new();
 
-    // gNMI uses only the final update for each path. Mark the path before parsing
+    // gNMI uses only the final update for each path. Mark it seen before parsing
     // its value so an invalid final value also suppresses earlier updates.
+    // Keep seen paths across payload splits, and enumerate before reversing to
+    // preserve the original update indexes in issues.
     for (index, update) in notification.update.into_iter().enumerate().rev() {
         let path = match resolve(spec, notification.prefix.as_ref(), update.path.as_ref()) {
             Ok(path) => path,
@@ -71,6 +84,20 @@ pub(super) fn project(
             .ok()
             .and_then(|index| spec.mappings.get(index))
         else {
+            if spec
+                .mappings
+                .iter()
+                .any(|mapping| path.contains(&mapping.path))
+            {
+                issues.push(
+                    ProjectionIssue::invalid(
+                        "path",
+                        "update covers mapped leaves; individual leaf updates are required",
+                    )
+                    .at_index("update", index),
+                );
+            }
+
             continue;
         };
 
@@ -78,40 +105,47 @@ pub(super) fn project(
             continue;
         }
 
-        let Some(value) = update
-            .val
-            .and_then(|value| value.value)
-            .and_then(|value| number(mapping.numeric_type, value))
-        else {
-            issues.push(
-                ProjectionIssue::invalid(
-                    "val",
-                    "value does not match the declared finite numeric type",
-                )
-                .at_index("update", index),
-            );
+        let value = update.val.and_then(|value| value.value);
 
-            continue;
+        let issue = match &mapping.kind {
+            MappingKind::Reading {
+                descriptor,
+                numeric_type,
+            } => {
+                if let Some(sample) = reading(descriptor, *numeric_type, value, observed_at)? {
+                    descriptors
+                        .entry(descriptor.key().clone())
+                        .or_insert_with(|| descriptor.clone());
+
+                    samples.push(sample);
+                    None
+                } else {
+                    Some("value does not match the declared type or exceeds the model limit")
+                }
+            }
+            MappingKind::State { target, value_type } => {
+                if let Some((state, unknown)) = state(target, value_type, value, observed_at)? {
+                    states.push(state);
+                    unknown.then_some("enum value is not listed; value was collected unchanged")
+                } else {
+                    Some("value does not match the declared type or exceeds the model limit")
+                }
+            }
         };
 
-        let sample = Reading::builder()
-            .key(mapping.descriptor.key().clone())
-            .value(value)
-            .observed_at(observed_at)
-            .build()
-            .map_err(|error| model_error(&error))?;
+        if let Some(detail) = issue {
+            issues.push(ProjectionIssue::invalid("val", detail).at_index("update", index));
+        }
 
-        descriptors
-            .entry(mapping.descriptor.key().clone())
-            .or_insert_with(|| mapping.descriptor.clone());
-
-        samples.push(sample);
-
-        if samples.len() == chunk_limit {
+        if samples.len() == readings_limit {
             payloads.push(payload(
                 std::mem::take(&mut descriptors),
                 std::mem::take(&mut samples),
             )?);
+        }
+
+        if states.len() == states_limit {
+            payloads.push(state_payload(std::mem::take(&mut states))?);
         }
     }
 
@@ -119,8 +153,30 @@ pub(super) fn project(
         payloads.push(payload(descriptors, samples)?);
     }
 
-    for (index, delete) in notification.delete.iter().enumerate() {
-        match resolve(spec, notification.prefix.as_ref(), Some(delete)) {
+    if !states.is_empty() {
+        payloads.push(state_payload(states)?);
+    }
+
+    delete_issues(
+        spec,
+        notification.prefix.as_ref(),
+        &notification.delete,
+        &mut issues,
+    );
+
+    Ok(AcquisitionParts::new(payloads, issues))
+}
+
+/// Reports deletes that name a mapped leaf or one of its ancestors.
+/// The model has no deletion observation, so deletes produce issues only.
+fn delete_issues(
+    spec: &SubscriptionSpec,
+    prefix: Option<&gnmi::Path>,
+    deletes: &[gnmi::Path],
+    issues: &mut Vec<ProjectionIssue>,
+) {
+    for (index, delete) in deletes.iter().enumerate() {
+        match resolve(spec, prefix, Some(delete)) {
             Ok(path)
                 if spec
                     .mappings
@@ -138,8 +194,6 @@ pub(super) fn project(
             Ok(_) => {}
         }
     }
-
-    Ok(AcquisitionParts::new(payloads, issues))
 }
 
 fn payload(
@@ -164,6 +218,65 @@ fn model_error(error: &Invalid) -> AcquisitionFailure {
     AcquisitionFailure::new(AcquisitionFailureClass::Internal)
         .with_retryable(false)
         .with_detail(format!("gNMI projection model error: {error}"))
+}
+
+fn state_payload(
+    observations: Vec<StateObservation>,
+) -> Result<(Coverage, Payload), AcquisitionFailure> {
+    let states = States::builder()
+        .observations(observations)
+        .build()
+        .map_err(|error| model_error(&error))?;
+
+    // A notification can omit unchanged leaves, so its state coverage is partial.
+    let coverage = Coverage::builder()
+        .completeness(Completeness::Partial)
+        .build()
+        .map_err(|error| model_error(&error))?;
+
+    Ok((coverage, Payload::States(states)))
+}
+
+/// Returns an observation and whether its string is unlisted. A wrong type or
+/// oversized string returns `Ok(None)`; model construction errors fail acquisition.
+fn state(
+    target: &StateIdentity,
+    value_type: &StateType,
+    value: Option<Value>,
+    observed_at: Timestamp,
+) -> Result<Option<(StateObservation, bool)>, AcquisitionFailure> {
+    let value = match (value_type, value) {
+        (StateType::Boolean, Some(Value::BoolVal(value))) => Some(ModelValue::bool(value)),
+        (StateType::Boolean, Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes))) => {
+            serde_json::from_slice::<bool>(&bytes)
+                .ok()
+                .map(ModelValue::bool)
+        }
+        (StateType::Enum { .. }, value) => {
+            let value = match value {
+                Some(Value::StringVal(value)) => Some(value),
+                Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes)) => {
+                    serde_json::from_slice::<String>(&bytes).ok()
+                }
+                _ => None,
+            };
+
+            value.and_then(|value| ModelValue::string(value).ok())
+        }
+        _ => None,
+    };
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let unlisted = matches!((value_type, value.kind()),
+        (StateType::Enum { values, .. }, ValueKind::String(value)) if !values.contains(value));
+
+    target
+        .observation(value, Some(observed_at))
+        .map(|state| Some((state, unlisted)))
+        .map_err(|error| model_error(&error))
 }
 
 fn resolve(
@@ -222,8 +335,13 @@ fn conflict(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && a != b
 }
 
-fn number(kind: NumericType, value: Value) -> Option<NumericValue> {
-    match (kind, value) {
+fn reading(
+    descriptor: &SignalDescriptor,
+    kind: NumericType,
+    value: Option<Value>,
+    observed_at: Timestamp,
+) -> Result<Option<Reading>, AcquisitionFailure> {
+    let value = value.and_then(|value| match (kind, value) {
         (NumericType::Int, Value::IntVal(value)) => Some(NumericValue::Int(value)),
         (NumericType::Uint, Value::UintVal(value)) => Some(NumericValue::Uint(value)),
         (NumericType::Double, Value::DoubleVal(value)) => NumericValue::double(value).ok(),
@@ -239,7 +357,19 @@ fn number(kind: NumericType, value: Value) -> Option<NumericValue> {
             }
         },
         _ => None,
-    }
+    });
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    Reading::builder()
+        .key(descriptor.key().clone())
+        .value(value)
+        .observed_at(observed_at)
+        .build()
+        .map(Some)
+        .map_err(|error| model_error(&error))
 }
 
 // Parse directly into N so large i64 and u64 values never pass through f64.

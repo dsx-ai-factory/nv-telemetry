@@ -66,10 +66,11 @@ content-hashable — `source` is the acquisition contract, and the Redfish
 crate's first provider reads one sensor into readings and states batches,
 pinned by a fixture corpus that asserts batches and issue lists together.
 
-`sources/gnmi` collects numeric readings using caller-supplied transport, paths,
-and signal mappings. The `gnmi.configured` provider validates scalar values at
-runtime. It does not validate against YANG or project JSON subtrees. See the crate's
-API documentation for a construction example.
+`sources/gnmi` collects numeric readings and states with enum strings or boolean
+values. Applications supply the transport, paths, and mappings. The
+`gnmi.configured` provider checks values at runtime. Unlisted enum strings are
+collected with a projection issue. It does not validate against YANG or
+traverse JSON subtrees. See the crate's API documentation for a construction example.
 
 Exporters are separate crates because their dependency trees are disjoint;
 `export` holds only what they share, such as joining readings to descriptors
