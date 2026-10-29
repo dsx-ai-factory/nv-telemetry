@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use nv_telemetry_model::Invalid;
 use nv_telemetry_model::SignalDescriptor;
@@ -129,6 +130,114 @@ impl SubscriptionPath {
                 .collect(),
             ..Default::default()
         }
+    }
+}
+
+/// A request path, subscription mode, and options for that mode.
+///
+/// [`SubscriptionSpec::from_requests`] validates the mode and options before acquisition.
+/// The target decides which paths, modes, and intervals it supports.
+///
+/// ```
+/// use std::time::Duration;
+/// use nv_telemetry_gnmi::{PathElement, SubscriptionPath, SubscriptionRequest};
+///
+/// let path = SubscriptionPath::new(vec![PathElement::new("counter")]);
+/// let request = SubscriptionRequest::sample(path, Duration::from_secs(10))
+///     .with_suppress_redundant(true)
+///     .with_heartbeat_interval(Duration::from_secs(60));
+/// ```
+#[derive(Clone, Debug)]
+pub struct SubscriptionRequest {
+    path: SubscriptionPath,
+    mode: gnmi::SubscriptionMode,
+    sample_interval: Duration,
+    heartbeat_interval: Duration,
+    suppress_redundant: bool,
+}
+
+impl SubscriptionRequest {
+    /// Uses `TARGET_DEFINED` to let the target choose a subscription mode for each leaf.
+    #[must_use]
+    pub fn target_defined(path: SubscriptionPath) -> Self {
+        Self {
+            path,
+            mode: gnmi::SubscriptionMode::TargetDefined,
+            sample_interval: Duration::ZERO,
+            heartbeat_interval: Duration::ZERO,
+            suppress_redundant: false,
+        }
+    }
+
+    /// Uses `ON_CHANGE` to request initial values, then updates when values change.
+    #[must_use]
+    pub fn on_change(path: SubscriptionPath) -> Self {
+        Self {
+            mode: gnmi::SubscriptionMode::OnChange,
+            ..Self::target_defined(path)
+        }
+    }
+
+    /// Uses `SAMPLE` to request periodic samples.
+    ///
+    /// Zero requests the target's fastest supported rate. The interval must fit in
+    /// an unsigned 64-bit count of nanoseconds.
+    #[must_use]
+    pub fn sample(path: SubscriptionPath, interval: Duration) -> Self {
+        Self {
+            mode: gnmi::SubscriptionMode::Sample,
+            sample_interval: interval,
+            ..Self::target_defined(path)
+        }
+    }
+
+    /// Requests that unchanged values be resent at this interval.
+    ///
+    /// Nonzero intervals require `ON_CHANGE` or `SAMPLE` mode and must fit in
+    /// an unsigned 64-bit count of nanoseconds. Zero leaves the heartbeat unset.
+    #[must_use]
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Requests that the target skip unchanged samples. The default is `false`.
+    ///
+    /// Enabling suppression requires `SAMPLE` mode. A configured heartbeat
+    /// still requests values to be resent even when they have not changed.
+    #[must_use]
+    pub fn with_suppress_redundant(mut self, suppress: bool) -> Self {
+        self.suppress_redundant = suppress;
+        self
+    }
+
+    fn wire(self) -> Result<gnmi::Subscription, InvalidSubscription> {
+        if self.mode == gnmi::SubscriptionMode::TargetDefined && !self.heartbeat_interval.is_zero()
+        {
+            return Err(InvalidSubscription(
+                "heartbeat_interval requires ON_CHANGE or SAMPLE mode",
+            ));
+        }
+
+        if self.mode != gnmi::SubscriptionMode::Sample && self.suppress_redundant {
+            return Err(InvalidSubscription(
+                "suppress_redundant requires SAMPLE mode",
+            ));
+        }
+
+        let sample_interval = u64::try_from(self.sample_interval.as_nanos())
+            .map_err(|_| InvalidSubscription("sample_interval exceeds u64 nanoseconds"))?;
+
+        let heartbeat_interval = u64::try_from(self.heartbeat_interval.as_nanos())
+            .map_err(|_| InvalidSubscription("heartbeat_interval exceeds u64 nanoseconds"))?;
+
+        Ok(gnmi::Subscription {
+            path: Some(self.path.wire()),
+            mode: self.mode.into(),
+            sample_interval,
+            heartbeat_interval,
+            suppress_redundant: self.suppress_redundant,
+        })
     }
 }
 
@@ -649,14 +758,38 @@ impl Mapping {
 pub struct SubscriptionSpec {
     pub(super) mappings: Vec<Mapping>,
     collections: BTreeMap<Vec<String>, Vec<usize>>,
-    requests: Vec<SubscriptionPath>,
+    requests: Vec<gnmi::Subscription>,
     pub(super) origin: String,
     pub(super) target: String,
     encoding: Encoding,
 }
 
 impl SubscriptionSpec {
-    /// Validates request paths and mappings before acquisition.
+    /// Validates paths and mappings with `TARGET_DEFINED` mode for every path.
+    ///
+    /// Use [`Self::from_requests`] to configure subscription modes and their options per path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if paths or mappings fail the checks in [`Self::from_requests`].
+    pub fn new(
+        requests: Vec<SubscriptionPath>,
+        mappings: Vec<Mapping>,
+    ) -> Result<Self, InvalidSubscription> {
+        Self::from_requests(
+            requests
+                .into_iter()
+                .map(SubscriptionRequest::target_defined)
+                .collect(),
+            mappings,
+        )
+    }
+
+    /// Validates request paths, subscription modes, options, and mappings before acquisition.
+    ///
+    /// Requests keep their order, including duplicate and overlapping paths.
+    /// Intervals are converted to nanoseconds during validation. The target decides
+    /// whether it supports the requested paths, modes, and intervals.
     ///
     /// Each mapping must be covered by a request path, and mapping paths must not
     /// overlap. Fixed reading keys and state identities `(subject, facet, name)`
@@ -669,10 +802,11 @@ impl SubscriptionSpec {
     /// # Errors
     ///
     /// Returns an error for empty requests or mappings, invalid paths, mappings
-    /// outside the requests, overlapping paths, duplicate output identities,
-    /// or invalid templates or state identities.
-    pub fn new(
-        requests: Vec<SubscriptionPath>,
+    /// outside the requests, overlapping mapping paths, duplicate output identities,
+    /// invalid templates or state identities, options invalid for the selected mode,
+    /// or intervals exceeding an unsigned 64-bit count of nanoseconds.
+    pub fn from_requests(
+        requests: Vec<SubscriptionRequest>,
         mut mappings: Vec<Mapping>,
     ) -> Result<Self, InvalidSubscription> {
         if requests.is_empty() || mappings.is_empty() {
@@ -681,7 +815,7 @@ impl SubscriptionSpec {
             ));
         }
 
-        if requests.iter().any(|path| !path.valid())
+        if requests.iter().any(|request| !request.path.valid())
             || mappings.iter().any(|mapping| !mapping.path.valid())
         {
             return Err(InvalidSubscription(
@@ -701,7 +835,7 @@ impl SubscriptionSpec {
 
             if !requests
                 .iter()
-                .any(|request| request.contains(&mapping.path))
+                .any(|request| request.path.contains(&mapping.path))
             {
                 return Err(InvalidSubscription(
                     "every mapping must be below a request path",
@@ -767,6 +901,12 @@ impl SubscriptionSpec {
 
         let collections = collection_index(&mappings)?;
 
+        // Validate and encode subscription modes and options once, before any acquisition.
+        let requests = requests
+            .into_iter()
+            .map(SubscriptionRequest::wire)
+            .collect::<Result<_, _>>()?;
+
         Ok(Self {
             collections,
             mappings,
@@ -826,15 +966,7 @@ impl SubscriptionSpec {
                         target: self.target.clone(),
                         ..Default::default()
                     }),
-                    subscription: self
-                        .requests
-                        .iter()
-                        .map(|path| gnmi::Subscription {
-                            path: Some(path.wire()),
-                            mode: gnmi::SubscriptionMode::TargetDefined.into(),
-                            ..Default::default()
-                        })
-                        .collect(),
+                    subscription: self.requests.clone(),
                     mode: gnmi::subscription_list::Mode::Stream.into(),
                     encoding: match self.encoding {
                         Encoding::Json => gnmi::Encoding::Json,

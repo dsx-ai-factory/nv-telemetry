@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::FutureExt;
@@ -1208,47 +1209,232 @@ async fn subscribe_request_sets_paths_context_modes_and_explicit_encoding() {
 
         let requests = requests.lock().expect("request lock");
 
-        let Some(wire::subscribe_request::Request::Subscribe(list)) = &requests[0].request else {
+        let mut expected_keyed = wire_path(&["interface"]);
+        expected_keyed.elem[0]
+            .key
+            .insert("name".into(), "Ethernet1".into());
+
+        let expected = wire::SubscribeRequest {
+            request: Some(wire::subscribe_request::Request::Subscribe(
+                wire::SubscriptionList {
+                    prefix: Some(wire::Path {
+                        origin: "openconfig".into(),
+                        target: "switch-a".into(),
+                        ..Default::default()
+                    }),
+                    subscription: vec![
+                        wire::Subscription {
+                            path: Some(expected_keyed),
+                            mode: wire::SubscriptionMode::TargetDefined as i32,
+                            ..Default::default()
+                        },
+                        wire::Subscription {
+                            path: Some(wire_path(&["other"])),
+                            mode: wire::SubscriptionMode::TargetDefined as i32,
+                            ..Default::default()
+                        },
+                    ],
+                    mode: wire::subscription_list::Mode::Stream as i32,
+                    encoding: if encoding.unwrap_or(Encoding::Json) == Encoding::Json {
+                        wire::Encoding::Json as i32
+                    } else {
+                        wire::Encoding::JsonIetf as i32
+                    },
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        assert_eq!(requests.as_slice(), &[expected]);
+    }
+}
+
+#[tokio::test]
+async fn request_options_preserve_modes_order_and_overlaps_across_acquisitions() {
+    let mock = Mock::new(Script::default());
+    let requests = Arc::clone(&mock.requests);
+    let root = path(&["root"]);
+
+    let spec = SubscriptionSpec::from_requests(
+        vec![
+            SubscriptionRequest::sample(root.clone(), Duration::from_secs(7))
+                .with_heartbeat_interval(Duration::from_secs(23))
+                .with_suppress_redundant(true),
+            SubscriptionRequest::on_change(path(&["root", "status"]))
+                .with_heartbeat_interval(Duration::from_millis(500)),
+            SubscriptionRequest::target_defined(root)
+                .with_heartbeat_interval(Duration::ZERO)
+                .with_suppress_redundant(false),
+        ],
+        vec![Mapping::new(
+            path(&["root", "counter"]),
+            descriptor("a"),
+            NumericType::Uint,
+        )],
+    )
+    .expect("mixed request options")
+    .with_origin("example")
+    .with_target("endpoint-a")
+    .with_encoding(Encoding::JsonIetf);
+
+    let unit = ConfiguredSubscription::new(endpoint(), mock, spec).expect("subscription");
+
+    for _ in 0..2 {
+        let stream = unit.perform().await.expect("opens");
+        drop(stream);
+    }
+
+    let requests = requests.lock().expect("request lock");
+
+    let expected = wire::SubscribeRequest {
+        request: Some(wire::subscribe_request::Request::Subscribe(
+            wire::SubscriptionList {
+                prefix: Some(wire::Path {
+                    origin: "example".into(),
+                    target: "endpoint-a".into(),
+                    ..Default::default()
+                }),
+                subscription: vec![
+                    wire::Subscription {
+                        path: Some(wire_path(&["root"])),
+                        mode: wire::SubscriptionMode::Sample as i32,
+                        sample_interval: 7_000_000_000,
+                        heartbeat_interval: 23_000_000_000,
+                        suppress_redundant: true,
+                    },
+                    wire::Subscription {
+                        path: Some(wire_path(&["root", "status"])),
+                        mode: wire::SubscriptionMode::OnChange as i32,
+                        heartbeat_interval: 500_000_000,
+                        ..Default::default()
+                    },
+                    wire::Subscription {
+                        path: Some(wire_path(&["root"])),
+                        mode: wire::SubscriptionMode::TargetDefined as i32,
+                        ..Default::default()
+                    },
+                ],
+                mode: wire::subscription_list::Mode::Stream as i32,
+                encoding: wire::Encoding::JsonIetf as i32,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+
+    assert_eq!(requests.as_slice(), &[expected.clone(), expected]);
+}
+
+#[test]
+fn request_intervals_preserve_zero_nanoseconds_and_uint64_bounds() {
+    let leaf = path(&["leaf"]);
+    let maximum = Duration::from_nanos(u64::MAX);
+
+    let cases = [
+        (
+            SubscriptionRequest::sample(leaf.clone(), Duration::ZERO),
+            0,
+            0,
+        ),
+        (
+            SubscriptionRequest::sample(leaf.clone(), Duration::from_nanos(1)),
+            1,
+            0,
+        ),
+        (
+            SubscriptionRequest::sample(leaf.clone(), maximum),
+            u64::MAX,
+            0,
+        ),
+        (
+            SubscriptionRequest::sample(leaf.clone(), Duration::ZERO)
+                .with_heartbeat_interval(maximum),
+            0,
+            u64::MAX,
+        ),
+        (
+            SubscriptionRequest::on_change(leaf.clone()).with_heartbeat_interval(maximum),
+            0,
+            u64::MAX,
+        ),
+        (
+            SubscriptionRequest::on_change(leaf.clone()).with_heartbeat_interval(Duration::ZERO),
+            0,
+            0,
+        ),
+    ];
+
+    for (request, sample, heartbeat) in cases {
+        let spec = SubscriptionSpec::from_requests(
+            vec![request],
+            vec![Mapping::new(
+                leaf.clone(),
+                descriptor("a"),
+                NumericType::Uint,
+            )],
+        )
+        .expect("representable intervals");
+
+        let wire::subscribe_request::Request::Subscribe(list) =
+            spec.request().request.expect("request")
+        else {
             panic!("Subscribe list")
         };
 
-        let prefix = list.prefix.as_ref().expect("context prefix");
+        let subscription = list.subscription.first().expect("one request");
 
-        assert_eq!(
-            (&*prefix.origin, &*prefix.target),
-            ("openconfig", "switch-a")
-        );
+        assert_eq!(subscription.sample_interval, sample);
+        assert_eq!(subscription.heartbeat_interval, heartbeat);
+    }
+}
 
-        assert!(prefix.elem.is_empty());
-        assert_eq!(list.mode, wire::subscription_list::Mode::Stream as i32);
-        assert!(!list.updates_only);
-        assert!(!list.allow_aggregation);
+#[test]
+fn request_options_reject_inapplicable_settings_and_interval_overflow() {
+    let leaf = path(&["leaf"]);
+    let overflow = Duration::from_nanos(u64::MAX) + Duration::from_nanos(1);
 
-        assert_eq!(
-            list.encoding,
-            if encoding.unwrap_or(Encoding::Json) == Encoding::Json {
-                wire::Encoding::Json as i32
-            } else {
-                wire::Encoding::JsonIetf as i32
-            }
-        );
+    let cases = [
+        (
+            SubscriptionRequest::sample(leaf.clone(), overflow),
+            "sample_interval",
+        ),
+        (
+            SubscriptionRequest::sample(leaf.clone(), Duration::ZERO)
+                .with_heartbeat_interval(overflow),
+            "heartbeat_interval",
+        ),
+        (
+            SubscriptionRequest::on_change(leaf.clone()).with_heartbeat_interval(overflow),
+            "heartbeat_interval",
+        ),
+        (
+            SubscriptionRequest::target_defined(leaf.clone())
+                .with_heartbeat_interval(Duration::from_nanos(1)),
+            "heartbeat_interval",
+        ),
+        (
+            SubscriptionRequest::target_defined(leaf.clone()).with_suppress_redundant(true),
+            "suppress_redundant",
+        ),
+        (
+            SubscriptionRequest::on_change(leaf.clone()).with_suppress_redundant(true),
+            "suppress_redundant",
+        ),
+    ];
 
-        assert_eq!(list.subscription.len(), 2);
+    for (request, field) in cases {
+        let error = SubscriptionSpec::from_requests(
+            vec![request],
+            vec![Mapping::new(
+                leaf.clone(),
+                descriptor("a"),
+                NumericType::Uint,
+            )],
+        )
+        .expect_err("invalid request configuration");
 
-        assert_eq!(
-            list.subscription[0].path.as_ref().expect("path").elem[0].key["name"],
-            "Ethernet1"
-        );
-
-        assert_eq!(
-            list.subscription[1].path.as_ref().expect("path").elem[0].name,
-            "other"
-        );
-
-        assert!(list
-            .subscription
-            .iter()
-            .all(|subscription| subscription.mode == wire::SubscriptionMode::TargetDefined as i32));
+        assert!(error.to_string().contains(field), "{field}: {error}");
     }
 }
 
@@ -1324,7 +1510,21 @@ async fn opening_and_terminal_statuses_share_failure_classification_and_retry_hi
                 ..Default::default()
             });
 
-            let unit = mock.subscription();
+            let request = SubscriptionRequest::sample(path(&["leaf"]), Duration::from_secs(1))
+                .with_heartbeat_interval(Duration::from_secs(2))
+                .with_suppress_redundant(true);
+
+            let spec = SubscriptionSpec::from_requests(
+                vec![request],
+                vec![Mapping::new(
+                    path(&["leaf"]),
+                    descriptor("a"),
+                    NumericType::Uint,
+                )],
+            )
+            .expect("sampled subscription");
+
+            let unit = ConfiguredSubscription::new(endpoint(), mock, spec).expect("subscription");
 
             let failure = match unit.perform().await {
                 Err(failure) => {
