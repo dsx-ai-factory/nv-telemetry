@@ -81,6 +81,43 @@
 //! # }
 //! ```
 //!
+//! Use [`SubscriptionSpec::from_requests`] to select a subscription mode for each path.
+//! The example requests counter samples every 10 seconds and status updates when
+//! values change. Suppression skips unchanged counter samples; the heartbeat asks
+//! the target to resend values every 60 seconds even when they have not changed.
+//!
+//! ```
+//! use std::time::Duration;
+//! use nv_telemetry_gnmi::{IdentityValue, Mapping, NumericType, PathElement,
+//!     ReadingTemplate, StateTemplate, SubjectTemplate, SubscriptionPath,
+//!     SubscriptionRequest, SubscriptionSpec};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let path = |names: &[&str]| SubscriptionPath::new(
+//!     names.iter().map(|name| PathElement::new(*name)).collect());
+//!
+//! let counter = path(&["telemetry", "entry", "count"]);
+//! let status = path(&["telemetry", "entry", "status"]);
+//! // Element 1 is "entry"; its "name" key supplies each sensor's ID.
+//! let subject = SubjectTemplate::new("sensor", IdentityValue::path_key(1, "name"));
+//!
+//! let spec = SubscriptionSpec::from_requests(vec![
+//!     SubscriptionRequest::sample(counter.clone(), Duration::from_secs(10))
+//!         .with_suppress_redundant(true)
+//!         .with_heartbeat_interval(Duration::from_secs(60)),
+//!     SubscriptionRequest::on_change(status.clone())
+//!         .with_heartbeat_interval(Duration::from_secs(60)),
+//! ], vec![
+//!     Mapping::collection_reading(counter, subject.clone(),
+//!         ReadingTemplate::new(NumericType::Uint).with_facet("count").with_unit("1")),
+//!     Mapping::collection_string_state(status, subject, StateTemplate::new("status")),
+//! ])?;
+//!
+//! // Use spec with ConfiguredSubscription::new(endpoint, transport, spec).
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Collection paths have fixed element names and optional literal key filters.
 //! Extra response keys are allowed. Selected keys must be present, nonempty, and
 //! within the model's subject limits; invalid keys produce issues for that update.
@@ -128,6 +165,7 @@ pub use spec::StateIdentity;
 pub use spec::StateTemplate;
 pub use spec::SubjectTemplate;
 pub use spec::SubscriptionPath;
+pub use spec::SubscriptionRequest;
 pub use spec::SubscriptionSpec;
 use tonic::codegen::Body;
 use tonic::codegen::Bytes;
