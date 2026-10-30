@@ -22,9 +22,17 @@ if [ -z "$packages" ]; then
   exit 1
 fi
 
+# Default lint levels: an inherited `-D warnings` would fail the build on
+# other private dependencies before the filter below sees them.
+status=0
 # shellcheck disable=SC2086 # one argument per package
-diagnostics=$(cargo "+$toolchain" -Zpublic-dependency check --locked --all-features \
-  --lib $packages --target-dir target/public-dependency --message-format=json)
+diagnostics=$(RUSTFLAGS='' cargo "+$toolchain" -Zpublic-dependency check --locked \
+  --all-features --lib $packages --target-dir target/public-dependency \
+  --message-format=json) || status=$?
+if [ "$status" -ne 0 ]; then
+  jq -r 'select(.reason == "compiler-message") | .message.rendered' <<< "$diagnostics" >&2
+  exit "$status"
+fi
 leaks=$(jq -r 'select(.reason == "compiler-message")
   | select(.message.code.code == "exported_private_dependencies")
   | select(.message.message | test("private dependency .nv_redfish"))
