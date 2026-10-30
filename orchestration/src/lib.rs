@@ -28,6 +28,8 @@
 //! [`ReconnectPolicy`] chooses and the runtime sleeps to. The stream an
 //! attempt opens is drained outside the dispatcher through
 //! [`StreamReports`], one report per item, at the embedder's pace.
+//! [`StreamCancelHandle`] lets a control task cancel one stream pair while
+//! another task drains its reports. Cancellation produces no status or fault.
 //!
 //! This crate is runtime-free: leaf futures are plain boxed futures, the
 //! embedder owns the dispatcher `Runtime`, its timer (`SleepUntil` is a
@@ -70,6 +72,7 @@ pub use status::refused_status;
 pub use status::success_status;
 pub use status::trips_endpoint_breaker;
 pub use stream::ReconnectPolicy;
+pub use stream::StreamCancelHandle;
 pub use stream::StreamEnd;
 pub use stream::StreamReport;
 pub use stream::StreamReports;
