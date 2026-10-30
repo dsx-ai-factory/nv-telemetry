@@ -16,7 +16,6 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use http_body_util::Full;
-use nv_redfish_dispatcher::Scheduler;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::NumericValue;
@@ -27,9 +26,17 @@ use nv_telemetry_model::SignalKey;
 use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
+use nv_telemetry_orchestration::AcquisitionReport;
 use nv_telemetry_orchestration::Clock;
+use nv_telemetry_orchestration::Collected;
+use nv_telemetry_orchestration::Collector;
+use nv_telemetry_orchestration::EndpointPolicy;
+use nv_telemetry_orchestration::EndpointUnits;
 use nv_telemetry_orchestration::Needs;
+use nv_telemetry_orchestration::ReconnectPolicy;
+use nv_telemetry_orchestration::Reports;
 use nv_telemetry_orchestration::StreamNeed;
+use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailureClass as Class;
 use prost::Message;
@@ -188,6 +195,23 @@ impl Clock for FixedClock {
 
     fn instant(&self) -> Instant {
         Instant::now()
+    }
+}
+
+/// Collects one stream unit on the fixed clock.
+fn collect(stream: StreamUnit) -> (Collector, Reports) {
+    let (collector, reports) = Collector::new(FixedClock);
+    collector
+        .add(EndpointUnits::new(EndpointPolicy::default()).with_streams([stream]))
+        .expect("a stream forms an endpoint");
+    (collector, reports)
+}
+
+async fn next_report(reports: &mut Reports) -> AcquisitionReport {
+    match reports.next().await {
+        Some(Collected::Report(report)) => report,
+        Some(Collected::Retired(_)) => panic!("a report is due, not the retirement"),
+        None => panic!("a report is due, but the reports ended"),
     }
 }
 
@@ -1487,24 +1511,14 @@ async fn stream_unit_reports_mixed_notifications_transitions_and_distinct_collec
     )
     .expect("provider declaration");
 
-    let (mut leaf, mut reports) = nv_telemetry_orchestration::StreamUnit::new(
-        plan.streams()[0].clone(),
-        unit,
-        nv_telemetry_orchestration::ReconnectPolicy::default(),
-        FixedClock,
-    );
-
-    assert!(leaf.update_ready(Instant::now()).ready);
-    let work = leaf.take_next().expect("connect work");
-    let connected = work.payload.await.expect("connect report");
-
-    assert!(connected.is_empty());
+    let stream = StreamUnit::new(plan.streams()[0].clone(), unit, ReconnectPolicy::default());
+    let (_collector, mut reports) = collect(stream);
 
     for (index, (expected, count)) in [(Some(false), 2), (Some(true), 1), (None, 0)]
         .into_iter()
         .enumerate()
     {
-        let report = reports.next().await.expect("report").expect("projects");
+        let report = next_report(&mut reports).await;
 
         assert_eq!(report.status().provider(), "gnmi.configured");
         assert_eq!(report.status().request_class(), "configured-subscribe");
@@ -2213,17 +2227,10 @@ async fn collection_stream_reports_interfaces_components_and_issues_in_one_acqui
     )
     .unwrap();
 
-    let (mut leaf, mut reports) = nv_telemetry_orchestration::StreamUnit::new(
-        plan.streams()[0].clone(),
-        unit,
-        nv_telemetry_orchestration::ReconnectPolicy::default(),
-        FixedClock,
-    );
+    let stream = StreamUnit::new(plan.streams()[0].clone(), unit, ReconnectPolicy::default());
+    let (_collector, mut reports) = collect(stream);
 
-    assert!(leaf.update_ready(Instant::now()).ready);
-    assert!(leaf.take_next().unwrap().payload.await.unwrap().is_empty());
-
-    let report = reports.next().await.unwrap().unwrap();
+    let report = next_report(&mut reports).await;
 
     assert_eq!(report.status().outcome(), Outcome::Succeeded);
     assert_eq!(report.batches().len(), 2);

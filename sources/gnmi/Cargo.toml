@@ -20,7 +20,6 @@ tonic-prost.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-nv-redfish-dispatcher.workspace = true
 nv-telemetry-orchestration.workspace = true
 tokio.workspace = true
 

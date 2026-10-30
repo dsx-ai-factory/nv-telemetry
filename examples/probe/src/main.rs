@@ -6,10 +6,8 @@
 //! streams — batches, statuses, and issues — one tagged line each.
 //!
 //! This binary is the embedder role the architecture assigns outside the
-//! library: it owns the endpoint list, the driving loop, and the timer.
-//! `SleepUntil` is a hint delivered once, so the loop retains the latest
-//! deadline and races the runtime against a sleep — the canonical driver
-//! shape.
+//! library: it owns the endpoint list, binds each planned acquisition to
+//! its unit, hands them to the collector, and consumes the reports.
 
 // A command-line tool reports on stdout and stderr; the workspace lint that
 // keeps printing out of library code does not apply to this target.
@@ -26,24 +24,19 @@ use nv_redfish::bmc_http::BmcCredentials;
 use nv_redfish::bmc_http::CacheSettings;
 use nv_redfish::bmc_http::HttpBmc;
 use nv_redfish_bmc_mock::Expect;
-use nv_redfish_dispatcher::ClockConfig;
-use nv_redfish_dispatcher::Runtime;
-use nv_redfish_dispatcher::RuntimeConfig;
-use nv_redfish_dispatcher::RuntimeOutput;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Outcome;
-use nv_telemetry_orchestration::endpoint_subtree;
 use nv_telemetry_orchestration::plan;
 use nv_telemetry_orchestration::AcquisitionReport;
-use nv_telemetry_orchestration::EndpointFault;
+use nv_telemetry_orchestration::Collected;
+use nv_telemetry_orchestration::Collector;
 use nv_telemetry_orchestration::EndpointPolicy;
+use nv_telemetry_orchestration::EndpointUnits;
 use nv_telemetry_orchestration::Needs;
-use nv_telemetry_orchestration::PollMeta;
 use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::ReconnectPolicy;
 use nv_telemetry_orchestration::StreamNeed;
-use nv_telemetry_orchestration::StreamReports;
 use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_orchestration::SystemClock;
 use nv_telemetry_probe::BmcTransport;
@@ -70,7 +63,7 @@ usage: nv-telemetry-probe --mode mock|http --endpoint-id <id>
           self-signed BMC certificates
 
 --event-stream (http only) also plans the endpoint's server-sent event
-stream; each Event payload is one report. The dispatcher reopens a stream
+stream; each Event payload is one report. The collector reopens a stream
 that ends after a backoff that doubles while instances deliver nothing,
 staggered per endpoint, unless the failure that ended it was not retryable.
 
@@ -228,7 +221,6 @@ async fn run(args: &Args) -> Result<(), String> {
         .build()
         .map_err(|error| format!("endpoint id: {error}"))?;
 
-    let clock = SystemClock::default();
     let needs = args
         .sensors
         .iter()
@@ -286,9 +278,9 @@ async fn run(args: &Args) -> Result<(), String> {
             let bmc = Arc::new(nv_redfish_bmc_mock::Bmc::<nv_redfish_bmc_mock::Error>::default());
             prime_mock(&bmc, args);
             let service = Arc::new(RedfishService::new(BmcTransport::new(bmc)));
-            let units = units(&plan, &service, clock);
-            let streams = streams(&plan, &service, clock);
-            drive(&endpoint, units, streams, clock, args).await
+            let units = units(&plan, &service);
+            let streams = streams(&plan, &service);
+            drive(&endpoint, units, streams, args).await
         }
         Mode::Http => {
             let base = args.base_url.as_deref().expect("checked at parse time");
@@ -307,9 +299,9 @@ async fn run(args: &Args) -> Result<(), String> {
                 CacheSettings::default(),
             ));
             let service = Arc::new(RedfishService::new(BmcTransport::new(bmc)));
-            let units = units(&plan, &service, clock);
-            let streams = streams(&plan, &service, clock);
-            drive(&endpoint, units, streams, clock, args).await
+            let units = units(&plan, &service);
+            let streams = streams(&plan, &service);
+            drive(&endpoint, units, streams, args).await
         }
     }
 }
@@ -369,7 +361,6 @@ fn credentials_from_env() -> Result<BmcCredentials, String> {
 fn units<T: RedfishTransport>(
     plan: &nv_telemetry_orchestration::Plan,
     service: &Arc<RedfishService<T>>,
-    clock: SystemClock,
 ) -> Vec<PollUnit> {
     plan.polls()
         .iter()
@@ -378,16 +369,16 @@ fn units<T: RedfishTransport>(
             let target = planned.target();
             if planned.origin().request_class() == SensorRead::<T>::REQUEST_CLASS {
                 let unit = SensorRead::new(endpoint, target, Arc::clone(service));
-                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+                PollUnit::new(planned.clone(), Arc::new(unit))
             } else if planned.origin().request_class() == ChassisRead::<T>::REQUEST_CLASS {
                 let unit = ChassisRead::new(endpoint, target, Arc::clone(service));
-                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+                PollUnit::new(planned.clone(), Arc::new(unit))
             } else if planned.origin().request_class() == LogRead::<T>::REQUEST_CLASS {
                 let unit = LogRead::new(endpoint, target, Arc::clone(service));
-                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+                PollUnit::new(planned.clone(), Arc::new(unit))
             } else if planned.origin().request_class() == FirmwareRead::<T>::REQUEST_CLASS {
                 let unit = FirmwareRead::new(endpoint, target, Arc::clone(service));
-                PollUnit::new(planned.clone(), Arc::new(unit), &clock)
+                PollUnit::new(planned.clone(), Arc::new(unit))
             } else {
                 unreachable!("the plan selects only declared providers")
             }
@@ -396,24 +387,17 @@ fn units<T: RedfishTransport>(
 }
 
 /// The streamed half of the class dispatch: each planned stream to the
-/// provider that declared its class, paired with the reports the driving
-/// loop pulls.
+/// provider that declared its class.
 fn streams<T: RedfishTransport>(
     plan: &nv_telemetry_orchestration::Plan,
     service: &Arc<RedfishService<T>>,
-    clock: SystemClock,
-) -> Vec<(StreamUnit, StreamReports)> {
+) -> Vec<StreamUnit> {
     plan.streams()
         .iter()
         .map(|planned| {
             if planned.origin().request_class() == EventStream::<T>::REQUEST_CLASS {
                 let unit = EventStream::new(planned.endpoint().clone(), Arc::clone(service));
-                StreamUnit::new(
-                    planned.clone(),
-                    Arc::new(unit),
-                    ReconnectPolicy::default(),
-                    clock,
-                )
+                StreamUnit::new(planned.clone(), Arc::new(unit), ReconnectPolicy::default())
             } else {
                 unreachable!("the plan selects only declared providers")
             }
@@ -430,53 +414,27 @@ struct Tally {
 }
 
 impl Tally {
-    fn record(&mut self, result: Result<Vec<AcquisitionReport>, EndpointFault>) {
-        match result {
-            Ok(reports) => {
-                for report in reports {
-                    let (batches, issues, status) = report.into_parts();
-                    self.failures += usize::from(status.outcome() == Outcome::Failed);
-                    for batch in batches {
-                        println!("batch: {batch:?}");
-                    }
-                    if let Some(issues) = issues {
-                        self.issue_reports += 1;
-                        println!("issues: {issues:?}");
-                    }
-                    println!("status: {status:?}");
-                    self.reports += 1;
-                }
-            }
-            Err(fault) => {
-                self.failures += 1;
-                println!("status: {:?}", fault.into_status());
-                self.reports += 1;
-            }
+    fn record(&mut self, report: AcquisitionReport) {
+        let (batches, issues, status) = report.into_parts();
+        self.failures += usize::from(status.outcome() == Outcome::Failed);
+        for batch in batches {
+            println!("batch: {batch:?}");
         }
+        if let Some(issues) = issues {
+            self.issue_reports += 1;
+            println!("issues: {issues:?}");
+        }
+        println!("status: {status:?}");
+        self.reports += 1;
     }
 }
 
 async fn drive(
     endpoint: &EndpointContext,
     units: Vec<PollUnit>,
-    streams: Vec<(StreamUnit, StreamReports)>,
-    clock: SystemClock,
+    streams: Vec<StreamUnit>,
     args: &Args,
 ) -> Result<(), String> {
-    let polled = !units.is_empty();
-    let (streams, reports): (Vec<StreamUnit>, Vec<StreamReports>) = streams.into_iter().unzip();
-    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, units, streams)
-        .map_err(|error| format!("recipe: {error}"))?;
-
-    let mut runtime: Runtime<AcquisitionReport, EndpointFault, PollMeta> = Runtime::new(
-        RuntimeConfig {
-            global_max_in_flight: std::num::NonZeroUsize::MIN,
-            clock: ClockConfig::Wallclock,
-        },
-        subtree,
-    );
-    let handle = runtime.handle();
-
     println!(
         "polling {} target(s) on `{}` every {:?}{}, {} report(s)",
         args.sensors.len()
@@ -485,7 +443,7 @@ async fn drive(
             + args.update_services.len(),
         endpoint.endpoint_id(),
         args.cadence,
-        if reports.is_empty() {
+        if streams.is_empty() {
             ""
         } else {
             " plus its event stream"
@@ -493,45 +451,25 @@ async fn drive(
         args.count
     );
 
-    // The streams' reports join the runtime's outputs. The runtime itself
-    // schedules every connect and reconnect; the reports end once policy
-    // has stopped the last stream.
-    let mut streaming = !reports.is_empty();
-    let mut reports = futures_util::stream::select_all(reports);
+    let (collector, mut reports) = Collector::new(SystemClock::default());
+    let units = EndpointUnits::new(EndpointPolicy::default())
+        .with_polls(units)
+        .with_streams(streams);
+    collector
+        .add(units)
+        .map_err(|error| format!("collector: {error}"))?;
 
+    // After the requested count, shutting down still delivers what is in
+    // flight; the one endpoint also retires on its own once its streams
+    // have stopped and it polls nothing.
     let mut tally = Tally::default();
-    let mut deadline = None;
-    loop {
-        // Three wake-ups: the runtime spoke, a stream reported or the last
-        // one ended, or the runtime's sleep hint came due.
-        tokio::select! {
-            output = runtime.next() => match output {
-                RuntimeOutput::SleepUntil(at) => deadline = Some(at),
-                RuntimeOutput::Work { result, .. } => tally.record(result),
-                RuntimeOutput::Shutdown => break,
-                RuntimeOutput::Runtime(_) => {}
-            },
-            report = reports.next(), if streaming => {
-                if let Some(report) = report {
-                    tally.record(report.map(|report| vec![report]));
-                } else {
-                    // With no polls beside the ended streams, nothing more
-                    // can report.
-                    streaming = false;
-                    if !polled {
-                        handle.graceful_shutdown();
-                    }
-                }
-            }
-            () = async {
-                match deadline {
-                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
-                    None => std::future::pending().await,
-                }
-            } => deadline = None,
+    while let Some(collected) = reports.next().await {
+        match collected {
+            Collected::Report(report) => tally.record(report),
+            Collected::Retired(_) => collector.shutdown(),
         }
         if tally.reports >= args.count {
-            handle.graceful_shutdown();
+            collector.shutdown();
         }
     }
     if args.strict && (tally.failures > 0 || tally.issue_reports > 0) {

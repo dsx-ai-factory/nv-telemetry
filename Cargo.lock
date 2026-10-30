@@ -1092,7 +1092,6 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "http-body-util",
- "nv-redfish-dispatcher",
  "nv-telemetry-model",
  "nv-telemetry-orchestration",
  "nv-telemetry-source",
@@ -1125,6 +1124,7 @@ dependencies = [
  "nv-redfish-dispatcher",
  "nv-telemetry-model",
  "nv-telemetry-source",
+ "tokio",
 ]
 
 [[package]]
@@ -1142,7 +1142,6 @@ dependencies = [
  "futures-util",
  "nv-redfish",
  "nv-redfish-bmc-mock",
- "nv-redfish-dispatcher",
  "nv-telemetry-model",
  "nv-telemetry-orchestration",
  "nv-telemetry-redfish",

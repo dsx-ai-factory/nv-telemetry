@@ -1,21 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The standard endpoint subtree: planned polls in, one dispatcher-ready
-//! scheduler out.
+//! The standard endpoint subtree: planned polls and streams in, one
+//! dispatcher-ready scheduler out.
 //!
 //! The milestone-1 slice of the architecture's admission stack — endpoint
 //! admission over the endpoint breaker over the rate bucket over the unit
 //! leaves. Units of different request classes share one round-robin
 //! ring; per-class lanes and the class breaker are deliberately absent
-//! until class-level policy exists. The embedder composes these
-//! subtrees under its own root and owns the `Runtime` driving loop; policy
-//! types here convert privately into dispatcher configuration, so the
-//! dispatcher's own vocabulary never leaks into embedder policy.
+//! until class-level policy exists. The collector seats each subtree on
+//! its own runtime; policy types here convert privately into dispatcher
+//! configuration, so the dispatcher's own vocabulary never leaks into
+//! embedder policy.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use nv_redfish_dispatcher::schedulers::BoundedConcurrency;
 use nv_redfish_dispatcher::schedulers::CircuitBreaker;
@@ -32,11 +33,12 @@ use nv_telemetry_model::Origin;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionParts;
 
-use crate::clock::Clock;
+use crate::clock::SharedClock;
 use crate::plan::PlannedPoll;
 use crate::report::poll_future;
 use crate::report::TelemetryWork;
 use crate::stream::ReconnectPolicy;
+use crate::stream::StreamReports;
 use crate::stream::StreamUnit;
 
 /// When the endpoint breaker opens and how it recovers.
@@ -89,14 +91,12 @@ impl BreakerPolicy {
     }
 }
 
-impl From<&BreakerPolicy> for CircuitBreakerConfig {
-    fn from(policy: &BreakerPolicy) -> Self {
-        Self {
-            failure_threshold: policy.failure_threshold,
-            sample_window: policy.sample_window,
-            min_samples: policy.min_samples,
-            cool_down: policy.cool_down,
-        }
+fn breaker_config(policy: &BreakerPolicy) -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: policy.failure_threshold,
+        sample_window: policy.sample_window,
+        min_samples: policy.min_samples,
+        cool_down: policy.cool_down,
     }
 }
 
@@ -137,13 +137,11 @@ impl RatePolicy {
     }
 }
 
-impl From<&RatePolicy> for TokenBucketConfig {
-    fn from(policy: &RatePolicy) -> Self {
-        Self {
-            capacity: CostUnits::new(policy.burst),
-            refill_amount: CostUnits::new(policy.refill),
-            refill_interval: policy.per,
-        }
+fn bucket_config(policy: &RatePolicy) -> TokenBucketConfig {
+    TokenBucketConfig {
+        capacity: CostUnits::new(policy.burst),
+        refill_amount: CostUnits::new(policy.refill),
+        refill_interval: policy.per,
     }
 }
 
@@ -191,16 +189,27 @@ impl EndpointPolicy {
 }
 
 /// The meta every unit under an endpoint subtree carries.
-pub type PollMeta = WithCost<()>;
+pub(crate) type PollMeta = WithCost<()>;
 
 /// The standard endpoint subtree: endpoint admission over the endpoint
 /// breaker over the rate bucket over the unit leaves.
-pub type EndpointSubtree = BoundedConcurrency<
+pub(crate) type EndpointSubtree = BoundedConcurrency<
     TelemetryWork,
     CircuitBreaker<TelemetryWork, TokenBucket<TelemetryWork, RoundRobin<TelemetryWork, PollMeta>>>,
 >;
 
-/// Why a subtree could not be built.
+/// One endpoint's subtree, ready for its runtime, and the reports of the
+/// streams seated in it.
+pub(crate) struct Seated {
+    pub(crate) endpoint: EndpointContext,
+    pub(crate) subtree: EndpointSubtree,
+    pub(crate) streams: Vec<StreamReports>,
+    /// Whether any poll is seated: without one, the endpoint has nothing
+    /// left to do once its streams stop.
+    pub(crate) polled: bool,
+}
+
+/// Why an endpoint could not be added.
 #[derive(Debug)]
 pub enum RecipeError {
     /// A subtree with no units schedules nothing and hides it.
@@ -235,6 +244,13 @@ pub enum RecipeError {
         /// The differing endpoint id.
         other: String,
     },
+    /// The endpoint is collected already, or still retiring.
+    AlreadyCollected {
+        /// The endpoint id.
+        endpoint: String,
+    },
+    /// The collector was shut down, or its reports were dropped.
+    ShutDown,
 }
 
 impl std::fmt::Display for RecipeError {
@@ -258,6 +274,10 @@ impl std::fmt::Display for RecipeError {
                 f,
                 "one subtree, one endpoint: got both `{first}` and `{other}`"
             ),
+            Self::AlreadyCollected { endpoint } => {
+                write!(f, "endpoint `{endpoint}` is collected already")
+            }
+            Self::ShutDown => f.write_str("the collector is shut down"),
         }
     }
 }
@@ -345,27 +365,24 @@ pub struct PollUnit {
     planned: PlannedPoll,
     unit_endpoint: EndpointContext,
     unit_origin: Origin,
-    make_work: Box<dyn FnMut() -> TelemetryWork + Send>,
+    work: Box<dyn Fn(&SharedClock) -> TelemetryWork + Send>,
 }
 
 impl PollUnit {
-    /// Pairs a planned poll with its unit. `clock` must be the clock the
-    /// subtree is later built with, so admitted stamps and leaf epochs
-    /// share one timeline. No checking happens here; the recipe compares
-    /// the plan against the unit's identity when the subtree is built.
-    pub fn new<A, C>(planned: PlannedPoll, unit: Arc<A>, clock: &C) -> Self
+    /// Pairs a planned poll with its unit. The collector's clock stamps
+    /// every acquisition. No checking happens here; the collector compares
+    /// the plan against the unit's identity when the endpoint is added.
+    pub fn new<A>(planned: PlannedPoll, unit: Arc<A>) -> Self
     where
         A: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
-        C: Clock + Clone + 'static,
     {
         let unit_endpoint = unit.endpoint().clone();
         let unit_origin = unit.origin().clone();
-        let clock = clock.clone();
         Self {
             planned,
             unit_endpoint,
             unit_origin,
-            make_work: Box::new(move || poll_future(Arc::clone(&unit), clock.clone())),
+            work: Box::new(move |clock| poll_future(Arc::clone(&unit), Arc::clone(clock))),
         }
     }
 }
@@ -379,11 +396,11 @@ impl std::fmt::Debug for PollUnit {
 }
 
 /// Builds one endpoint's subtree from its planned polls and streams, each
-/// bound to its unit. Leaf epochs and the bucket epoch come from `clock`,
-/// so the subtree and whatever timeline drives the runtime cannot diverge.
-/// Units of different request classes, polled or streamed, share the
-/// round-robin ring; per-class lanes and the class breaker remain
-/// deliberately absent.
+/// bound to its unit and stamping on `clock`. Leaf epochs and the bucket
+/// epoch are `now`, on the timeline of the runtime that will drive the
+/// subtree. Units of different request classes, polled or
+/// streamed, share the round-robin ring; per-class lanes and the class
+/// breaker remain deliberately absent.
 ///
 /// # Errors
 ///
@@ -393,25 +410,23 @@ impl std::fmt::Debug for PollUnit {
 /// / [`RecipeError::OriginMismatch`] when a planned acquisition and its
 /// unit disagree; and [`RecipeError::MixedEndpoints`] when the units span
 /// more than one endpoint.
-pub fn endpoint_subtree<C: Clock>(
+pub(crate) fn endpoint_subtree(
     policy: &EndpointPolicy,
-    clock: &C,
+    clock: &SharedClock,
+    now: Instant,
     units: Vec<PollUnit>,
     streams: Vec<StreamUnit>,
-) -> Result<EndpointSubtree, RecipeError> {
-    let subtree_endpoint = units
+) -> Result<Seated, RecipeError> {
+    let endpoint = units
         .first()
-        .map(|unit| unit.planned.endpoint().endpoint_id())
-        .or_else(|| {
-            streams
-                .first()
-                .map(|stream| stream.planned().endpoint().endpoint_id())
-        })
+        .map(|unit| unit.planned.endpoint())
+        .or_else(|| streams.first().map(|stream| stream.planned().endpoint()))
         .ok_or(RecipeError::NoUnits)?
-        .to_owned();
+        .clone();
+    let subtree_endpoint = endpoint.endpoint_id().to_owned();
+    let polled = !units.is_empty();
     validate(policy)?;
 
-    let now = clock.instant();
     let mut lanes = RoundRobin::new();
     for unit in units {
         let planned = &unit.planned;
@@ -433,9 +448,13 @@ pub fn endpoint_subtree<C: Clock>(
                 unit: Box::new(unit.unit_origin.clone()),
             });
         }
-        let leaf = PeriodicLeaf::new(now, planned.cadence(), unit.make_work);
-        lanes.add_child(FixedCost::new(CostUnits::new(planned.cost()), leaf));
+        let cost = CostUnits::new(planned.cost());
+        let work = unit.work;
+        let clock = Arc::clone(clock);
+        let leaf = PeriodicLeaf::new(now, planned.cadence(), move || work(&clock));
+        lanes.add_child(FixedCost::new(cost, leaf));
     }
+    let mut reports = Vec::with_capacity(streams.len());
     for stream in streams {
         let planned = stream.planned();
         if planned.endpoint().endpoint_id() != subtree_endpoint {
@@ -458,16 +477,24 @@ pub fn endpoint_subtree<C: Clock>(
         }
         validate_reconnect(stream.policy())?;
         let cost = CostUnits::new(planned.cost());
-        lanes.add_child(FixedCost::new(cost, stream));
+        let (leaf, stream_reports) = stream.bind(clock);
+        lanes.add_child(FixedCost::new(cost, leaf));
+        reports.push(stream_reports);
     }
 
-    Ok(BoundedConcurrency::new(
+    let subtree = BoundedConcurrency::new(
         policy.max_in_flight,
         CircuitBreaker::new(
-            (&policy.breaker).into(),
-            TokenBucket::new(now, (&policy.rate).into(), lanes),
+            breaker_config(&policy.breaker),
+            TokenBucket::new(now, bucket_config(&policy.rate), lanes),
         ),
-    ))
+    );
+    Ok(Seated {
+        endpoint,
+        subtree,
+        streams: reports,
+        polled,
+    })
 }
 
 #[cfg(test)]

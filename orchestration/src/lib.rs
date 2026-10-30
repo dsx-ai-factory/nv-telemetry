@@ -1,39 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Planning and dispatcher vocabulary.
+//! Planning and collection.
 //!
 //! Orchestration owns everything between the acquisition contract and the
-//! embedder's driving loop: the clock that stamps admitted instants, the
-//! failure-class policy tables, and the assembly of every
-//! [`AcquisitionStatus`](nv_telemetry_model::AcquisitionStatus) and
-//! [`ProjectionIssues`](nv_telemetry_model::ProjectionIssues) envelope —
-//! sources never author either. One polled acquisition or reportable
-//! subscription item yields exactly one [`AcquisitionReport`] or endpoint
-//! fault, each carrying exactly one status. Stream synchronization controls
-//! and cancellation yield neither.
+//! embedder's consumer: the clock that stamps admitted instants, the
+//! failure-class policy tables, the dispatcher runtimes, and the assembly
+//! of every [`AcquisitionStatus`](nv_telemetry_model::AcquisitionStatus)
+//! and [`ProjectionIssues`](nv_telemetry_model::ProjectionIssues) envelope
+//! — sources never author either. One polled acquisition or reportable
+//! subscription item yields exactly one [`AcquisitionReport`], carrying
+//! exactly one status. Stream synchronization controls and cancellation
+//! yield none.
 //!
 //! The planner ([`plan`]) is static and deterministic: needs in, planned
 //! polls out, exactly one polled declaration serving each need's request
-//! class. The recipe
-//! ([`endpoint_subtree`]) turns a plan into the standard admission stack —
+//! class. The embedder binds each planned acquisition to its unit
+//! ([`PollUnit`], [`StreamUnit`]) and hands one endpoint's units to the
+//! [`Collector`], which seats them in the standard admission stack —
 //! endpoint admission over the endpoint breaker over the rate bucket over
-//! the unit leaves. Breaker scope rides the work's channel: only
-//! endpoint-scoped failures travel as errors, so the breaker samples
-//! exactly the classes that indict the endpoint.
+//! the unit leaves — on a dispatcher runtime of the endpoint's own.
+//! Breaker scope rides the work's channel: only endpoint-scoped failures
+//! travel as errors, so the breaker samples exactly the classes that
+//! indict the endpoint.
 //!
-//! A stream ([`StreamUnit`]) enters the same subtree as its own connect
-//! leaf: each connect attempt is one admission, charged and breaker-sampled
-//! like a poll, and each reconnect is a due instant the leaf's
-//! [`ReconnectPolicy`] chooses and the runtime sleeps to. The stream an
-//! attempt opens is drained outside the dispatcher through
-//! [`StreamReports`], one report per item, at the embedder's pace.
+//! A stream enters the same subtree as its own connect leaf: each connect
+//! attempt is one admission, charged and breaker-sampled like a poll, and
+//! each reconnect is a due instant the unit's [`ReconnectPolicy`] chooses
+//! and the runtime sleeps to. The stream an attempt opens is drained
+//! outside the dispatcher, one report per item, at the consumer's pace.
 //!
-//! This crate is runtime-free: leaf futures are plain boxed futures, the
-//! embedder owns the dispatcher `Runtime`, its timer (`SleepUntil` is a
-//! hint delivered once, never a wake-up), and all fan-out.
+//! The collector runs on tokio: one task per endpoint, sleeping to the
+//! endpoint's next due unit. Every report reaches the embedder through
+//! one bounded [`Reports`] stream.
 
 mod clock;
+mod collector;
 mod plan;
 mod recipe;
 mod report;
@@ -42,6 +44,10 @@ mod stream;
 
 pub use clock::Clock;
 pub use clock::SystemClock;
+pub use collector::Collected;
+pub use collector::Collector;
+pub use collector::EndpointUnits;
+pub use collector::Reports;
 pub use plan::plan;
 pub use plan::Needs;
 pub use plan::Plan;
@@ -50,20 +56,12 @@ pub use plan::PlannedPoll;
 pub use plan::PlannedStream;
 pub use plan::PollNeed;
 pub use plan::StreamNeed;
-pub use recipe::endpoint_subtree;
 pub use recipe::BreakerPolicy;
 pub use recipe::EndpointPolicy;
-pub use recipe::EndpointSubtree;
-pub use recipe::PollMeta;
 pub use recipe::PollUnit;
 pub use recipe::RatePolicy;
 pub use recipe::RecipeError;
-pub use report::assemble;
-pub use report::assemble_stream_item;
-pub use report::poll_future;
 pub use report::AcquisitionReport;
-pub use report::EndpointFault;
-pub use report::TelemetryWork;
 pub use status::default_retryable;
 pub use status::failed_status;
 pub use status::refused_status;
@@ -71,6 +69,7 @@ pub use status::success_status;
 pub use status::trips_endpoint_breaker;
 pub use stream::ReconnectPolicy;
 pub use stream::StreamEnd;
-pub use stream::StreamReport;
-pub use stream::StreamReports;
 pub use stream::StreamUnit;
+
+#[cfg(test)]
+mod tests;
