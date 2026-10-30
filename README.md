@@ -74,8 +74,8 @@ make rust-install
 make all
 ```
 
-`make all` checks formatting, protobuf lint, generated output, Redfish feature
-combinations, clippy, builds, tests, and API documentation. CI uses `make ci`,
+`make all` checks formatting, protobuf lint, generated output, clippy, builds,
+tests, and API documentation. CI uses `make ci`,
 which installs the formatting toolchain before the same checks. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution and DCO process.
 
