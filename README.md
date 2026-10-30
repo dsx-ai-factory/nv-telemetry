@@ -30,7 +30,7 @@ source/               nv-telemetry-source         acquisition contract
 sources/
   redfish/            nv-telemetry-redfish        HTTP/JSON, OData, DMTF schemas
   gnmi/               nv-telemetry-gnmi           gRPC subscribe, YANG paths
-orchestration/        nv-telemetry-orchestration  planner, providers, recipes
+orchestration/        nv-telemetry-orchestration  planner, collector, recipes
 examples/
   probe/              nv-telemetry-probe          demo embedder (not published)
 export/               nv-telemetry-export         shared batch traversal

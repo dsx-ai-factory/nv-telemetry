@@ -6,21 +6,22 @@
 //! A stream is not a poll. Its connect attempt is one admission through the
 //! endpoint's breaker and bucket, like a poll; the stream it opens is then
 //! drained outside the dispatcher, because a work item completes once while
-//! a stream yields for its lifetime. [`StreamUnit`] is the connect leaf the
-//! recipe seats in the endpoint's subtree: due at construction, due again
-//! at the instant its [`ReconnectPolicy`] chooses once an instance ends,
-//! and never once that policy says stop. The runtime schedules every
-//! reconnect as it schedules a poll's next tick, sleeping to the due
-//! instant, so no loop and no timer exist beside the dispatcher.
-//! [`StreamReports`] is the other half: the reports the embedder pulls, one
-//! per item, at its own pace, so backpressure reaches the socket.
+//! a stream yields for its lifetime. A [`StreamUnit`] becomes two halves
+//! when the collector seats it. The connect leaf sits in the endpoint's
+//! subtree: due at seating, due again at the instant its [`ReconnectPolicy`]
+//! chooses once an instance ends, and never once that policy says stop.
+//! The runtime schedules every reconnect as it schedules a poll's next
+//! tick, sleeping to the due instant, so no loop and no timer exist beside
+//! the dispatcher. The reports are the other half: the collector pulls
+//! them one per item as fast as its consumer takes them, so backpressure
+//! reaches the socket.
 //!
 //! A failed connect is reported through the dispatcher, where the breaker
 //! samples it; a successful one earns no status, as the contract has it. A
 //! failure mid-stream reaches the reports, not the dispatcher, so the
 //! breaker learns of a dead stream only from the next connect attempt.
-//! Dropping the reports cancels the stream: an attempt already taken by
-//! the runtime still runs, but opens nothing.
+//! Dropping the reports, as retiring the endpoint does, cancels the stream:
+//! an attempt already taken by the runtime still runs, but opens nothing.
 
 use std::fmt;
 use std::pin::Pin;
@@ -44,10 +45,11 @@ use nv_redfish_dispatcher::ScheduledWork;
 use nv_redfish_dispatcher::Scheduler;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Origin;
+use nv_telemetry_model::Timestamp;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::SubscriptionItem;
 
-use crate::clock::Clock;
+use crate::clock::SharedClock;
 use crate::plan::PlannedStream;
 use crate::report::assemble;
 use crate::report::assemble_stream_item;
@@ -56,11 +58,35 @@ use crate::report::EndpointFault;
 use crate::report::TelemetryWork;
 use crate::status::resolved_retryable;
 
-/// One report as the embedder pulls it: a poll's shape, one at a time.
-pub type StreamReport = Result<AcquisitionReport, EndpointFault>;
+/// One report as the collector pulls it: a poll's shape, one at a time.
+pub(crate) type StreamReport = Result<AcquisitionReport, EndpointFault>;
 
 /// The opened stream, erased so every connect attempt hands over one shape.
 type Items = BoxStream<'static, SubscriptionItem>;
+
+/// A stream unit erased to what its leaf and its reports call, so units of
+/// different types share one subtree.
+trait Subscribe: Send + Sync {
+    /// Opens one connect attempt as dispatcher work.
+    fn connect(self: Arc<Self>, clock: SharedClock, shared: SharedState) -> TelemetryWork;
+
+    /// Assembles one item the opened stream yielded, stamped `at`.
+    fn assemble(&self, at: Timestamp, item: SubscriptionItem) -> StreamReport;
+}
+
+impl<A> Subscribe for A
+where
+    A: Acquire + Send + Sync + 'static,
+    A::Output: Stream<Item = SubscriptionItem> + Send + 'static,
+{
+    fn connect(self: Arc<Self>, clock: SharedClock, shared: SharedState) -> TelemetryWork {
+        connect_future(self, clock, shared)
+    }
+
+    fn assemble(&self, at: Timestamp, item: SubscriptionItem) -> StreamReport {
+        assemble_stream_item(self, at, item)
+    }
+}
 
 /// When a stream that ended is opened again. The delay after an instance
 /// that delivered nothing doubles with each such instance in a row, up to
@@ -227,67 +253,57 @@ fn lock(shared: &SharedState) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One planned stream bound to its acquisition unit: the connect leaf the
-/// recipe seats in the endpoint's subtree.
+/// One planned stream bound to its acquisition unit, ready for the
+/// collector to seat in the endpoint's subtree.
 pub struct StreamUnit {
     planned: PlannedStream,
     unit_endpoint: EndpointContext,
     unit_origin: Origin,
     policy: ReconnectPolicy,
-    shared: SharedState,
-    connect: Box<dyn FnMut() -> TelemetryWork + Send>,
-    last_now: Option<Instant>,
-    /// Instances in a row that delivered nothing, the last one included.
-    unproductive: u32,
+    unit: Arc<dyn Subscribe>,
 }
 
 impl StreamUnit {
-    /// Pairs a planned stream with its unit: the leaf for the recipe and
-    /// the reports for the embedder. `clock` stamps the items and must be
-    /// the clock the subtree is built with, as for a poll; the runtime's
-    /// own clock times the reconnects. No checking happens here; the
-    /// recipe compares the plan against the unit's identity when the
-    /// subtree is built.
-    pub fn new<A, C>(
-        planned: PlannedStream,
-        unit: Arc<A>,
-        policy: ReconnectPolicy,
-        clock: C,
-    ) -> (Self, StreamReports)
+    /// Pairs a planned stream with its unit. The collector's clock stamps
+    /// the items; the runtime times the reconnects. No checking happens
+    /// here; the collector compares the plan against the unit's identity
+    /// when the endpoint is added.
+    pub fn new<A>(planned: PlannedStream, unit: Arc<A>, policy: ReconnectPolicy) -> Self
     where
         A: Acquire + Send + Sync + 'static,
         A::Output: Stream<Item = SubscriptionItem> + Send + 'static,
-        C: Clock + Clone + 'static,
     {
-        let unit_endpoint = unit.endpoint().clone();
-        let unit_origin = unit.origin().clone();
+        Self {
+            planned,
+            unit_endpoint: unit.endpoint().clone(),
+            unit_origin: unit.origin().clone(),
+            policy,
+            unit,
+        }
+    }
+
+    /// Splits the unit into the connect leaf and its reports, both stamping
+    /// on `clock`.
+    pub(crate) fn bind(self, clock: &SharedClock) -> (StreamLeaf, StreamReports) {
         let shared = Arc::new(Mutex::new(Shared {
             phase: Phase::Due(None),
             opened: None,
             reports: None,
             runtime: None,
         }));
-        let connect = {
-            let unit = Arc::clone(&unit);
-            let clock = clock.clone();
-            let shared = Arc::clone(&shared);
-            Box::new(move || connect_future(Arc::clone(&unit), clock.clone(), Arc::clone(&shared)))
-        };
         let reports = StreamReports {
             shared: Arc::clone(&shared),
             current: None,
             productive: false,
-            assemble: Box::new(move |item| {
-                assemble_stream_item(unit.as_ref(), clock.timestamp(), item)
-            }),
+            unit: Arc::clone(&self.unit),
+            clock: Arc::clone(clock),
         };
-        let leaf = Self {
-            planned,
-            unit_endpoint,
-            unit_origin,
-            policy,
+        let leaf = StreamLeaf {
+            planned: self.planned,
+            policy: self.policy,
             shared,
-            connect,
+            unit: self.unit,
+            clock: Arc::clone(clock),
             last_now: None,
             unproductive: 0,
         };
@@ -309,7 +325,30 @@ impl StreamUnit {
     pub(crate) fn policy(&self) -> &ReconnectPolicy {
         &self.policy
     }
+}
 
+impl fmt::Debug for StreamUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamUnit")
+            .field("planned", &self.planned)
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The connect leaf a seated stream unit becomes.
+pub(crate) struct StreamLeaf {
+    planned: PlannedStream,
+    policy: ReconnectPolicy,
+    shared: SharedState,
+    unit: Arc<dyn Subscribe>,
+    clock: SharedClock,
+    last_now: Option<Instant>,
+    /// Instances in a row that delivered nothing, the last one included.
+    unproductive: u32,
+}
+
+impl StreamLeaf {
     fn due(phase: Phase, now: Instant) -> bool {
         match phase {
             Phase::Due(None) => true,
@@ -350,7 +389,7 @@ impl StreamUnit {
     }
 }
 
-impl Scheduler<TelemetryWork> for StreamUnit {
+impl Scheduler<TelemetryWork> for StreamLeaf {
     type Meta = ();
 
     fn update_ready(&mut self, now: Instant) -> Readiness {
@@ -379,7 +418,9 @@ impl Scheduler<TelemetryWork> for StreamUnit {
         }
         state.phase = Phase::Connecting;
         drop(state);
-        Some(ScheduledWork::new((), (self.connect)()))
+        let attempt =
+            Arc::clone(&self.unit).connect(Arc::clone(&self.clock), Arc::clone(&self.shared));
+        Some(ScheduledWork::new((), attempt))
     }
 
     fn on_complete(&mut self, _completion: Completion<()>) {
@@ -392,7 +433,7 @@ impl Scheduler<TelemetryWork> for StreamUnit {
     }
 }
 
-impl Drop for StreamUnit {
+impl Drop for StreamLeaf {
     fn drop(&mut self) {
         // The subtree is gone: the reports end once their stream does.
         let mut state = lock(&self.shared);
@@ -401,24 +442,14 @@ impl Drop for StreamUnit {
     }
 }
 
-impl fmt::Debug for StreamUnit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamUnit")
-            .field("planned", &self.planned)
-            .field("policy", &self.policy)
-            .finish_non_exhaustive()
-    }
-}
-
 /// The connect attempt as dispatcher work: `perform` under the endpoint's
 /// admission. An opened stream goes to the reports and earns no status; a
 /// failed attempt is assembled like a failed poll, so an endpoint-scoped
 /// failure reaches the breaker.
-fn connect_future<A, C>(unit: Arc<A>, clock: C, shared: SharedState) -> TelemetryWork
+fn connect_future<A>(unit: Arc<A>, clock: SharedClock, shared: SharedState) -> TelemetryWork
 where
     A: Acquire + Send + Sync + 'static,
     A::Output: Stream<Item = SubscriptionItem> + Send + 'static,
-    C: Clock + 'static,
 {
     Box::pin(async move {
         let stopped = lock(&shared).phase == Phase::Stopped;
@@ -464,15 +495,16 @@ where
     })
 }
 
-/// The reports of one stream, pulled by the embedder: one per item, at the
-/// consumer's pace. Ends when the stream's policy says stop, or when the
-/// subtree seating its leaf is gone.
-pub struct StreamReports {
+/// The reports of one stream, pulled by the collector: one per item, at
+/// the consumer's pace. Ends when the stream's policy says stop, or when
+/// the subtree seating its leaf is gone.
+pub(crate) struct StreamReports {
     shared: SharedState,
     current: Option<Items>,
     /// Whether the current instance delivered an item.
     productive: bool,
-    assemble: Box<dyn FnMut(SubscriptionItem) -> StreamReport + Send>,
+    unit: Arc<dyn Subscribe>,
+    clock: SharedClock,
 }
 
 impl StreamReports {
@@ -505,7 +537,7 @@ impl Stream for StreamReports {
                 match items.as_mut().poll_next(cx) {
                     Poll::Ready(Some(item)) => {
                         let terminal = item.as_ref().err().map(resolved_retryable);
-                        let report = (this.assemble)(item);
+                        let report = this.unit.assemble(this.clock.timestamp(), item);
                         match terminal {
                             Some(retryable) => this.ended(StreamEnd::Failed { retryable }),
                             None => this.productive = true,

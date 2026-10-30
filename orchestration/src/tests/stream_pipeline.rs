@@ -37,30 +37,33 @@ use nv_telemetry_model::Outcome;
 use nv_telemetry_model::Payload;
 use nv_telemetry_model::States;
 use nv_telemetry_model::Timestamp;
-use nv_telemetry_orchestration::endpoint_subtree;
-use nv_telemetry_orchestration::plan;
-use nv_telemetry_orchestration::AcquisitionReport;
-use nv_telemetry_orchestration::Clock;
-use nv_telemetry_orchestration::EndpointFault;
-use nv_telemetry_orchestration::EndpointPolicy;
-use nv_telemetry_orchestration::EndpointSubtree;
-use nv_telemetry_orchestration::Needs;
-use nv_telemetry_orchestration::PlannedStream;
-use nv_telemetry_orchestration::PollMeta;
-use nv_telemetry_orchestration::PollNeed;
-use nv_telemetry_orchestration::PollUnit;
-use nv_telemetry_orchestration::RecipeError;
-use nv_telemetry_orchestration::ReconnectPolicy;
-use nv_telemetry_orchestration::StreamNeed;
-use nv_telemetry_orchestration::StreamReport;
-use nv_telemetry_orchestration::StreamReports;
-use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProviderDeclaration;
 use nv_telemetry_source::SubscriptionItem;
+
+use crate::clock::SharedClock;
+use crate::plan;
+use crate::recipe::endpoint_subtree;
+use crate::recipe::EndpointSubtree;
+use crate::recipe::PollMeta;
+use crate::recipe::Seated;
+use crate::report::EndpointFault;
+use crate::stream::StreamReport;
+use crate::stream::StreamReports;
+use crate::AcquisitionReport;
+use crate::Clock;
+use crate::EndpointPolicy;
+use crate::Needs;
+use crate::PlannedStream;
+use crate::PollNeed;
+use crate::PollUnit;
+use crate::RecipeError;
+use crate::ReconnectPolicy;
+use crate::StreamNeed;
+use crate::StreamUnit;
 
 const BASE_SECONDS: i64 = 1_785_621_243;
 const POLL_PROVIDER: &str = "fixture.sensor";
@@ -212,7 +215,7 @@ impl Acquire for FixturePoll {
 }
 
 /// One planned poll of `endpoint` every 30 seconds, with its unit.
-fn planned_poll(endpoint: EndpointContext, clock: &TestClock) -> PollUnit {
+fn planned_poll(endpoint: EndpointContext) -> PollUnit {
     let need = PollNeed::new(
         endpoint.clone(),
         POLL_CLASS,
@@ -228,7 +231,7 @@ fn planned_poll(endpoint: EndpointContext, clock: &TestClock) -> PollUnit {
         endpoint,
         origin: origin(POLL_PROVIDER, POLL_CLASS),
     });
-    PollUnit::new(plan.polls()[0].clone(), unit, clock)
+    PollUnit::new(plan.polls()[0].clone(), unit)
 }
 
 /// One planned stream of `endpoint`, served by `provider`.
@@ -257,11 +260,11 @@ struct TestClock {
 }
 
 impl TestClock {
-    fn new(manual: &ManualClock) -> Self {
-        Self {
+    fn shared(manual: &ManualClock) -> SharedClock {
+        Arc::new(Self {
             manual: manual.clone(),
             epoch: manual.now(),
-        }
+        })
     }
 }
 
@@ -311,18 +314,23 @@ struct Rig {
 
 fn rig_with(unit: Arc<FixtureSubscription>) -> Rig {
     let manual = ManualClock::new();
-    let clock = TestClock::new(&manual);
-    let (stream, reports) = StreamUnit::new(
-        planned_stream(endpoint(), STREAM_PROVIDER),
-        unit,
-        policy(),
-        clock.clone(),
-    );
-    let subtree = endpoint_subtree(&EndpointPolicy::default(), &clock, Vec::new(), vec![stream])
-        .expect("a stream alone forms a subtree");
+    let clock = TestClock::shared(&manual);
+    let stream = StreamUnit::new(planned_stream(endpoint(), STREAM_PROVIDER), unit, policy());
+    let Seated {
+        subtree,
+        mut streams,
+        ..
+    } = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        clock.instant(),
+        Vec::new(),
+        vec![stream],
+    )
+    .expect("a stream alone forms a subtree");
     Rig {
         runtime: runtime(subtree, &manual),
-        reports,
+        reports: streams.pop().expect("the stream's reports"),
         manual,
     }
 }
@@ -665,21 +673,22 @@ fn dropping_the_subtree_ends_the_reports_after_the_current_instance() {
 #[test]
 fn a_poll_and_a_stream_share_one_endpoints_subtree() {
     let manual = ManualClock::new();
-    let clock = TestClock::new(&manual);
+    let clock = TestClock::shared(&manual);
     let unit = FixtureSubscription::scripted(endpoint(), vec![Ok(vec![Ok(states_parts())])]);
-    let (stream, mut reports) = StreamUnit::new(
-        planned_stream(endpoint(), STREAM_PROVIDER),
-        unit,
-        policy(),
-        clock.clone(),
-    );
-    let subtree = endpoint_subtree(
+    let stream = StreamUnit::new(planned_stream(endpoint(), STREAM_PROVIDER), unit, policy());
+    let Seated {
+        subtree,
+        mut streams,
+        ..
+    } = endpoint_subtree(
         &EndpointPolicy::default(),
         &clock,
-        vec![planned_poll(endpoint(), &clock)],
+        clock.instant(),
+        vec![planned_poll(endpoint())],
         vec![stream],
     )
     .expect("a poll and a stream on one endpoint form a subtree");
+    let mut reports = streams.pop().expect("the stream's reports");
     let mut runtime = runtime(subtree, &manual);
 
     // Both leaves are due at construction; the ring runs each as its own
@@ -724,45 +733,45 @@ fn a_poll_and_a_stream_share_one_endpoints_subtree() {
 #[test]
 fn a_stream_unit_is_checked_against_its_plan() {
     let manual = ManualClock::new();
-    let clock = TestClock::new(&manual);
+    let clock = TestClock::shared(&manual);
     let default = EndpointPolicy::default();
 
     // The unit's endpoint disagrees with the plan's.
-    let (stream, _reports) = StreamUnit::new(
+    let stream = StreamUnit::new(
         planned_stream(endpoint(), STREAM_PROVIDER),
         FixtureSubscription::scripted(other_endpoint(), Vec::new()),
         policy(),
-        clock.clone(),
     );
-    let Err(error) = endpoint_subtree(&default, &clock, Vec::new(), vec![stream]) else {
+    let Err(error) = endpoint_subtree(&default, &clock, clock.instant(), Vec::new(), vec![stream])
+    else {
         panic!("the endpoints disagree");
     };
     assert!(matches!(error, RecipeError::EndpointMismatch { .. }));
 
     // The unit's origin disagrees with the plan's.
-    let (stream, _reports) = StreamUnit::new(
+    let stream = StreamUnit::new(
         planned_stream(endpoint(), "fixture.other"),
         FixtureSubscription::scripted(endpoint(), Vec::new()),
         policy(),
-        clock.clone(),
     );
-    let Err(error) = endpoint_subtree(&default, &clock, Vec::new(), vec![stream]) else {
+    let Err(error) = endpoint_subtree(&default, &clock, clock.instant(), Vec::new(), vec![stream])
+    else {
         panic!("the origins disagree");
     };
     assert!(matches!(error, RecipeError::OriginMismatch { .. }));
 
     // A poll on one endpoint and a stream on another: the polls name the
     // subtree's endpoint, and the stream is the one that does not belong.
-    let (stream, _reports) = StreamUnit::new(
+    let stream = StreamUnit::new(
         planned_stream(other_endpoint(), STREAM_PROVIDER),
         FixtureSubscription::scripted(other_endpoint(), Vec::new()),
         policy(),
-        clock.clone(),
     );
     let Err(error) = endpoint_subtree(
         &default,
         &clock,
-        vec![planned_poll(endpoint(), &clock)],
+        clock.instant(),
+        vec![planned_poll(endpoint())],
         vec![stream],
     ) else {
         panic!("a subtree is one endpoint's admission scope");
@@ -774,7 +783,8 @@ fn a_stream_unit_is_checked_against_its_plan() {
     ));
 
     // Nothing to admit is not a subtree.
-    let Err(error) = endpoint_subtree(&default, &clock, Vec::new(), Vec::new()) else {
+    let Err(error) = endpoint_subtree(&default, &clock, clock.instant(), Vec::new(), Vec::new())
+    else {
         panic!("nothing to admit is not a subtree");
     };
     assert!(matches!(error, RecipeError::NoUnits));
@@ -788,13 +798,14 @@ fn a_stream_unit_is_checked_against_its_plan() {
             .with_max_retry(Duration::from_secs(1)),
         ReconnectPolicy::default().with_stagger_percent(101),
     ] {
-        let (stream, _reports) = StreamUnit::new(
+        let stream = StreamUnit::new(
             planned_stream(endpoint(), STREAM_PROVIDER),
             FixtureSubscription::scripted(endpoint(), Vec::new()),
             unusable,
-            clock.clone(),
         );
-        let Err(error) = endpoint_subtree(&default, &clock, Vec::new(), vec![stream]) else {
+        let Err(error) =
+            endpoint_subtree(&default, &clock, clock.instant(), Vec::new(), vec![stream])
+        else {
             panic!("the policy is unusable");
         };
         assert!(matches!(error, RecipeError::InvalidPolicy(_)));

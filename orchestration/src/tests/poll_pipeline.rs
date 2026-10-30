@@ -31,25 +31,27 @@ use nv_telemetry_model::Outcome;
 use nv_telemetry_model::Payload;
 use nv_telemetry_model::States;
 use nv_telemetry_model::Timestamp;
-use nv_telemetry_orchestration::endpoint_subtree;
-use nv_telemetry_orchestration::plan;
-use nv_telemetry_orchestration::AcquisitionReport;
-use nv_telemetry_orchestration::BreakerPolicy;
-use nv_telemetry_orchestration::Clock;
-use nv_telemetry_orchestration::EndpointFault;
-use nv_telemetry_orchestration::EndpointPolicy;
-use nv_telemetry_orchestration::Needs;
-use nv_telemetry_orchestration::PollMeta;
-use nv_telemetry_orchestration::PollNeed;
-use nv_telemetry_orchestration::PollUnit;
-use nv_telemetry_orchestration::RatePolicy;
-use nv_telemetry_orchestration::RecipeError;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProjectionIssue;
 use nv_telemetry_source::ProviderDeclaration;
+
+use crate::clock::SharedClock;
+use crate::plan;
+use crate::recipe::endpoint_subtree;
+use crate::recipe::PollMeta;
+use crate::report::EndpointFault;
+use crate::AcquisitionReport;
+use crate::BreakerPolicy;
+use crate::Clock;
+use crate::EndpointPolicy;
+use crate::Needs;
+use crate::PollNeed;
+use crate::PollUnit;
+use crate::RatePolicy;
+use crate::RecipeError;
 
 const PROVIDER: &str = "fixture.sensor";
 const REQUEST_CLASS: &str = "fixture-read";
@@ -121,11 +123,11 @@ struct TestClock {
 }
 
 impl TestClock {
-    fn new(manual: &ManualClock) -> Self {
-        Self {
+    fn shared(manual: &ManualClock) -> SharedClock {
+        Arc::new(Self {
             manual: manual.clone(),
             epoch: manual.now(),
-        }
+        })
     }
 }
 
@@ -206,7 +208,7 @@ fn pipeline(
     policy: &EndpointPolicy,
 ) -> (PollRuntime, ManualClock) {
     let manual = ManualClock::new();
-    let clock = TestClock::new(&manual);
+    let clock = TestClock::shared(&manual);
     let unit = FixtureUnit::scripted(origin(), script);
 
     let declarations = [ProviderDeclaration::polled(PROVIDER, REQUEST_CLASS, 1)];
@@ -223,10 +225,12 @@ fn pipeline(
     let subtree = endpoint_subtree(
         policy,
         &clock,
-        vec![PollUnit::new(planned, unit, &clock)],
+        clock.instant(),
+        vec![PollUnit::new(planned, unit)],
         Vec::new(),
     )
-    .expect("one unit forms a subtree");
+    .expect("one unit forms a subtree")
+    .subtree;
     let runtime = Runtime::new(
         RuntimeConfig {
             global_max_in_flight: std::num::NonZeroUsize::MIN,
@@ -422,7 +426,7 @@ fn the_rate_bucket_defers_a_tick_to_the_refill_instant() {
 #[test]
 fn two_request_classes_share_one_subtree() {
     let manual = ManualClock::new();
-    let clock = TestClock::new(&manual);
+    let clock = TestClock::shared(&manual);
     let chassis_origin = Origin::builder()
         .provider("fixture.chassis")
         .request_class("chassis-read")
@@ -457,13 +461,15 @@ fn two_request_classes_share_one_subtree() {
     let subtree = endpoint_subtree(
         &EndpointPolicy::default(),
         &clock,
+        clock.instant(),
         vec![
-            PollUnit::new(plan.polls()[0].clone(), sensor_unit, &clock),
-            PollUnit::new(plan.polls()[1].clone(), chassis_unit, &clock),
+            PollUnit::new(plan.polls()[0].clone(), sensor_unit),
+            PollUnit::new(plan.polls()[1].clone(), chassis_unit),
         ],
         Vec::new(),
     )
-    .expect("two classes form one subtree");
+    .expect("two classes form one subtree")
+    .subtree;
     let mut runtime: PollRuntime = Runtime::new(
         RuntimeConfig {
             global_max_in_flight: std::num::NonZeroUsize::MIN,
@@ -487,7 +493,7 @@ fn two_request_classes_share_one_subtree() {
 #[test]
 fn recipe_checks_survive_erasure() {
     let manual = ManualClock::new();
-    let clock = TestClock::new(&manual);
+    let clock = TestClock::shared(&manual);
     let other_endpoint = || {
         EndpointContext::builder()
             .endpoint_id("bmc-lab-08")
@@ -518,7 +524,8 @@ fn recipe_checks_survive_erasure() {
     let Err(error) = endpoint_subtree(
         &EndpointPolicy::default(),
         &clock,
-        vec![PollUnit::new(planned(endpoint(), "t"), unit, &clock)],
+        clock.instant(),
+        vec![PollUnit::new(planned(endpoint(), "t"), unit)],
         Vec::new(),
     ) else {
         panic!("the origins disagree");
@@ -534,7 +541,8 @@ fn recipe_checks_survive_erasure() {
     let Err(error) = endpoint_subtree(
         &EndpointPolicy::default(),
         &clock,
-        vec![PollUnit::new(planned(endpoint(), "t"), unit, &clock)],
+        clock.instant(),
+        vec![PollUnit::new(planned(endpoint(), "t"), unit)],
         Vec::new(),
     ) else {
         panic!("the endpoints disagree");
@@ -551,9 +559,10 @@ fn recipe_checks_survive_erasure() {
     let Err(error) = endpoint_subtree(
         &EndpointPolicy::default(),
         &clock,
+        clock.instant(),
         vec![
-            PollUnit::new(planned(endpoint(), "a"), unit_a, &clock),
-            PollUnit::new(planned(other_endpoint(), "b"), unit_b, &clock),
+            PollUnit::new(planned(endpoint(), "a"), unit_a),
+            PollUnit::new(planned(other_endpoint(), "b"), unit_b),
         ],
         Vec::new(),
     ) else {

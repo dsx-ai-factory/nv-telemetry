@@ -28,7 +28,7 @@ buf-version ?= 1.72.0
 # being the one that matters. Without this, make sees the directory, decides
 # the target is up to date, and silently does nothing.
 .PHONY: all ci fmt bench codegen check-codegen proto-lint \
-	check-proto-format require-buf \
+	check-proto-format require-buf check-public-deps \
 	rust-install clean test-bmc-mock
 
 # `--locked` throughout: generated output is byte-compared, and its bytes are
@@ -92,6 +92,13 @@ codegen:
 
 check-codegen:
 	cargo run $(cargo-locked) -p nv-telemetry-codegen -- --check
+
+# No published crate may expose an nv-redfish type: an nv-redfish release
+# must never force an nv-telemetry one. `-Zpublic-dependency` is nightly-only,
+# so this runs on the pinned nightly, as its own CI job rather than inside
+# the pipeline above. Needs jq.
+check-public-deps:
+	bash tools/check-public-deps.sh $(fmt-toolchain)
 
 # Optional cross-repository HTTP test; first build the sibling bmc-mock and
 # point BMC_MOCK_ROOT at its target directory.
