@@ -47,7 +47,8 @@ A successful run prints two `batch:` lines (readings and states), one
 `status:` line with a successful outcome, and exits with status 0. The fixture
 reports CPU temperature **47.5 Cel**. An `issues:` line identifies projection
 issues; `--strict` makes any acquisition failure or projection issue produce
-exit status 1. Invalid arguments produce exit status 2.
+exit status 1. Argument-parse errors produce exit status 2; runtime errors,
+including a malformed `--base-url`, produce exit status 1.
 
 For live collection, the probe's HTTP mode requires a reachable Redfish
 endpoint, its resource paths, `PROBE_USERNAME`, and, when needed,
