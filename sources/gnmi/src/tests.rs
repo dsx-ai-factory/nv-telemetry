@@ -17,9 +17,15 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use http_body_util::Full;
+use nv_redfish_dispatcher::ClockConfig;
+use nv_redfish_dispatcher::ManualClock;
+use nv_redfish_dispatcher::Runtime;
+use nv_redfish_dispatcher::RuntimeConfig;
+use nv_redfish_dispatcher::RuntimeOutput;
 use nv_redfish_dispatcher::Scheduler;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::EndpointContext;
+use nv_telemetry_model::FailureClass;
 use nv_telemetry_model::NumericValue;
 use nv_telemetry_model::Outcome;
 use nv_telemetry_model::Payload;
@@ -29,7 +35,10 @@ use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
 use nv_telemetry_orchestration::Clock;
+use nv_telemetry_orchestration::EndpointPolicy;
 use nv_telemetry_orchestration::Needs;
+use nv_telemetry_orchestration::PollNeed;
+use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::StreamNeed;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailureClass as Class;
@@ -46,6 +55,8 @@ use crate::protocol::gnmi::typed_value::Value;
 #[derive(Default)]
 struct Script {
     responses: Vec<wire::SubscribeResponse>,
+    get_responses: Vec<wire::GetResponse>,
+    advance_clock: Option<(ManualClock, Duration)>,
     status: Option<Code>,
     opening_error: bool,
     hold_connect: bool,
@@ -56,6 +67,7 @@ struct Script {
 struct Mock {
     script: Arc<Script>,
     requests: Arc<Mutex<Vec<wire::SubscribeRequest>>>,
+    get_requests: Arc<Mutex<Vec<wire::GetRequest>>>,
     dropped: Arc<AtomicUsize>,
 }
 
@@ -65,10 +77,15 @@ impl Mock {
             .expect("subscription")
     }
 
+    fn get(&self, spec: GetSpec) -> ConfiguredGet<Self> {
+        ConfiguredGet::new(endpoint(), self.clone(), spec).expect("configured Get")
+    }
+
     fn new(script: Script) -> Self {
         Self {
             script: Arc::new(script),
             requests: Arc::default(),
+            get_requests: Arc::default(),
             dropped: Arc::default(),
         }
     }
@@ -98,7 +115,9 @@ impl Service<http::Request<tonic::body::Body>> for Mock {
         let probe = DropProbe(Arc::clone(&self.dropped));
 
         Box::pin(async move {
-            assert_eq!(request.uri().path(), "/gnmi.gNMI/Subscribe");
+            let is_get = request.uri().path() == "/gnmi.gNMI/Get";
+
+            assert!(is_get || request.uri().path() == "/gnmi.gNMI/Subscribe");
 
             let bytes = request
                 .into_body()
@@ -109,12 +128,39 @@ impl Service<http::Request<tonic::body::Body>> for Mock {
 
             assert_eq!(bytes[0], 0, "uncompressed gRPC request");
             let length = u32::from_be_bytes(bytes[1..5].try_into().expect("frame length")) as usize;
-            assert_eq!(length + 5, bytes.len(), "one SubscribeRequest");
+            assert_eq!(length + 5, bytes.len(), "one request");
 
-            let request =
-                wire::SubscribeRequest::decode(&bytes[5..]).expect("valid request protobuf");
+            let messages = if is_get {
+                let request = wire::GetRequest::decode(&bytes[5..]).expect("Get request");
+                let mut requests = mock.get_requests.lock().expect("request lock");
+                let index = requests.len();
 
-            mock.requests.lock().expect("request lock").push(request);
+                requests.push(request);
+
+                let response = mock
+                    .script
+                    .get_responses
+                    .get(index)
+                    .or_else(|| mock.script.get_responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+
+                vec![response.encode_to_vec()]
+            } else {
+                let request =
+                    wire::SubscribeRequest::decode(&bytes[5..]).expect("Subscribe request");
+
+                mock.requests.lock().expect("request lock").push(request);
+                mock.script
+                    .responses
+                    .iter()
+                    .map(Message::encode_to_vec)
+                    .collect()
+            };
+
+            if let Some((clock, elapsed)) = &mock.script.advance_clock {
+                clock.advance(*elapsed);
+            }
 
             if mock.script.hold_connect {
                 let _probe = probe;
@@ -124,8 +170,7 @@ impl Service<http::Request<tonic::body::Body>> for Mock {
             let mut bytes = Vec::new();
 
             // Each gRPC message starts with a compression flag and a four-byte length.
-            for response in &mock.script.responses {
-                let message = response.encode_to_vec();
+            for message in messages {
                 bytes.push(0);
 
                 bytes.extend_from_slice(
@@ -146,6 +191,8 @@ impl Service<http::Request<tonic::body::Body>> for Mock {
                     .parse()
                     .expect("status header"),
             );
+
+            trailers.insert("grpc-message", "target-secret".parse().expect("error text"));
 
             let opening_error = mock.script.opening_error;
             let status = mock.script.status.unwrap_or(Code::Ok);
@@ -168,6 +215,10 @@ impl Service<http::Request<tonic::body::Body>> for Mock {
             );
 
             if opening_error {
+                response
+                    .headers_mut()
+                    .insert("grpc-message", "target-secret".parse().expect("error text"));
+
                 response.headers_mut().insert(
                     "grpc-status",
                     (status as i32).to_string().parse().expect("status header"),
@@ -290,7 +341,24 @@ fn configuration_rejects_empty_ambiguous_and_unrequested_paths() {
         ),
     ];
 
+    for subject in [
+        SubjectTemplate::new("interface", IdentityValue::literal("fixed")),
+        SubjectTemplate::new("interface", IdentityValue::path_key(1, "name")),
+        SubjectTemplate::new("", IdentityValue::path_key(0, "name")),
+    ] {
+        assert!(GetSpec::new(
+            vec![valid.clone()],
+            vec![Mapping::collection_boolean_state(
+                valid.clone(),
+                subject,
+                StateTemplate::new("enabled"),
+            )]
+        )
+        .is_err());
+    }
+
     for (requests, mappings) in cases {
+        assert!(GetSpec::new(requests.clone(), mappings.clone()).is_err());
         assert!(SubscriptionSpec::new(requests, mappings).is_err());
     }
 
@@ -412,13 +480,14 @@ fn declared_state_types_preserve_native_and_json_scalars() {
             .expect("state-only subscription");
 
         let parts = projection::project(
-            &spec,
+            &spec.projection,
             wire::Notification {
                 timestamp: -1,
                 update: vec![update(value)],
                 ..Default::default()
             },
         )
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
         .expect("state projects");
 
         assert_eq!(parts.payloads().len(), 1);
@@ -472,7 +541,7 @@ fn ancestor_updates_report_issues_without_traversing_subtrees() {
             Value::BoolVal(false),
         ] {
             let parts = projection::project(
-                &spec,
+                &spec.projection,
                 wire::Notification {
                     prefix: Some(parent.clone()),
                     update: vec![wire::Update {
@@ -483,6 +552,7 @@ fn ancestor_updates_report_issues_without_traversing_subtrees() {
                     ..Default::default()
                 },
             )
+            .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
             .expect("ancestor update issue");
 
             assert!(parts.payloads().is_empty());
@@ -492,13 +562,14 @@ fn ancestor_updates_report_issues_without_traversing_subtrees() {
     }
 
     let parts = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             prefix: Some(unrelated),
             update: vec![update(Value::JsonVal(b"{}".to_vec()))],
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .expect("unrelated update is ignored");
 
     assert!(parts.payloads().is_empty());
@@ -565,12 +636,13 @@ fn state_decode_failures_keep_valid_siblings_and_original_issue_indexes() {
             };
 
             let parts = projection::project(
-                &spec,
+                &spec.projection,
                 wire::Notification {
                     update: vec![update(Value::UintVal(42)), invalid],
                     ..Default::default()
                 },
             )
+            .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
             .expect("partial notification");
 
             assert_eq!(parts.issues().len(), 1);
@@ -739,12 +811,13 @@ fn declared_numeric_types_preserve_precision_and_reject_incompatible_values() {
 
     for (kind, value, expected) in cases {
         let parts = projection::project(
-            &spec(kind),
+            &spec(kind).projection,
             wire::Notification {
                 update: vec![update(value.clone())],
                 ..Default::default()
             },
         )
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
         .expect("notification projects");
 
         if let Some(expected) = expected {
@@ -811,7 +884,9 @@ fn duplicate_updates_project_only_the_final_value_and_keep_original_issue_indexe
             ..Default::default()
         };
 
-        let parts = projection::project(&spec, notification).expect("duplicate update projection");
+        let parts = projection::project(&spec.projection, notification)
+            .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+            .expect("duplicate update projection");
 
         if let Some(expected) = expected {
             assert_eq!(parts.payloads().len(), 1, "{name}");
@@ -872,13 +947,14 @@ fn state_duplicate_updates_use_only_the_final_value_at_the_original_index() {
             .collect();
 
         let parts = projection::project(
-            &spec,
+            &spec.projection,
             wire::Notification {
                 prefix: Some(wire_path(&["parent"])),
                 update: updates,
                 ..Default::default()
             },
         )
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
         .expect("duplicate state projection");
 
         if let Some(expected) = expected {
@@ -927,7 +1003,9 @@ fn projection_retains_valid_siblings_and_sparse_notifications_have_no_missing_is
         ..Default::default()
     };
 
-    let parts = projection::project(&spec, notification).expect("partial projection");
+    let parts = projection::project(&spec.projection, notification)
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        .expect("partial projection");
 
     assert_eq!(parts.issues().len(), 2);
     assert_ne!(parts.issues()[0].path(), parts.issues()[1].path());
@@ -945,8 +1023,9 @@ fn projection_retains_valid_siblings_and_sparse_notifications_have_no_missing_is
         Some(&Timestamp::new(-1, 999_999_999).expect("valid timestamp"))
     );
 
-    let sparse =
-        projection::project(&spec, wire::Notification::default()).expect("empty notification");
+    let sparse = projection::project(&spec.projection, wire::Notification::default())
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        .expect("empty notification");
 
     assert!(sparse.payloads().is_empty());
     assert!(sparse.issues().is_empty());
@@ -980,7 +1059,7 @@ fn prefixes_keys_and_context_resolve_structurally_and_parent_deletes_match() {
     wrong_key.path.as_mut().expect("path").target = "different-target".into();
 
     let parts = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             prefix: Some(prefix.clone()),
             update: vec![leaf, wrong_key],
@@ -988,6 +1067,7 @@ fn prefixes_keys_and_context_resolve_structurally_and_parent_deletes_match() {
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .expect("partial projection");
 
     assert_eq!(parts.payloads().len(), 1);
@@ -1006,7 +1086,7 @@ fn prefixes_keys_and_context_resolve_structurally_and_parent_deletes_match() {
     prefix.elem[0].key.insert("name".into(), "Ethernet2".into());
 
     let absent = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             prefix: Some(prefix),
             update: vec![wire::Update {
@@ -1019,6 +1099,7 @@ fn prefixes_keys_and_context_resolve_structurally_and_parent_deletes_match() {
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .expect("unmapped key");
 
     assert!(absent.payloads().is_empty());
@@ -1052,7 +1133,9 @@ fn large_notifications_split_payloads_and_bound_issues_without_losing_descriptor
         ..Default::default()
     };
 
-    let parts = projection::project(&spec, notification.clone()).expect("large notification");
+    let parts = projection::project(&spec.projection, notification.clone())
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        .expect("large notification");
 
     assert_eq!(parts.payloads().len(), 2);
     let mut total = 0;
@@ -1088,7 +1171,9 @@ fn large_notifications_split_payloads_and_bound_issues_without_losing_descriptor
         });
     }
 
-    let parts = projection::project(&spec, invalid).expect("issue-only notification");
+    let parts = projection::project(&spec.projection, invalid)
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        .expect("issue-only notification");
 
     assert_eq!(
         parts.issues().len(),
@@ -1133,7 +1218,9 @@ fn large_state_notifications_split_payloads_and_bound_issues() {
         ..Default::default()
     };
 
-    let parts = projection::project(&spec, notification.clone()).expect("large state notification");
+    let parts = projection::project(&spec.projection, notification.clone())
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        .expect("large state notification");
 
     assert_eq!(parts.payloads().len(), 2);
     assert!(parts.issues().is_empty());
@@ -1163,7 +1250,9 @@ fn large_state_notifications_split_payloads_and_bound_issues() {
         });
     }
 
-    let invalid = projection::project(&spec, notification).expect("bounded state issues");
+    let invalid = projection::project(&spec.projection, notification)
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        .expect("bounded state issues");
 
     assert!(invalid.payloads().is_empty());
 
@@ -1789,7 +1878,7 @@ fn collection_subjects_use_full_path_keys_and_preserve_descriptor_metadata() {
     });
 
     let parts = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             prefix: Some(wire_path(&["interfaces"])),
             timestamp: 7_000_000_123,
@@ -1797,6 +1886,7 @@ fn collection_subjects_use_full_path_keys_and_preserve_descriptor_metadata() {
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .expect("projection");
 
     assert!(parts.issues().is_empty());
@@ -1989,7 +2079,7 @@ fn collection_prefix_splits_resolve_nested_key_selectors() {
     // All prefix splits must use the same absolute selector positions.
     for split in 0..=valid.elem.len() {
         let parts = projection::project(
-            &spec,
+            &spec.projection,
             wire::Notification {
                 prefix: Some(wire::Path {
                     elem: valid.elem[..split].to_vec(),
@@ -2007,6 +2097,7 @@ fn collection_prefix_splits_resolve_nested_key_selectors() {
                 ..Default::default()
             },
         )
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
         .unwrap();
 
         assert!(parts.issues().is_empty(), "split {split}");
@@ -2055,7 +2146,7 @@ fn collection_filters_keys_and_reports_invalid_keys_and_ancestors() {
     ];
 
     let parts = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             update: paths
                 .into_iter()
@@ -2068,6 +2159,7 @@ fn collection_filters_keys_and_reports_invalid_keys_and_ancestors() {
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .unwrap();
 
     assert!(parts.payloads().is_empty());
@@ -2113,7 +2205,7 @@ fn collection_duplicates_keep_last_values_per_concrete_entry() {
     };
 
     let parts = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             update: vec![
                 make("a", Value::StringVal("UP".into())),
@@ -2125,6 +2217,7 @@ fn collection_duplicates_keep_last_values_per_concrete_entry() {
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .unwrap();
 
     let Payload::States(states) = &parts.payloads()[0].1 else {
@@ -2189,7 +2282,7 @@ fn collection_identity_collisions_suppress_all_valid_candidates_and_keep_sibling
     };
 
     let parts = projection::project(
-        &spec,
+        &spec.projection,
         wire::Notification {
             update: vec![
                 make("fixed", "a", "counter", Value::UintVal(1)),
@@ -2206,6 +2299,7 @@ fn collection_identity_collisions_suppress_all_valid_candidates_and_keep_sibling
             ..Default::default()
         },
     )
+    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
     .unwrap();
 
     assert_eq!(parts.payloads().len(), 2);
@@ -2290,12 +2384,13 @@ fn collection_colliding_observations_are_omitted_before_payloads_are_built() {
         updates.push(collision);
 
         let parts = projection::project(
-            &spec,
+            &spec.projection,
             wire::Notification {
                 update: updates,
                 ..Default::default()
             },
         )
+        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
         .unwrap();
 
         assert_eq!(parts.payloads().len(), 2);
@@ -2455,6 +2550,639 @@ async fn collection_stream_reports_interfaces_components_and_issues_in_one_acqui
                 );
             }
             _ => panic!("reading or state"),
+        }
+    }
+}
+
+fn get_spec() -> GetSpec {
+    GetSpec::new(
+        vec![path(&["leaf"])],
+        vec![Mapping::new(
+            path(&["leaf"]),
+            descriptor("a"),
+            NumericType::Uint,
+        )],
+    )
+    .expect("Get specification")
+}
+
+fn snapshot(timestamp: i64, updates: Vec<wire::Update>) -> wire::Notification {
+    wire::Notification {
+        timestamp,
+        update: updates,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn get_requests_preserve_defaults_paths_context_encoding_and_data_type() {
+    let mock = Mock::new(Script {
+        get_responses: vec![wire::GetResponse {
+            notification: vec![snapshot(0, vec![])],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    mock.get(get_spec()).perform().await.expect("default Get");
+
+    let request = mock.get_requests.lock().unwrap()[0].clone();
+
+    assert_eq!(request.r#type, wire::get_request::DataType::All as i32);
+    assert_eq!(request.encoding, wire::Encoding::Json as i32);
+    assert_eq!(request.prefix, Some(wire::Path::default()));
+
+    for (data_type, expected) in [
+        (GetDataType::All, wire::get_request::DataType::All),
+        (GetDataType::Config, wire::get_request::DataType::Config),
+        (GetDataType::State, wire::get_request::DataType::State),
+        (
+            GetDataType::Operational,
+            wire::get_request::DataType::Operational,
+        ),
+    ] {
+        for (encoding, expected_encoding) in [
+            (Encoding::Json, wire::Encoding::Json),
+            (Encoding::JsonIetf, wire::Encoding::JsonIetf),
+        ] {
+            let keyed =
+                SubscriptionPath::new(vec![PathElement::new("root").with_key("name", "eth0")]);
+
+            let spec = GetSpec::new(
+                vec![keyed.clone(), path(&["leaf"]), keyed],
+                vec![Mapping::new(
+                    path(&["leaf"]),
+                    descriptor("a"),
+                    NumericType::Uint,
+                )],
+            )
+            .unwrap()
+            .with_origin("openconfig")
+            .with_target("switch-a")
+            .with_data_type(data_type)
+            .with_encoding(encoding);
+
+            mock.get(spec).perform().await.expect("explicit Get");
+
+            let request = mock.get_requests.lock().unwrap().last().unwrap().clone();
+            let prefix = request.prefix.unwrap();
+
+            assert_eq!(prefix.origin, "openconfig");
+            assert_eq!(prefix.target, "switch-a");
+            assert!(prefix.elem.is_empty());
+            assert_eq!(request.r#type, expected as i32);
+            assert_eq!(request.encoding, expected_encoding as i32);
+            assert_eq!(request.path.len(), 3);
+            assert_eq!(request.path[0], request.path[2]);
+            assert_eq!(request.path[0].elem[0].key["name"], "eth0");
+            assert_eq!(request.path[1], wire_path(&["leaf"]));
+            assert!(request.use_models.is_empty());
+            assert!(request.extension.is_empty());
+        }
+    }
+
+    assert_eq!(mock.get_requests.lock().unwrap().len(), 9);
+}
+
+#[tokio::test]
+async fn get_projects_notifications_independently_and_indexes_all_issue_locations() {
+    let subject = descriptor("a").key().subject().clone();
+
+    let spec = GetSpec::new(
+        vec![path(&["root"])],
+        vec![
+            Mapping::new(path(&["root", "leaf"]), descriptor("a"), NumericType::Uint),
+            Mapping::string_state(
+                path(&["root", "status"]),
+                StateIdentity::new(subject.clone(), "status"),
+            ),
+            Mapping::boolean_state(
+                path(&["root", "enabled"]),
+                StateIdentity::new(subject, "enabled"),
+            ),
+        ],
+    )
+    .unwrap()
+    .with_origin("openconfig")
+    .with_target("switch-a");
+
+    let notifications = [7_000_000_123, 8_000_000_456].map(|timestamp| {
+        let updates = [
+            ("leaf", Value::UintVal(1)),
+            ("leaf", Value::JsonIetfVal(b"42".to_vec())),
+            ("status", Value::JsonVal(br#""UP""#.to_vec())),
+            ("enabled", Value::BoolVal(false)),
+            ("unmapped", Value::UintVal(9)),
+            ("status", Value::JsonVal(b"{}".to_vec())),
+        ]
+        .into_iter()
+        .map(|(name, value)| wire::Update {
+            path: Some(wire_path(&[name])),
+            ..update(value)
+        })
+        .collect();
+
+        let mut prefix = wire_path(&["root"]);
+
+        prefix.origin = "openconfig".into();
+        prefix.target = "switch-a".into();
+
+        wire::Notification {
+            prefix: Some(prefix),
+            delete: vec![wire_path(&["leaf"])],
+            ..snapshot(timestamp, updates)
+        }
+    });
+
+    let mock = Mock::new(Script {
+        get_responses: vec![
+            wire::GetResponse {
+                notification: notifications.into(),
+                ..Default::default()
+            },
+            wire::GetResponse {
+                notification: vec![snapshot(9_000_000_000, vec![])],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+
+    let unit = mock.get(spec);
+
+    let parts = unit.perform().await.unwrap();
+
+    assert_eq!(parts.payloads().len(), 4);
+    assert_eq!(parts.issues().len(), 4);
+
+    let locations: BTreeSet<_> = parts
+        .issues()
+        .iter()
+        .map(nv_telemetry_source::ProjectionIssue::path)
+        .collect();
+
+    assert_eq!(
+        locations,
+        BTreeSet::from([
+            "notification[0].update[5].val",
+            "notification[0].delete[0]",
+            "notification[1].update[5].val",
+            "notification[1].delete[0]",
+        ])
+    );
+
+    for (index, pair) in parts.payloads().chunks_exact(2).enumerate() {
+        let observed = Timestamp::new(
+            7 + i64::try_from(index).unwrap(),
+            if index == 0 { 123 } else { 456 },
+        )
+        .unwrap();
+
+        for (coverage, payload) in pair {
+            assert_eq!(coverage.completeness(), Completeness::Partial);
+
+            match payload {
+                Payload::Readings(readings) => {
+                    assert_eq!(readings.samples().len(), 1);
+                    assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(42));
+                    assert_eq!(readings.samples()[0].observed_at(), Some(&observed));
+                }
+                Payload::States(states) => {
+                    assert_eq!(states.observations().len(), 1);
+                    assert_eq!(states.observations()[0].value(), &ModelValue::bool(false));
+                    assert_eq!(states.observations()[0].observed_at(), Some(&observed));
+                }
+                _ => panic!("scalar payload"),
+            }
+        }
+    }
+
+    let empty = unit.perform().await.unwrap();
+
+    assert!(empty.payloads().is_empty());
+    assert!(empty.issues().is_empty());
+    assert_eq!(mock.get_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn get_collection_and_fixed_mappings_keep_valid_siblings_of_bad_keys_and_containers() {
+    let subject = SubjectTemplate::new("interface", IdentityValue::path_key(0, "name"));
+
+    let spec = GetSpec::new(
+        vec![path(&["entry"]), path(&["leaf"])],
+        vec![
+            Mapping::new(path(&["leaf"]), descriptor("fixed"), NumericType::Uint),
+            Mapping::collection_string_state(
+                path(&["entry", "status"]),
+                subject.clone(),
+                StateTemplate::new("status"),
+            ),
+            Mapping::collection_reading(
+                path(&["entry", "count"]),
+                subject,
+                ReadingTemplate::new(NumericType::Uint).with_unit("1"),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let make = |name: &str, leaf: &str, value| {
+        let mut path = wire_path(&["entry", leaf]);
+        path.elem[0].key.insert("name".into(), name.into());
+        wire::Update {
+            path: Some(path),
+            ..update(value)
+        }
+    };
+
+    let mock = Mock::new(Script {
+        get_responses: vec![wire::GetResponse {
+            notification: vec![snapshot(
+                1,
+                vec![
+                    update(Value::UintVal(7)),
+                    make("eth0", "status", Value::StringVal("UP".into())),
+                    make("eth0", "count", Value::UintVal(5)),
+                    make("", "count", Value::UintVal(8)),
+                    wire::Update {
+                        path: Some(wire_path(&["entry"])),
+                        ..update(Value::JsonVal(b"{}".to_vec()))
+                    },
+                ],
+            )],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let parts = mock.get(spec).perform().await.unwrap();
+
+    assert_eq!(parts.issues().len(), 2);
+    assert_eq!(parts.payloads().len(), 2);
+    let mut readings_seen = 0;
+    let mut states_seen = 0;
+
+    for (_, payload) in parts.payloads() {
+        match payload {
+            Payload::Readings(readings) => {
+                readings_seen += readings.samples().len();
+                assert!(readings
+                    .descriptors()
+                    .iter()
+                    .any(|d| d.key().subject().id() == "eth0"));
+            }
+            Payload::States(states) => {
+                states_seen += states.observations().len();
+                assert_eq!(states.observations()[0].subject().id(), "eth0");
+
+                assert_eq!(
+                    states.observations()[0].value(),
+                    &ModelValue::string("UP").unwrap()
+                );
+            }
+            _ => panic!("scalar payload"),
+        }
+    }
+
+    assert_eq!(readings_seen, 2);
+    assert_eq!(states_seen, 1);
+}
+
+#[tokio::test]
+async fn get_rejects_rpc_and_legacy_errors_without_leaking_target_text_or_observations() {
+    for (code, class, retryable) in [
+        (Code::Unavailable, Class::Connectivity, true),
+        (Code::DeadlineExceeded, Class::Timeout, true),
+        (Code::Unauthenticated, Class::Authentication, false),
+        (Code::PermissionDenied, Class::Authentication, false),
+        (Code::Unimplemented, Class::Unsupported, false),
+        (Code::InvalidArgument, Class::Unsupported, false),
+        (Code::NotFound, Class::Unsupported, false),
+        (Code::AlreadyExists, Class::Unsupported, false),
+        (Code::FailedPrecondition, Class::Unsupported, false),
+        (Code::Cancelled, Class::Device, true),
+        (Code::Unknown, Class::Device, true),
+        (Code::Aborted, Class::Device, true),
+        (Code::ResourceExhausted, Class::Device, true),
+        (Code::Internal, Class::Protocol, false),
+        (Code::DataLoss, Class::Protocol, false),
+        (Code::OutOfRange, Class::Protocol, false),
+    ] {
+        for opening_error in [true, false] {
+            let mock = Mock::new(Script {
+                get_responses: vec![wire::GetResponse {
+                    notification: vec![snapshot(1, vec![update(Value::UintVal(5))])],
+                    ..Default::default()
+                }],
+                status: Some(code),
+                opening_error,
+                ..Default::default()
+            });
+
+            let failure = mock
+                .get(get_spec())
+                .perform()
+                .await
+                .expect_err("RPC failure");
+
+            assert_eq!(failure.class(), class, "{code:?}, opening={opening_error}");
+            assert_eq!(failure.retryable(), Some(retryable));
+            assert!(failure.detail().unwrap().contains("Get"));
+            assert!(!failure.detail().unwrap().contains("target-secret"));
+        }
+    }
+
+    for (code, class, retryable) in [
+        (Code::PermissionDenied as u32, Class::Authentication, false),
+        (Code::Unavailable as u32, Class::Connectivity, true),
+        (0, Class::Protocol, false),
+        (17, Class::Protocol, false),
+        (u32::MAX, Class::Protocol, false),
+    ] {
+        #[allow(deprecated)]
+        let response = wire::GetResponse {
+            notification: vec![snapshot(1, vec![update(Value::UintVal(5))])],
+            error: Some(wire::Error {
+                code,
+                message: "target-secret".into(),
+                data: None,
+            }),
+            ..Default::default()
+        };
+
+        let mock = Mock::new(Script {
+            get_responses: vec![response],
+            ..Default::default()
+        });
+
+        let failure = mock
+            .get(get_spec())
+            .perform()
+            .await
+            .expect_err("legacy error");
+
+        assert_eq!(failure.class(), class);
+        assert_eq!(failure.retryable(), Some(retryable));
+        assert!(!failure.detail().unwrap().contains("target-secret"));
+    }
+}
+
+#[tokio::test]
+async fn get_distinguishes_empty_responses_from_empty_or_unmapped_notifications_and_bounds_decode()
+{
+    for (notifications, valid) in [
+        (vec![], false),
+        (vec![snapshot(0, vec![])], true),
+        (
+            vec![snapshot(
+                0,
+                vec![wire::Update {
+                    path: Some(wire_path(&["other"])),
+                    ..update(Value::UintVal(1))
+                }],
+            )],
+            true,
+        ),
+        (
+            vec![snapshot(
+                0,
+                vec![update(Value::JsonVal(vec![b'0'; 4 * 1024 * 1024 + 1]))],
+            )],
+            false,
+        ),
+    ] {
+        let mock = Mock::new(Script {
+            get_responses: vec![wire::GetResponse {
+                notification: notifications,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        match mock.get(get_spec()).perform().await {
+            Ok(parts) => {
+                assert!(valid);
+                assert!(parts.payloads().is_empty());
+                assert!(parts.issues().is_empty());
+            }
+            Err(failure) => {
+                assert!(!valid);
+                assert_eq!(failure.class(), Class::Protocol);
+                assert_eq!(failure.retryable(), Some(false));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_pending_get_connect_or_response_body_cancels_the_rpc() {
+    for hold_connect in [true, false] {
+        let mock = Mock::new(Script {
+            hold_connect,
+            hold_open: !hold_connect,
+            get_responses: vec![wire::GetResponse {
+                notification: vec![snapshot(1, vec![update(Value::UintVal(3))])],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let unit = mock.get(get_spec());
+
+        let mut future = Box::pin(unit.perform());
+
+        assert!(futures_util::poll!(&mut future).is_pending());
+        assert_eq!(mock.get_requests.lock().unwrap().len(), 1);
+        assert_eq!(mock.dropped.load(Ordering::SeqCst), 0);
+        drop(future);
+
+        assert_eq!(mock.dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn get_bounds_issues_once_across_notifications() {
+    let limit = nv_telemetry_model::limits::PROJECTIONISSUES_ISSUES_MAX_ITEMS as usize;
+
+    // Each invalid path produces a separate issue.
+    let invalid = wire::Update {
+        path: Some(wire_path(&[""])),
+        ..update(Value::UintVal(1))
+    };
+
+    let mock = Mock::new(Script {
+        get_responses: vec![wire::GetResponse {
+            notification: vec![
+                snapshot(1, vec![invalid; limit + 2]),
+                snapshot(2, vec![update(Value::BoolVal(false))]),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let parts = mock.get(get_spec()).perform().await.unwrap();
+
+    assert!(parts.payloads().is_empty());
+    assert_eq!(parts.issues().len(), limit);
+
+    let omitted = parts.issues().last().unwrap();
+
+    assert_eq!(omitted.path(), nv_telemetry_source::OMITTED_ISSUES_LOCATOR);
+
+    assert_eq!(
+        omitted.kind(),
+        &nv_telemetry_source::ProjectionIssueKind::Invalid {
+            detail: "4 further issues omitted at the envelope's bound".into(),
+        }
+    );
+}
+
+#[derive(Clone)]
+struct GetClock {
+    manual: ManualClock,
+    epoch: Instant,
+}
+
+impl Clock for GetClock {
+    fn timestamp(&self) -> Timestamp {
+        let elapsed = self.manual.now().duration_since(self.epoch);
+        Timestamp::new(
+            99 + i64::try_from(elapsed.as_secs()).unwrap(),
+            elapsed.subsec_nanos(),
+        )
+        .unwrap()
+    }
+
+    fn instant(&self) -> Instant {
+        self.manual.now()
+    }
+}
+
+#[tokio::test]
+async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admission() {
+    let manual = ManualClock::new();
+
+    let clock = GetClock {
+        epoch: manual.now(),
+        manual: manual.clone(),
+    };
+
+    let elapsed = Duration::from_millis(25);
+
+    let mock = Mock::new(Script {
+        get_responses: vec![
+            wire::GetResponse {
+                notification: vec![
+                    snapshot(7_000_000_123, vec![update(Value::UintVal(3))]),
+                    snapshot(8_000_000_456, vec![update(Value::UintVal(4))]),
+                ],
+                ..Default::default()
+            },
+            wire::GetResponse::default(),
+            wire::GetResponse {
+                notification: vec![snapshot(9, vec![])],
+                ..Default::default()
+            },
+        ],
+        advance_clock: Some((manual.clone(), elapsed)),
+        ..Default::default()
+    });
+
+    let plan = nv_telemetry_orchestration::plan(
+        Needs::default().with_polls([PollNeed::new(
+            endpoint(),
+            ConfiguredGet::<Mock>::REQUEST_CLASS,
+            "snapshot",
+            Duration::from_secs(1),
+        )]),
+        &[ConfiguredGet::<Mock>::declaration()],
+    )
+    .unwrap();
+
+    assert_eq!(plan.polls()[0].cost(), 1);
+
+    let subtree = nv_telemetry_orchestration::endpoint_subtree(
+        &EndpointPolicy::default().with_max_in_flight(std::num::NonZeroU32::MIN),
+        &clock,
+        vec![PollUnit::new(
+            plan.polls()[0].clone(),
+            Arc::new(mock.get(get_spec())),
+            &clock,
+        )],
+        vec![],
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            global_max_in_flight: std::num::NonZeroUsize::MIN,
+            clock: ClockConfig::Manual(manual.clone()),
+        },
+        subtree,
+    );
+
+    for (tick, (outcome, count, failure)) in [
+        (Outcome::Succeeded, 2, None),
+        (Outcome::Failed, 0, Some(FailureClass::Protocol)),
+        (Outcome::Succeeded, 0, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let started_at = clock.timestamp();
+
+        let RuntimeOutput::Work { result, .. } = runtime.next().await else {
+            panic!("one completed Get work item")
+        };
+
+        let mut reports = result.expect("device outcomes produce reports");
+
+        assert_eq!(reports.len(), 1);
+
+        let report = reports.pop().unwrap();
+
+        assert_eq!(report.status().failure_class(), failure);
+        assert_eq!(report.status().provider(), "gnmi.configured");
+        assert_eq!(report.status().request_class(), "configured-get");
+        assert_eq!(report.status().started_at(), &started_at);
+
+        assert_eq!(
+            report.status().duration_nanos(),
+            Some(u64::try_from(elapsed.as_nanos()).unwrap())
+        );
+
+        assert_eq!(report.status().outcome(), outcome);
+        assert_eq!(report.batches().len(), count);
+
+        for (index, batch) in report.batches().iter().enumerate() {
+            assert_eq!(batch.endpoint(), &endpoint());
+            assert_eq!(batch.window().start(), &started_at);
+
+            let Payload::Readings(readings) = batch.payload() else {
+                panic!("readings")
+            };
+
+            let sample = &readings.samples()[0];
+
+            assert_eq!(sample.value(), &NumericValue::Uint(3 + index as u64));
+
+            let device_times = [
+                Timestamp::new(7, 123).unwrap(),
+                Timestamp::new(8, 456).unwrap(),
+            ];
+
+            assert_eq!(sample.observed_at(), device_times.get(index));
+        }
+
+        assert_eq!(mock.get_requests.lock().unwrap().len(), tick + 1);
+
+        if tick < 2 {
+            let RuntimeOutput::SleepUntil(deadline) = runtime.next().await else {
+                panic!("next polling deadline after released admission")
+            };
+
+            manual.advance_to(deadline);
         }
     }
 }

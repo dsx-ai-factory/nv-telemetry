@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Readings and states from configured `gNMI` subscriptions.
+//! Readings and states from configured `gNMI` subscriptions and Get requests.
 //!
 //! The caller supplies transport, endpoint identity, and mappings for individual leaves.
 //! [`ConfiguredSubscription`] opens one STREAM subscription per acquisition.
@@ -133,6 +133,46 @@
 //! [`Mapping::boolean_state`] to collect a boolean state. A subscription may
 //! contain only state mappings.
 //!
+//! [`ConfiguredGet`] collects small snapshots through the existing polling APIs.
+//! One Get call produces one acquisition report, even when the target returns
+//! several notifications. Each notification retains its device timestamp and its
+//! issues are indexed under `notification[index]`. An empty response is a protocol
+//! failure. The target must send leaf-addressed scalar updates, as for subscriptions.
+//!
+//! The caller supplies the transport and adds the returned poll to its endpoint
+//! subtree. The same clock must be used for the poll and the subtree.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! use nv_telemetry_gnmi::{ConfiguredGet, GetDataType, GetSpec, Mapping,
+//!     NumericType, PathElement, SubscriptionPath};
+//! use nv_telemetry_model::{EndpointContext, SignalDescriptor, SignalKey, Subject};
+//! use nv_telemetry_orchestration::{plan, Needs, PollNeed, PollUnit, SystemClock};
+//! use nv_telemetry_source::{Acquire, AcquisitionParts};
+//!
+//! fn poll<T>(endpoint: EndpointContext, transport: T, clock: &SystemClock)
+//!     -> Result<PollUnit, Box<dyn std::error::Error>>
+//! where ConfiguredGet<T>: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
+//! {
+//!     let path = SubscriptionPath::new(vec![PathElement::new("count")]);
+//!     let subject = Subject::builder().kind("sensor").id("sensor-a").build()?;
+//!     let key = SignalKey::builder().subject(subject).facet("count").build()?;
+//!     let descriptor = SignalDescriptor::builder().key(key).unit("1").build()?;
+//!     let spec = GetSpec::new(vec![path.clone()],
+//!         vec![Mapping::new(path, descriptor, NumericType::Uint)])?
+//!         .with_data_type(GetDataType::State);
+//!     let unit = Arc::new(ConfiguredGet::new(endpoint.clone(), transport, spec)?);
+//!     let needs = Needs::default().with_polls([PollNeed::new(endpoint,
+//!         ConfiguredGet::<T>::REQUEST_CLASS, "sensor-count", Duration::from_secs(10))]);
+//!     let planned = plan(needs, &[ConfiguredGet::<T>::declaration()])?;
+//!     let poll = planned.polls().first().ok_or("missing Get poll")?.clone();
+//!
+//!     Ok(PollUnit::new(poll, unit, clock))
+//! }
+//! ```
+//!
 //! Run `make codegen` to regenerate the bindings and `make check-codegen`
 //! to check them. Builds use the checked-in files and do not need `protoc`.
 
@@ -152,10 +192,14 @@ use nv_telemetry_model::Origin;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass as Class;
+use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProviderDeclaration;
 use nv_telemetry_source::SubscriptionItem;
 pub use spec::Encoding;
+pub use spec::GetDataType;
+pub use spec::GetSpec;
 pub use spec::IdentityValue;
+pub use spec::InvalidGet;
 pub use spec::InvalidSubscription;
 pub use spec::Mapping;
 pub use spec::NumericType;
@@ -250,7 +294,7 @@ where
         let response = client
             .subscribe(stream::iter([self.spec.request()]))
             .await
-            .map_err(|status| failure(status.code()))?
+            .map_err(|status| failure("Subscribe", status.code()))?
             .into_inner();
 
         let spec = Arc::clone(&self.spec);
@@ -265,24 +309,21 @@ where
                         Ok(Some(message)) => match message.response {
                             Some(Response::SyncResponse(_)) => continue,
                             Some(Response::Update(notification)) => {
-                                let item = projection::project(&spec, notification);
+                                let item = projection::project(&spec.projection, notification).map(
+                                    |(payloads, issues)| AcquisitionParts::new(payloads, issues),
+                                );
+
                                 let next = item.is_ok().then_some((response, spec));
 
                                 return Some((item, next));
                             }
                             #[allow(deprecated)]
                             Some(Response::Error(error)) => {
-                                let code = i32::try_from(error.code)
-                                    .ok()
-                                    .map(Code::from_i32)
-                                    .filter(|code| *code as u32 == error.code)
-                                    .unwrap_or(Code::DataLoss);
-
-                                Err(failure(code))
+                                Err(legacy_failure("Subscribe", error.code))
                             }
-                            None => Err(failure(Code::DataLoss)),
+                            None => Err(failure("Subscribe", Code::DataLoss)),
                         },
-                        Err(status) => Err(failure(status.code())),
+                        Err(status) => Err(failure("Subscribe", status.code())),
                         Ok(None) => Err(AcquisitionFailure::new(Class::Protocol)
                             .with_retryable(true)
                             .with_detail("gNMI STREAM closed without a terminal error")),
@@ -296,8 +337,127 @@ where
     }
 }
 
+/// A configured unary Get acquisition for one endpoint.
+///
+/// Each [`Acquire::perform`] call sends one RPC and projects all returned
+/// notifications into one acquisition. Device timestamps are retained per
+/// notification. Coverage is partial; missing leaves do not imply deletion.
+/// Transport security, credentials, and deadlines are supplied by the caller.
+#[derive(Debug)]
+pub struct ConfiguredGet<T> {
+    endpoint: EndpointContext,
+    origin: Origin,
+    transport: T,
+    spec: GetSpec,
+}
+
+impl<T> ConfiguredGet<T> {
+    /// Provider identity used in declarations and observations.
+    pub const PROVIDER: &str = ConfiguredSubscription::<T>::PROVIDER;
+
+    /// Request class used for Get admission.
+    pub const REQUEST_CLASS: &str = "configured-get";
+
+    /// Creates an acquisition. The validated specification is sent by [`Acquire::perform`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a model validation error if the provider origin cannot be built.
+    pub fn new(endpoint: EndpointContext, transport: T, spec: GetSpec) -> Result<Self, Invalid> {
+        let origin = Origin::builder()
+            .provider(Self::PROVIDER)
+            .request_class(Self::REQUEST_CLASS)
+            .build()?;
+
+        Ok(Self {
+            endpoint,
+            origin,
+            transport,
+            spec,
+        })
+    }
+
+    /// Declares a polled provider with an admission cost of one.
+    #[must_use]
+    pub fn declaration() -> ProviderDeclaration {
+        ProviderDeclaration::polled(Self::PROVIDER, Self::REQUEST_CLASS, 1)
+    }
+}
+
+impl<T> Acquire for ConfiguredGet<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
+    T::Error: Into<StdError>,
+    T::Future: Send,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
+    type Output = AcquisitionParts;
+
+    fn endpoint(&self) -> &EndpointContext {
+        &self.endpoint
+    }
+
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+        let mut client = protocol::gnmi::g_nmi_client::GNmiClient::new(self.transport.clone());
+
+        // The unary client checks final gRPC status before releasing the response.
+        // Keep its default decoding limit, as for Subscribe.
+        let response = client
+            .get(self.spec.request())
+            .await
+            .map_err(|status| failure("Get", status.code()))?
+            .into_inner();
+
+        #[allow(deprecated)]
+        if let Some(error) = response.error {
+            return Err(legacy_failure("Get", error.code));
+        }
+
+        if response.notification.is_empty() {
+            return Err(AcquisitionFailure::new(Class::Protocol)
+                .with_retryable(false)
+                .with_detail("gNMI Get returned no notifications"));
+        }
+
+        let mut payloads = Vec::new();
+        let mut issues = Vec::new();
+
+        for (index, notification) in response.notification.into_iter().enumerate() {
+            let (projected, notification_issues) =
+                projection::project(&self.spec.projection, notification)?;
+
+            // Preserve notification boundaries and timestamps; overlapping request
+            // paths can return the same leaf at different snapshot times.
+            payloads.extend(projected);
+
+            issues.extend(
+                notification_issues
+                    .into_iter()
+                    .map(|issue| issue.at_index("notification", index)),
+            );
+        }
+
+        Ok(AcquisitionParts::new(payloads, issues))
+    }
+}
+
+fn legacy_failure(operation: &str, code: u32) -> AcquisitionFailure {
+    let decoded = i32::try_from(code)
+        .ok()
+        .map(Code::from_i32)
+        .filter(|decoded| *decoded as u32 == code)
+        .unwrap_or(Code::DataLoss);
+
+    failure(operation, decoded)
+}
+
 // Report the gRPC code without copying error text from the target.
-fn failure(code: Code) -> AcquisitionFailure {
+fn failure(operation: &str, code: Code) -> AcquisitionFailure {
     let (class, retryable) = match code {
         Code::Unavailable => (Class::Connectivity, true),
         Code::DeadlineExceeded => (Class::Timeout, true),
@@ -316,7 +476,7 @@ fn failure(code: Code) -> AcquisitionFailure {
 
     AcquisitionFailure::new(class)
         .with_retryable(retryable)
-        .with_detail(format!("gNMI Subscribe failed with gRPC code {code:?}"))
+        .with_detail(format!("gNMI {operation} failed with gRPC code {code:?}"))
 }
 
 #[cfg(test)]
