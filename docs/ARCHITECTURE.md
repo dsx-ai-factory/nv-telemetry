@@ -1084,9 +1084,13 @@ at the device's pace:
   demand reaching the socket; the device's own overflow behavior is the
   overflow policy, and it is reported as a coverage gap rather than absorbed
   by an unbounded buffer.
-- **Cancellation and shutdown are drops.** Dropping the report stream stops
-  the leaf and makes a pending connect attempt open nothing; dropping the
-  subtree ends the report stream once its current instance does.
+- **Cancellation belongs to the stream pair.** Dropping the report stream or
+  calling its cancellation handle stops reconnects and wakes pending connection
+  work and report consumers. The embedder keeps polling pending dispatcher work
+  and any retained report stream until cancellation is observed. Cancellation
+  produces no status or fault. Dropping the subtree lets the current instance
+  drain. To remove a subscription immediately, the embedder cancels its pair
+  before removing the subtree.
 - **Fairness covers connects.** The items themselves are not admitted: a
   stream's rate is the device's, and throttling it client-side would only
   move the overflow from the device's buffer, which reports it, to the

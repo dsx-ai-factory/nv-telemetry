@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::pin;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,6 +29,7 @@ use nv_redfish_dispatcher::ManualClock;
 use nv_redfish_dispatcher::Runtime;
 use nv_redfish_dispatcher::RuntimeConfig;
 use nv_redfish_dispatcher::RuntimeOutput;
+use nv_redfish_dispatcher::Scheduler;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::Coverage;
 use nv_telemetry_model::EndpointContext;
@@ -51,6 +53,7 @@ use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::RecipeError;
 use nv_telemetry_orchestration::ReconnectPolicy;
+use nv_telemetry_orchestration::StreamCancelHandle;
 use nv_telemetry_orchestration::StreamNeed;
 use nv_telemetry_orchestration::StreamReport;
 use nv_telemetry_orchestration::StreamReports;
@@ -100,6 +103,7 @@ fn origin(provider: &str, request_class: &str) -> Origin {
 struct Gate {
     open: AtomicBool,
     held: Mutex<Option<Waker>>,
+    dropped: AtomicBool,
 }
 
 impl Gate {
@@ -135,6 +139,12 @@ impl Future for Held<'_> {
     }
 }
 
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
 /// A subscription whose connect attempts are scripted: each opens a stream
 /// of the given items, or fails; with a gate, each waits to be let through.
 struct FixtureSubscription {
@@ -142,6 +152,8 @@ struct FixtureSubscription {
     origin: Origin,
     gate: Option<Arc<Gate>>,
     connects: Mutex<VecDeque<Connect>>,
+    hooks: Mutex<StreamHooks>,
+    cancel_on_connect: Mutex<Option<StreamCancelHandle>>,
 }
 
 impl FixtureSubscription {
@@ -151,6 +163,8 @@ impl FixtureSubscription {
             origin: origin(STREAM_PROVIDER, STREAM_CLASS),
             gate: None,
             connects: Mutex::new(connects.into()),
+            hooks: Mutex::new(StreamHooks::default()),
+            cancel_on_connect: Mutex::new(None),
         })
     }
 
@@ -160,12 +174,14 @@ impl FixtureSubscription {
             origin: origin(STREAM_PROVIDER, STREAM_CLASS),
             gate: Some(gate),
             connects: Mutex::new(connects.into()),
+            hooks: Mutex::new(StreamHooks::default()),
+            cancel_on_connect: Mutex::new(None),
         })
     }
 }
 
 impl Acquire for FixtureSubscription {
-    type Output = Iter<std::vec::IntoIter<SubscriptionItem>>;
+    type Output = FixtureItems;
 
     fn endpoint(&self) -> &EndpointContext {
         &self.endpoint
@@ -179,13 +195,72 @@ impl Acquire for FixtureSubscription {
         if let Some(gate) = &self.gate {
             Held(gate).await;
         }
+
+        let cancel = self.cancel_on_connect.lock().expect("connect hook").take();
+
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+
         let items = self
             .connects
             .lock()
             .expect("the script mutex is never poisoned")
             .pop_front()
             .expect("the script covers every connect attempt")?;
-        Ok(futures_util::stream::iter(items))
+
+        let hooks = self.hooks.lock().expect("stream hooks").clone();
+
+        Ok(FixtureItems {
+            items: futures_util::stream::iter(items),
+            hooks,
+        })
+    }
+}
+
+/// Controls provider polls and observes stream destruction at the source boundary.
+#[derive(Clone, Default)]
+struct StreamHooks {
+    /// Stay idle after the scripted items so cancellation must wake the consumer.
+    pending: bool,
+
+    dropped: Arc<AtomicUsize>,
+    cancel_on_poll: Option<StreamCancelHandle>,
+    cancel_on_drop: Option<StreamCancelHandle>,
+}
+
+struct FixtureItems {
+    items: Iter<std::vec::IntoIter<SubscriptionItem>>,
+    hooks: StreamHooks,
+}
+
+impl Stream for FixtureItems {
+    type Item = SubscriptionItem;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if let Some(cancel) = this.hooks.cancel_on_poll.take() {
+            cancel.cancel();
+        }
+
+        let polled = Pin::new(&mut this.items).poll_next(cx);
+
+        if matches!(polled, Poll::Ready(None)) && this.hooks.pending {
+            Poll::Pending
+        } else {
+            polled
+        }
+    }
+}
+
+impl Drop for FixtureItems {
+    fn drop(&mut self) {
+        self.hooks.dropped.fetch_add(1, Ordering::SeqCst);
+
+        if let Some(cancel) = self.hooks.cancel_on_drop.take() {
+            cancel.cancel();
+        }
     }
 }
 
@@ -622,7 +697,7 @@ fn dropping_the_reports_stops_the_stream_before_it_connects() {
 }
 
 #[test]
-fn dropping_the_reports_while_an_attempt_runs_opens_nothing() {
+fn dropping_reports_cancels_a_pending_connection_and_releases_admission() {
     let gate = Arc::new(Gate::default());
     let Rig {
         mut runtime,
@@ -634,15 +709,337 @@ fn dropping_the_reports_while_an_attempt_runs_opens_nothing() {
         vec![Ok(vec![Ok(states_parts())])],
     ));
 
+    let handle = runtime.handle();
+
     // The attempt is taken and waits at the gate; the runtime parks on it.
     assert!(drive(&mut runtime).is_none(), "the attempt is in flight");
+    assert_eq!(handle.stats().in_flight, 1);
+
     drop(reports);
-    gate.open();
-    // The attempt completes: the stream it opened is dropped unread, no
-    // report comes of it, and nothing is due again.
+
     let none = work_outcome(&mut runtime).expect("the attempt completes");
+
     assert!(none.is_empty());
+    assert!(gate.dropped.load(Ordering::SeqCst));
+    assert!(!gate.open.load(Ordering::SeqCst));
+    assert_eq!(handle.stats().in_flight, 0);
     assert!(drive(&mut runtime).is_none(), "nothing more is ever due");
+}
+
+#[test]
+fn cancellation_prevents_undispatched_and_unstarted_connections() {
+    for dispatched in [false, true] {
+        let manual = ManualClock::new();
+        let clock = TestClock::new(&manual);
+        let unit = FixtureSubscription::scripted(endpoint(), Vec::new());
+
+        let (mut leaf, mut reports) = StreamUnit::new(
+            planned_stream(endpoint(), STREAM_PROVIDER),
+            unit,
+            policy(),
+            clock,
+        );
+
+        let cancel = reports.cancel_handle();
+
+        assert!(leaf.update_ready(manual.now()).ready);
+
+        let work = dispatched.then(|| leaf.take_next().expect("due connect").payload);
+
+        cancel.clone().cancel();
+        cancel.cancel();
+
+        if let Some(mut work) = work {
+            let outcome = work.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+
+            assert!(matches!(outcome, Poll::Ready(Ok(ref reports)) if reports.is_empty()));
+        }
+
+        assert!(matches!(next(&mut reports), Poll::Ready(None)));
+        assert!(!leaf.update_ready(manual.now()).ready);
+        assert!(leaf.take_next().is_none());
+
+        drop(reports);
+        drop(leaf);
+        cancel.cancel();
+    }
+}
+
+#[test]
+fn cancellation_wakes_a_pending_connection_and_report_consumer() {
+    let gate = Arc::new(Gate::default());
+
+    let Rig {
+        mut runtime,
+        mut reports,
+        manual,
+    } = rig_with(FixtureSubscription::held(
+        endpoint(),
+        Arc::clone(&gate),
+        Vec::new(),
+    ));
+
+    let handle = runtime.handle();
+    let cancel = reports.cancel_handle();
+    let runtime_flag = Arc::new(Flag::default());
+    let reports_flag = Arc::new(Flag::default());
+    let runtime_waker = Waker::from(Arc::clone(&runtime_flag));
+    let reports_waker = Waker::from(Arc::clone(&reports_flag));
+
+    {
+        let turn = pin!(runtime.next());
+
+        assert!(turn
+            .poll(&mut Context::from_waker(&runtime_waker))
+            .is_pending());
+    }
+
+    assert_eq!(handle.stats().in_flight, 1);
+    assert!(Pin::new(&mut reports)
+        .poll_next(&mut Context::from_waker(&reports_waker))
+        .is_pending());
+
+    std::thread::spawn(move || cancel.cancel())
+        .join()
+        .expect("control task");
+
+    assert!(runtime_flag.woken());
+    assert!(reports_flag.woken());
+    assert!(work_outcome(&mut runtime)
+        .expect("canceled work")
+        .is_empty());
+
+    assert!(gate.dropped.load(Ordering::SeqCst));
+    assert_eq!(handle.stats().in_flight, 0);
+    assert!(matches!(next(&mut reports), Poll::Ready(None)));
+
+    gate.open();
+    manual.advance(MAX_RETRY);
+
+    assert!(drive(&mut runtime).is_none());
+}
+
+#[test]
+fn cancellation_drops_opened_and_idle_streams_without_holding_the_lock() {
+    for drain in [false, true] {
+        let unit = FixtureSubscription::scripted(endpoint(), vec![Ok(vec![Ok(states_parts())])]);
+        let dropped = Arc::clone(&unit.hooks.lock().expect("stream hooks").dropped);
+
+        let Rig {
+            mut runtime,
+            mut reports,
+            ..
+        } = rig_with(Arc::clone(&unit));
+
+        let cancel = reports.cancel_handle();
+
+        {
+            let mut hooks = unit.hooks.lock().expect("stream hooks");
+            hooks.pending = true;
+            hooks.cancel_on_drop = Some(cancel.clone());
+        }
+
+        assert!(work_outcome(&mut runtime).expect("opened").is_empty());
+
+        let flag = Arc::new(Flag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+
+        if drain {
+            pulled(&mut reports).expect("initial value");
+
+            assert!(Pin::new(&mut reports)
+                .poll_next(&mut Context::from_waker(&waker))
+                .is_pending());
+        }
+
+        cancel.cancel();
+
+        if drain {
+            assert!(flag.woken());
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
+
+        assert!(matches!(next(&mut reports), Poll::Ready(None)));
+        assert!(matches!(next(&mut reports), Poll::Ready(None)));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(drive(&mut runtime).is_none());
+    }
+}
+
+#[test]
+fn cancellation_discards_ready_connection_success_and_failure() {
+    for succeeds in [false, true] {
+        let result = if succeeds {
+            Ok(vec![Ok(states_parts())])
+        } else {
+            Err(AcquisitionFailure::new(
+                AcquisitionFailureClass::Connectivity,
+            ))
+        };
+
+        let unit = FixtureSubscription::scripted(endpoint(), vec![result]);
+        let dropped = Arc::clone(&unit.hooks.lock().expect("stream hooks").dropped);
+
+        let Rig {
+            mut runtime,
+            mut reports,
+            ..
+        } = rig_with(Arc::clone(&unit));
+
+        *unit.cancel_on_connect.lock().expect("connect hook") = Some(reports.cancel_handle());
+
+        assert!(work_outcome(&mut runtime)
+            .expect("canceled outcome")
+            .is_empty());
+
+        assert_eq!(dropped.load(Ordering::SeqCst), usize::from(succeeds));
+        assert!(matches!(next(&mut reports), Poll::Ready(None)));
+        assert!(drive(&mut runtime).is_none());
+    }
+}
+
+#[test]
+fn cancellation_discards_ready_items_and_wakes_a_pending_item_poll() {
+    let cases = [
+        Some(Ok(states_parts())),
+        Some(Err(AcquisitionFailure::new(
+            AcquisitionFailureClass::Connectivity,
+        ))),
+        None,
+    ];
+
+    for item in cases {
+        let pending = item.is_none();
+        let unit = FixtureSubscription::scripted(endpoint(), vec![Ok(item.into_iter().collect())]);
+        let dropped = Arc::clone(&unit.hooks.lock().expect("stream hooks").dropped);
+
+        let Rig {
+            mut runtime,
+            mut reports,
+            ..
+        } = rig_with(Arc::clone(&unit));
+
+        {
+            let mut hooks = unit.hooks.lock().expect("stream hooks");
+            hooks.pending = pending;
+            hooks.cancel_on_poll = Some(reports.cancel_handle());
+        }
+
+        assert!(work_outcome(&mut runtime).expect("opened").is_empty());
+
+        let flag = Arc::new(Flag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+        let polled = Pin::new(&mut reports).poll_next(&mut Context::from_waker(&waker));
+
+        if pending {
+            assert!(polled.is_pending());
+            assert!(flag.woken());
+        } else {
+            assert!(matches!(polled, Poll::Ready(None)));
+        }
+
+        assert!(matches!(next(&mut reports), Poll::Ready(None)));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(drive(&mut runtime).is_none());
+    }
+}
+
+#[test]
+fn cancellation_prevents_a_scheduled_reconnect() {
+    let Rig {
+        mut runtime,
+        mut reports,
+        manual,
+    } = rig(vec![Ok(vec![Err(AcquisitionFailure::new(
+        AcquisitionFailureClass::Connectivity,
+    ))])]);
+
+    let cancel = reports.cancel_handle();
+
+    assert!(work_outcome(&mut runtime).expect("opened").is_empty());
+
+    let failed = pulled(&mut reports).expect_err("endpoint fault");
+
+    assert_eq!(failed.status().outcome(), Outcome::Failed);
+    assert_eq!(sleep_deadline(&mut runtime), manual.now() + FIRST_RETRY);
+
+    cancel.cancel();
+    manual.advance(MAX_RETRY);
+
+    assert!(matches!(next(&mut reports), Poll::Ready(None)));
+    assert!(drive(&mut runtime).is_none());
+}
+
+#[test]
+fn cancellation_is_isolated_from_replacements_siblings_and_polls() {
+    let manual = ManualClock::new();
+    let clock = TestClock::new(&manual);
+
+    let mut leaves = Vec::new();
+    let mut consumers = Vec::new();
+
+    for _ in 0..2 {
+        let unit = FixtureSubscription::scripted(endpoint(), vec![Ok(vec![Ok(states_parts())])]);
+        unit.hooks.lock().expect("stream hooks").pending = true;
+
+        let (leaf, reports) = StreamUnit::new(
+            planned_stream(endpoint(), STREAM_PROVIDER),
+            unit,
+            policy(),
+            clock.clone(),
+        );
+
+        leaves.push(leaf);
+        consumers.push(reports);
+    }
+
+    let subtree = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        vec![planned_poll(endpoint(), &clock)],
+        leaves,
+    )
+    .expect("mixed subtree");
+
+    let mut runtime = runtime(subtree, &manual);
+    let mut sibling = consumers.pop().expect("sibling reports");
+    let mut original = consumers.pop().expect("original reports");
+    let cancel = original.cancel_handle();
+
+    drop(sibling.cancel_handle());
+
+    for _ in 0..3 {
+        work_outcome(&mut runtime).expect("initial acquisitions");
+    }
+
+    cancel.cancel();
+
+    assert!(matches!(next(&mut original), Poll::Ready(None)));
+    assert!(pulled(&mut sibling).is_ok());
+
+    let Rig {
+        runtime: mut replacement_runtime,
+        reports: mut replacement,
+        ..
+    } = rig(vec![Ok(vec![Ok(states_parts())])]);
+
+    assert!(work_outcome(&mut replacement_runtime)
+        .expect("replacement opens")
+        .is_empty());
+
+    cancel.cancel();
+
+    assert!(pulled(&mut replacement).is_ok());
+
+    manual.advance(Duration::from_secs(30));
+
+    let polled = work_outcome(&mut runtime).expect("poll remains scheduled");
+
+    assert_eq!(polled.len(), 1);
+    assert_eq!(polled[0].status().provider(), POLL_PROVIDER);
+    assert!(next(&mut sibling).is_pending());
 }
 
 #[test]

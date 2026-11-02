@@ -19,8 +19,9 @@
 //! samples it; a successful one earns no status, as the contract has it. A
 //! failure mid-stream reaches the reports, not the dispatcher, so the
 //! breaker learns of a dead stream only from the next connect attempt.
-//! Dropping the reports cancels the stream: an attempt already taken by
-//! the runtime still runs, but opens nothing.
+//! Dropping the reports or calling [`StreamCancelHandle::cancel`] cancels
+//! the stream and pending connection work. The embedder keeps driving the
+//! runtime and any retained reports until their futures observe cancellation.
 
 use std::fmt;
 use std::pin::Pin;
@@ -34,6 +35,8 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::future::AbortHandle;
+use futures_util::future::Abortable;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use nv_redfish_dispatcher::Completion;
@@ -187,21 +190,21 @@ impl StreamEnd {
 /// connect attempt it dispatches, and the reports outside.
 struct Shared {
     phase: Phase,
+
+    /// Explicit cancellation stops the current stream; subtree removal lets it drain.
+    cancelled: bool,
+
+    /// Handle for aborting the pending acquisition.
+    connecting: Option<AbortHandle>,
+
     /// A stream a connect attempt opened, until the reports take it.
     opened: Option<Items>,
-    /// The reports' waker while they wait for a stream or for the end.
+
+    /// The report consumer's waker, including while a live stream is idle.
     reports: Option<Waker>,
+
     /// The runtime's wake-up, once the leaf is seated.
     runtime: Option<QueueEventSink>,
-}
-
-impl Shared {
-    /// Wakes the reports if they are parked.
-    fn wake_reports(&mut self) {
-        if let Some(waker) = self.reports.take() {
-            waker.wake();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,8 +217,9 @@ enum Phase {
     Streaming,
     /// The instance ended; the leaf decides the next attempt, or the stop.
     Ended { end: StreamEnd, productive: bool },
-    /// Nothing more: the policy said stop, the reports were dropped, or
-    /// the subtree is gone.
+
+    /// No new connection attempts. A current stream may still drain after
+    /// subtree removal.
     Stopped,
 }
 
@@ -225,6 +229,72 @@ type SharedState = Arc<Mutex<Shared>>;
 /// consistent state.
 fn lock(shared: &SharedState) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Requests cancellation of a [`StreamUnit`] and its [`StreamReports`],
+/// including pending connection work.
+///
+/// Handles can be cloned and sent to the embedder's control task while another
+/// task drains [`StreamReports`]. Dropping a handle does not cancel the stream.
+#[derive(Clone)]
+pub struct StreamCancelHandle {
+    shared: SharedState,
+}
+
+impl StreamCancelHandle {
+    /// Permanently cancels this stream pair. Repeated calls have no further effect.
+    ///
+    /// Cancellation wakes pending connection work and report consumers. Keep
+    /// polling the runtime and reports so they can drop the acquisition future
+    /// or live stream. This call does not wait for cleanup or remote RPC closure.
+    ///
+    /// Canceled work produces no acquisition report or endpoint fault. A report
+    /// accepted before cancellation may still be delivered. No further connection
+    /// attempt is scheduled, including after an existing reconnect delay.
+    pub fn cancel(&self) {
+        let (connecting, opened, reports, runtime) = {
+            let mut state = lock(&self.shared);
+
+            if state.cancelled {
+                return;
+            }
+
+            state.cancelled = true;
+            state.phase = Phase::Stopped;
+            (
+                state.connecting.take(),
+                state.opened.take(),
+                state.reports.take(),
+                state.runtime.clone(),
+            )
+        };
+
+        // Release the lock before dropping provider resources or waking tasks:
+        // their callbacks may re-enter the stream pair.
+        if let Some(connecting) = connecting {
+            connecting.abort();
+        }
+
+        drop(opened);
+
+        if let Some(reports) = reports {
+            reports.wake();
+        }
+
+        if let Some(runtime) = runtime {
+            runtime.push(QueueEvent::WakeUp);
+        }
+    }
+}
+
+impl fmt::Debug for StreamCancelHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cancelled = lock(&self.shared).cancelled;
+
+        f.debug_struct("StreamCancelHandle")
+            .field("cancelled", &cancelled)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One planned stream bound to its acquisition unit: the connect leaf the
@@ -263,6 +333,8 @@ impl StreamUnit {
         let unit_origin = unit.origin().clone();
         let shared = Arc::new(Mutex::new(Shared {
             phase: Phase::Due(None),
+            cancelled: false,
+            connecting: None,
             opened: None,
             reports: None,
             runtime: None,
@@ -344,7 +416,6 @@ impl StreamUnit {
             Readiness::not_ready(Some(at))
         } else {
             state.phase = Phase::Stopped;
-            state.wake_reports();
             Readiness::not_ready(None)
         }
     }
@@ -357,7 +428,8 @@ impl Scheduler<TelemetryWork> for StreamUnit {
         self.last_now = Some(now);
         let shared = Arc::clone(&self.shared);
         let mut state = lock(&shared);
-        match state.phase {
+
+        let readiness = match state.phase {
             Phase::Due(None) => Readiness::ready(None),
             Phase::Due(Some(at)) => {
                 if now >= at {
@@ -368,7 +440,21 @@ impl Scheduler<TelemetryWork> for StreamUnit {
             }
             Phase::Connecting | Phase::Streaming | Phase::Stopped => Readiness::not_ready(None),
             Phase::Ended { end, productive } => self.schedule(&mut state, end, productive, now),
+        };
+
+        let reports = if state.phase == Phase::Stopped {
+            state.reports.take()
+        } else {
+            None
+        };
+
+        drop(state);
+
+        if let Some(reports) = reports {
+            reports.wake();
         }
+
+        readiness
     }
 
     fn take_next(&mut self) -> Option<ScheduledWork<TelemetryWork, ()>> {
@@ -397,7 +483,13 @@ impl Drop for StreamUnit {
         // The subtree is gone: the reports end once their stream does.
         let mut state = lock(&self.shared);
         state.phase = Phase::Stopped;
-        state.wake_reports();
+        let reports = state.reports.take();
+
+        drop(state);
+
+        if let Some(reports) = reports {
+            reports.wake();
+        }
     }
 }
 
@@ -421,27 +513,64 @@ where
     C: Clock + 'static,
 {
     Box::pin(async move {
-        let stopped = lock(&shared).phase == Phase::Stopped;
-        if stopped {
-            // The reports were dropped while this attempt waited: nothing
-            // would read the stream, so no request is made.
-            return Ok(Vec::new());
+        let (abort, registration) = AbortHandle::new_pair();
+
+        {
+            let mut state = lock(&shared);
+
+            if state.phase == Phase::Stopped {
+                return Ok(Vec::new());
+            }
+
+            // Register before polling the acquisition so cancellation can wake it.
+            state.connecting = Some(abort);
         }
+
         let begun = clock.instant();
         let at = clock.timestamp();
-        match unit.perform().await {
+
+        let Ok(result) = Abortable::new(unit.perform(), registration).await else {
+            // Complete dispatcher work to release admission without a report.
+            return Ok(Vec::new());
+        };
+
+        let duration = clock.instant().saturating_duration_since(begun);
+
+        // Abortable can return a ready result while cancellation is racing it.
+        // Accept that result under the same lock that records cancellation.
+        let mut state = lock(&shared);
+        let connecting = state.connecting.take();
+
+        if state.cancelled {
+            drop(state);
+            drop(connecting);
+            drop(result);
+            return Ok(Vec::new());
+        }
+
+        match result {
             Ok(items) => {
-                let mut state = lock(&shared);
-                if state.phase != Phase::Stopped {
-                    state.phase = Phase::Streaming;
-                    state.opened = Some(Box::pin(items));
-                    state.wake_reports();
+                if state.phase == Phase::Stopped {
+                    drop(state);
+                    drop(connecting);
+                    drop(items);
+                    return Ok(Vec::new());
                 }
+
+                state.phase = Phase::Streaming;
+                state.opened = Some(Box::pin(items));
+                let reports = state.reports.take();
+
+                drop(state);
+                drop(connecting);
+
+                if let Some(reports) = reports {
+                    reports.wake();
+                }
+
                 Ok(Vec::new())
             }
             Err(failure) => {
-                let duration = clock.instant().saturating_duration_since(begun);
-                let mut state = lock(&shared);
                 if state.phase != Phase::Stopped {
                     state.phase = Phase::Ended {
                         end: StreamEnd::NotConnected {
@@ -450,7 +579,10 @@ where
                         productive: false,
                     };
                 }
+
                 drop(state);
+                drop(connecting);
+
                 assemble(
                     unit.endpoint(),
                     unit.origin(),
@@ -465,8 +597,10 @@ where
 }
 
 /// The reports of one stream, pulled by the embedder: one per item, at the
-/// consumer's pace. Ends when the stream's policy says stop, or when the
-/// subtree seating its leaf is gone.
+/// consumer's pace. Ends when the reconnect policy stops the stream pair.
+/// Explicit cancellation ends the reports on their next poll.
+/// Removing the subtree allows the current instance to drain before ending.
+/// Dropping the reports requests cancellation of connection work and the stream.
 pub struct StreamReports {
     shared: SharedState,
     current: Option<Items>,
@@ -476,6 +610,31 @@ pub struct StreamReports {
 }
 
 impl StreamReports {
+    /// Returns a handle that can cancel this stream pair from another task.
+    ///
+    /// For immediate removal, cancel the pair before removing its scheduler
+    /// entry. To replace a subscription, construct a new pair; handles for the
+    /// old pair cannot cancel the replacement. Keep driving canceled work and
+    /// reports until cleanup completes; the handle does not acknowledge cleanup.
+    ///
+    /// ```
+    /// use nv_telemetry_orchestration::{StreamReports, StreamUnit};
+    ///
+    /// fn retire(reports: StreamReports, leaf: StreamUnit) {
+    ///     let cancel = reports.cancel_handle();
+    ///
+    ///     cancel.cancel();
+    ///     drop(reports);
+    ///     drop(leaf);
+    /// }
+    /// ```
+    #[must_use]
+    pub fn cancel_handle(&self) -> StreamCancelHandle {
+        StreamCancelHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Records the current instance's end and wakes the runtime, whose
     /// next readiness scan schedules what follows.
     fn ended(&mut self, end: StreamEnd) {
@@ -500,33 +659,76 @@ impl Stream for StreamReports {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
         loop {
-            if let Some(items) = this.current.as_mut() {
-                match items.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(item)) => {
-                        let terminal = item.as_ref().err().map(resolved_retryable);
-                        let report = (this.assemble)(item);
-                        match terminal {
-                            Some(retryable) => this.ended(StreamEnd::Failed { retryable }),
-                            None => this.productive = true,
-                        }
-                        return Poll::Ready(Some(report));
-                    }
-                    Poll::Ready(None) => this.ended(StreamEnd::Closed),
-                    Poll::Pending => return Poll::Pending,
+            // Register before polling the provider so cancellation can wake an
+            // idle report consumer.
+            let waker = cx.waker().clone();
+
+            let previous_waker = {
+                let mut state = lock(&this.shared);
+
+                if state.cancelled {
+                    drop(state);
+
+                    this.current = None;
+                    return Poll::Ready(None);
                 }
+
+                state.reports.replace(waker)
+            };
+
+            // A waker's destructor may re-enter the pair, so drop it outside the lock.
+            drop(previous_waker);
+
+            let polled = this
+                .current
+                .as_mut()
+                .map(|items| items.as_mut().poll_next(cx));
+
+            match polled {
+                Some(Poll::Ready(Some(item))) => {
+                    // Cancellation can arrive during the provider poll, even
+                    // when that poll returns an item.
+                    let cancelled = lock(&this.shared).cancelled;
+
+                    if cancelled {
+                        this.current = None;
+                        return Poll::Ready(None);
+                    }
+
+                    let terminal = item.as_ref().err().map(resolved_retryable);
+                    let report = (this.assemble)(item);
+
+                    match terminal {
+                        Some(retryable) => this.ended(StreamEnd::Failed { retryable }),
+                        None => this.productive = true,
+                    }
+
+                    return Poll::Ready(Some(report));
+                }
+                Some(Poll::Ready(None)) => this.ended(StreamEnd::Closed),
+                Some(Poll::Pending) => return Poll::Pending,
+                None => {}
             }
+
             let mut state = lock(&this.shared);
+
             if let Some(items) = state.opened.take() {
                 drop(state);
                 this.current = Some(items);
                 this.productive = false;
                 continue;
             }
+
             if state.phase == Phase::Stopped {
+                let reports = state.reports.take();
+
+                drop(state);
+                drop(reports);
                 return Poll::Ready(None);
             }
-            state.reports = Some(cx.waker().clone());
+
             return Poll::Pending;
         }
     }
@@ -534,9 +736,7 @@ impl Stream for StreamReports {
 
 impl Drop for StreamReports {
     fn drop(&mut self) {
-        let mut state = lock(&self.shared);
-        state.phase = Phase::Stopped;
-        state.opened = None;
+        self.cancel_handle().cancel();
     }
 }
 
