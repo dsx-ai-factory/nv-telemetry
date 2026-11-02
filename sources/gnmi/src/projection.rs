@@ -23,27 +23,27 @@ use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
-use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProjectionIssue;
-use nv_telemetry_source::SubscriptionItem;
 use serde::de::DeserializeOwned;
 
 use crate::protocol::gnmi;
 use crate::protocol::gnmi::typed_value::Value;
 use crate::spec::CollectionTarget;
 use crate::spec::MappingKind;
+use crate::spec::MappingSpec;
 use crate::spec::StateType;
 use crate::Mapping;
 use crate::NumericType;
 use crate::PathElement;
 use crate::StateIdentity;
 use crate::SubscriptionPath;
-use crate::SubscriptionSpec;
+
+type ProjectionParts = (Vec<(Coverage, Payload)>, Vec<ProjectionIssue>);
 
 pub(super) fn project(
-    spec: &SubscriptionSpec,
+    spec: &MappingSpec,
     notification: gnmi::Notification,
-) -> SubscriptionItem {
+) -> Result<ProjectionParts, AcquisitionFailure> {
     const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
     // Timestamps before the Unix epoch still need a nonnegative nanosecond remainder.
@@ -136,7 +136,7 @@ pub(super) fn project(
         &mut issues,
     );
 
-    Ok(AcquisitionParts::new(payloads, issues))
+    Ok((payloads, issues))
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -281,7 +281,7 @@ fn split_payloads(
 /// Reports deletes that name a mapped leaf or one of its ancestors.
 /// The model has no deletion observation, so deletes produce issues only.
 fn delete_issues(
-    spec: &SubscriptionSpec,
+    spec: &MappingSpec,
     prefix: Option<&gnmi::Path>,
     deletes: &[gnmi::Path],
     issues: &mut Vec<ProjectionIssue>,
@@ -334,7 +334,7 @@ fn state_payload(
         .build()
         .map_err(|error| model_error(&error))?;
 
-    // A notification can omit unchanged leaves, so its state coverage is partial.
+    // Configured mappings select leaves without establishing complete subject coverage.
     let coverage = Coverage::builder()
         .completeness(Completeness::Partial)
         .build()
@@ -383,7 +383,7 @@ fn state(
 }
 
 fn resolve(
-    spec: &SubscriptionSpec,
+    spec: &MappingSpec,
     prefix: Option<&gnmi::Path>,
     path: Option<&gnmi::Path>,
 ) -> Result<SubscriptionPath, &'static str> {

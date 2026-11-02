@@ -44,6 +44,23 @@ pub enum Encoding {
     JsonIetf,
 }
 
+/// The portion of the target's data tree requested by Get.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GetDataType {
+    /// Configuration, state, and operational data.
+    #[default]
+    All,
+
+    /// Data that the target considers read/write.
+    Config,
+
+    /// Data that the target considers read-only.
+    State,
+
+    /// Read-only data related to processes or external interactions.
+    Operational,
+}
+
 /// One concrete path element. Keys select entries in a list.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PathElement {
@@ -747,75 +764,27 @@ impl Mapping {
     }
 }
 
-/// Validated request paths and signal mappings for one subscription.
-///
-/// Request paths select what the target sends. Mappings match leaf paths
-/// after notification prefixes are applied. A parent request is supported when
-/// the target sends updates for individual leaves. The provider does not traverse
-/// JSON subtrees.
-/// Validation checks the configuration without a YANG schema or target lookup.
+/// Mapping rules and path context shared by configured acquisitions.
 #[derive(Clone, Debug)]
-pub struct SubscriptionSpec {
+pub(super) struct MappingSpec {
     pub(super) mappings: Vec<Mapping>,
     collections: BTreeMap<Vec<String>, Vec<usize>>,
-    requests: Vec<gnmi::Subscription>,
     pub(super) origin: String,
     pub(super) target: String,
-    encoding: Encoding,
 }
 
-impl SubscriptionSpec {
-    /// Validates paths and mappings with `TARGET_DEFINED` mode for every path.
-    ///
-    /// Use [`Self::from_requests`] to configure subscription modes and their options per path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if paths or mappings fail the checks in [`Self::from_requests`].
-    pub fn new(
-        requests: Vec<SubscriptionPath>,
-        mappings: Vec<Mapping>,
-    ) -> Result<Self, InvalidSubscription> {
-        Self::from_requests(
-            requests
-                .into_iter()
-                .map(SubscriptionRequest::target_defined)
-                .collect(),
-            mappings,
-        )
-    }
-
-    /// Validates request paths, subscription modes, options, and mappings before acquisition.
-    ///
-    /// Requests keep their order, including duplicate and overlapping paths.
-    /// Intervals are converted to nanoseconds during validation. The target decides
-    /// whether it supports the requested paths, modes, and intervals.
-    ///
-    /// Each mapping must be covered by a request path, and mapping paths must not
-    /// overlap. Fixed reading keys and state identities `(subject, facet, name)`
-    /// must be unique. Collection mappings with the same subject template, facet,
-    /// and state name are rejected unless literal key filters keep their entries
-    /// apart. A reading and a state may describe the same signal.
-    /// Collection subjects are checked again against received keys. Output identity
-    /// collisions between concrete paths are reported when projecting a notification.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for empty requests or mappings, invalid paths, mappings
-    /// outside the requests, overlapping mapping paths, duplicate output identities,
-    /// invalid templates or state identities, options invalid for the selected mode,
-    /// or intervals exceeding an unsigned 64-bit count of nanoseconds.
-    pub fn from_requests(
-        requests: Vec<SubscriptionRequest>,
+impl MappingSpec {
+    fn new<'a>(
+        requests: &(impl Iterator<Item = &'a SubscriptionPath> + Clone),
         mut mappings: Vec<Mapping>,
     ) -> Result<Self, InvalidSubscription> {
-        if requests.is_empty() || mappings.is_empty() {
+        if requests.clone().next().is_none() || mappings.is_empty() {
             return Err(InvalidSubscription(
                 "requests and mappings must be nonempty",
             ));
         }
 
-        if requests.iter().any(|request| !request.path.valid())
+        if requests.clone().any(|request| !request.valid())
             || mappings.iter().any(|mapping| !mapping.path.valid())
         {
             return Err(InvalidSubscription(
@@ -834,8 +803,8 @@ impl SubscriptionSpec {
             }
 
             if !requests
-                .iter()
-                .any(|request| request.path.contains(&mapping.path))
+                .clone()
+                .any(|request| request.contains(&mapping.path))
             {
                 return Err(InvalidSubscription(
                     "every mapping must be below a request path",
@@ -901,19 +870,11 @@ impl SubscriptionSpec {
 
         let collections = collection_index(&mappings)?;
 
-        // Validate and encode subscription modes and options once, before any acquisition.
-        let requests = requests
-            .into_iter()
-            .map(SubscriptionRequest::wire)
-            .collect::<Result<_, _>>()?;
-
         Ok(Self {
             collections,
             mappings,
-            requests,
             origin: String::new(),
             target: String::new(),
-            encoding: Encoding::default(),
         })
     }
 
@@ -935,18 +896,93 @@ impl SubscriptionSpec {
             .filter_map(|index| self.mappings.get(*index))
             .find(|mapping| mapping.path.contains(path))
     }
+}
+
+/// Validated request paths and signal mappings for one subscription.
+///
+/// Request paths select what the target sends. Mappings match leaf paths
+/// after notification prefixes are applied. A parent request is supported when
+/// the target sends updates for individual leaves. The provider does not traverse
+/// JSON subtrees.
+/// Validation checks the configuration without a YANG schema or target lookup.
+#[derive(Clone, Debug)]
+pub struct SubscriptionSpec {
+    pub(super) projection: MappingSpec,
+    requests: Vec<gnmi::Subscription>,
+    encoding: Encoding,
+}
+
+impl SubscriptionSpec {
+    /// Validates paths and mappings with `TARGET_DEFINED` mode for every path.
+    ///
+    /// Use [`Self::from_requests`] to configure subscription modes and their options per path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if paths or mappings fail the checks in [`Self::from_requests`].
+    pub fn new(
+        requests: Vec<SubscriptionPath>,
+        mappings: Vec<Mapping>,
+    ) -> Result<Self, InvalidSubscription> {
+        Self::from_requests(
+            requests
+                .into_iter()
+                .map(SubscriptionRequest::target_defined)
+                .collect(),
+            mappings,
+        )
+    }
+
+    /// Validates request paths, subscription modes, options, and mappings before acquisition.
+    ///
+    /// Requests keep their order, including duplicate and overlapping paths.
+    /// Intervals are converted to nanoseconds during validation. The target decides
+    /// whether it supports the requested paths, modes, and intervals.
+    ///
+    /// Each mapping must be covered by a request path, and mapping paths must not
+    /// overlap. Fixed reading keys and state identities `(subject, facet, name)`
+    /// must be unique. Collection mappings with the same subject template, facet,
+    /// and state name are rejected unless literal key filters keep their entries
+    /// apart. A reading and a state may describe the same signal.
+    /// Collection subjects are checked again against received keys. Output identity
+    /// collisions between concrete paths are reported when projecting a notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty requests or mappings, invalid paths, mappings
+    /// outside the requests, overlapping mapping paths, duplicate output identities,
+    /// invalid templates or state identities, options invalid for the selected mode,
+    /// or intervals exceeding an unsigned 64-bit count of nanoseconds.
+    pub fn from_requests(
+        requests: Vec<SubscriptionRequest>,
+        mappings: Vec<Mapping>,
+    ) -> Result<Self, InvalidSubscription> {
+        let projection = MappingSpec::new(&requests.iter().map(|request| &request.path), mappings)?;
+
+        // Validate and encode subscription modes and options once, before any acquisition.
+        let requests = requests
+            .into_iter()
+            .map(SubscriptionRequest::wire)
+            .collect::<Result<_, _>>()?;
+
+        Ok(Self {
+            projection,
+            requests,
+            encoding: Encoding::default(),
+        })
+    }
 
     /// Sets the gNMI origin for all request paths. Empty leaves the origin unspecified.
     #[must_use]
     pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
-        self.origin = origin.into();
+        self.projection.origin = origin.into();
         self
     }
 
     /// Sets the gNMI target for all request paths. Empty leaves the target unspecified.
     #[must_use]
     pub fn with_target(mut self, target: impl Into<String>) -> Self {
-        self.target = target.into();
+        self.projection.target = target.into();
         self
     }
 
@@ -962,8 +998,8 @@ impl SubscriptionSpec {
             request: Some(gnmi::subscribe_request::Request::Subscribe(
                 gnmi::SubscriptionList {
                     prefix: Some(gnmi::Path {
-                        origin: self.origin.clone(),
-                        target: self.target.clone(),
+                        origin: self.projection.origin.clone(),
+                        target: self.projection.target.clone(),
                         ..Default::default()
                     }),
                     subscription: self.requests.clone(),
@@ -980,6 +1016,111 @@ impl SubscriptionSpec {
         }
     }
 }
+
+/// Validated paths and scalar mappings for one unary Get request.
+///
+/// Paths and mappings use the same rules as [`SubscriptionSpec`]. The target
+/// must return leaf-addressed updates; mapped JSON containers produce issues.
+/// Get requests default to [`GetDataType::All`] and [`Encoding::Json`].
+#[derive(Clone, Debug)]
+pub struct GetSpec {
+    pub(super) projection: MappingSpec,
+    requests: Vec<gnmi::Path>,
+    data_type: GetDataType,
+    encoding: Encoding,
+}
+
+impl GetSpec {
+    /// Validates request paths and mappings before any RPC is sent.
+    ///
+    /// Request order, duplicates, and overlapping request paths are preserved.
+    /// Every mapping must be covered by a request. Mapping paths and configured
+    /// output identities must not overlap under the rules of [`SubscriptionSpec`].
+    /// Validation uses no YANG schema and does not establish target path support.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or invalid paths or mappings, overlapping mapping
+    /// paths, duplicate output identities, or invalid identity and reading templates.
+    pub fn new(
+        requests: Vec<SubscriptionPath>,
+        mappings: Vec<Mapping>,
+    ) -> Result<Self, InvalidGet> {
+        let projection = MappingSpec::new(&requests.iter(), mappings)
+            .map_err(|InvalidSubscription(detail)| InvalidGet(detail))?;
+
+        Ok(Self {
+            projection,
+            requests: requests.into_iter().map(|path| path.wire()).collect(),
+            data_type: GetDataType::default(),
+            encoding: Encoding::default(),
+        })
+    }
+
+    /// Sets the origin for all request paths. Empty leaves it unspecified.
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.projection.origin = origin.into();
+        self
+    }
+
+    /// Sets the target for all request paths. Empty leaves it unspecified.
+    #[must_use]
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.projection.target = target.into();
+        self
+    }
+
+    /// Selects the requested data type. The target applies this filter.
+    #[must_use]
+    pub const fn with_data_type(mut self, data_type: GetDataType) -> Self {
+        self.data_type = data_type;
+        self
+    }
+
+    /// Selects the requested encoding. The target must support the selection.
+    #[must_use]
+    pub const fn with_encoding(mut self, encoding: Encoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    pub(super) fn request(&self) -> gnmi::GetRequest {
+        gnmi::GetRequest {
+            prefix: Some(gnmi::Path {
+                origin: self.projection.origin.clone(),
+                target: self.projection.target.clone(),
+                ..Default::default()
+            }),
+            path: self.requests.clone(),
+            r#type: match self.data_type {
+                GetDataType::All => gnmi::get_request::DataType::All,
+                GetDataType::Config => gnmi::get_request::DataType::Config,
+                GetDataType::State => gnmi::get_request::DataType::State,
+                GetDataType::Operational => gnmi::get_request::DataType::Operational,
+            }
+            .into(),
+            encoding: match self.encoding {
+                Encoding::Json => gnmi::Encoding::Json,
+                Encoding::JsonIetf => gnmi::Encoding::JsonIetf,
+            }
+            .into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// An invalid Get request path or mapping configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidGet(&'static str);
+
+impl fmt::Display for InvalidGet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidGet {}
 
 /// An invalid set of request paths or signal mappings.
 #[derive(Clone, Debug, PartialEq, Eq)]
