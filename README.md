@@ -16,7 +16,7 @@ integration with mock and HTTP transports.
 | --- | --- |
 | Observation model | Versioned protobuf schema, generated validated Rust types, canonical ordering, content hashing, and encode/decode support. |
 | Redfish | Sensor and chassis reads, log-service and firmware-inventory walks, and server-sent events projected into observation batches. |
-| gNMI | Configured subscriptions that map numeric, string, and boolean leaves to readings and states. |
+| gNMI | Configured subscriptions and Get requests that map numeric, string, and boolean leaves to readings and states. |
 | Orchestration | Deterministic poll/stream planning, endpoint admission, circuit-breaker and rate policies, report assembly, and stream reconnect policy. |
 | Probe | A demo embedder with in-process mock and live HTTP modes; tagged batches, statuses, and projection issues on stdout. |
 
@@ -108,7 +108,7 @@ model/                nv-telemetry-model          data plane, generated
 source/               nv-telemetry-source         acquisition contract
 sources/
   redfish/            nv-telemetry-redfish        HTTP/JSON, OData, DMTF schemas
-  gnmi/               nv-telemetry-gnmi           configured gNMI subscriptions
+  gnmi/               nv-telemetry-gnmi           configured gNMI subscriptions and Get requests
 orchestration/        nv-telemetry-orchestration  planner, providers, recipes
 examples/
   probe/              nv-telemetry-probe          demo embedder (not published)
