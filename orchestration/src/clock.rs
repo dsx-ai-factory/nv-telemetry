@@ -9,6 +9,7 @@
 //! long it took ([`Clock::instant`]) — differencing wall-clock instants
 //! would let a clock step masquerade as a duration.
 
+use std::sync::Arc;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -25,6 +26,9 @@ pub trait Clock: Send + Sync {
     /// A monotonic instant for duration measurement.
     fn instant(&self) -> Instant;
 }
+
+/// The one clock a collector binds into every unit it seats.
+pub(crate) type SharedClock = Arc<dyn Clock>;
 
 /// The system clock — the workspace's one bridge from [`SystemTime`] to the
 /// contract's [`Timestamp`].

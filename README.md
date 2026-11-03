@@ -5,8 +5,8 @@ Libraries for bare-metal telemetry collection
 
 `nv-telemetry` collects telemetry from bare-metal endpoints and emits immutable
 observations. It accepts endpoint inventory and collection intent from an
-embedding service, plans how to obtain the requested data, executes collection
-through an embedder-owned dispatcher, and reports what it observed. Sources
+embedding service, plans how to obtain the requested data, collects it on a
+dispatcher runtime per endpoint, and reports what it observed. Sources
 only read; health verdicts, thresholds, and remediation are consumer policy.
 
 The observation model is a versioned, annotated protobuf schema. Wire types,
@@ -30,7 +30,7 @@ source/               nv-telemetry-source         acquisition contract
 sources/
   redfish/            nv-telemetry-redfish        HTTP/JSON, OData, DMTF schemas
   gnmi/               nv-telemetry-gnmi           gRPC subscribe, YANG paths
-orchestration/        nv-telemetry-orchestration  planner, providers, recipes
+orchestration/        nv-telemetry-orchestration  planner, collector, recipes
 examples/
   probe/              nv-telemetry-probe          demo embedder (not published)
 export/               nv-telemetry-export         shared batch traversal

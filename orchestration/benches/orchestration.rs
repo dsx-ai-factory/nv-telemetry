@@ -5,19 +5,19 @@
 //! orchestration, through the public API only — the numbers are what an
 //! embedder pays.
 //!
-//! Three questions, one group each:
+//! Two questions, one group each:
 //!
-//! - `assemble`: the per-acquisition doctrine price — one status built,
-//!   the issues envelope when issues exist, the breaker-channel split.
-//!   Batches pass through already validated, so payload size is priced in
-//!   the model crate's benchmarks, not here.
-//! - `tick`: everything one poll pays above the wire — a full runtime
-//!   turn through the four-layer admission stack, the leaf's `acquire`,
-//!   and assembly, on a virtual timeline with a trivial payload; alone,
-//!   contended by a dense subtree, and paired with the follow-up turn
-//!   that applies the completion and hints the next deadline.
+//! - `deliver`: everything one steady-state poll pays above the wire,
+//!   from the endpoint's timer firing to the report in the consumer's hand
+//!   — the turn through the four-layer admission stack, the leaf's
+//!   `acquire`, the status-and-issues doctrine for each kind of outcome,
+//!   the completion's bookkeeping and next hint, and the reports channel;
+//!   alone, and contended by a dense endpoint. Batches pass through already
+//!   validated, so payload size is priced in the model crate's benchmarks,
+//!   not here. Tokio runs on one thread with its clock paused, so the
+//!   timeline is virtual and the counts deterministic.
 //! - `configure`: what a config change pays — planning a fleet-size need
-//!   list and building an endpoint subtree from its planned polls.
+//!   list and adding an endpoint from its planned polls.
 //!
 //! Sizes are deliberately modest: instruction counts are deterministic,
 //! so a thousand-need plan answers the scaling question without a
@@ -39,25 +39,16 @@
 
 #[cfg(unix)]
 mod unix {
-    use std::future::Future;
     use std::hint::black_box;
-    use std::pin::pin;
     use std::sync::Arc;
-    use std::task::Context;
-    use std::task::Poll;
-    use std::task::Waker;
     use std::time::Duration;
     use std::time::Instant;
 
+    use futures_util::StreamExt as _;
     use gungraun::library_benchmark;
     use gungraun::Callgrind;
     use gungraun::EventKind;
     use gungraun::LibraryBenchmarkConfig;
-    use nv_redfish_dispatcher::ClockConfig;
-    use nv_redfish_dispatcher::ManualClock;
-    use nv_redfish_dispatcher::Runtime;
-    use nv_redfish_dispatcher::RuntimeConfig;
-    use nv_redfish_dispatcher::RuntimeOutput;
     use nv_telemetry_model::Completeness;
     use nv_telemetry_model::Coverage;
     use nv_telemetry_model::EndpointContext;
@@ -65,21 +56,18 @@ mod unix {
     use nv_telemetry_model::Payload;
     use nv_telemetry_model::States;
     use nv_telemetry_model::Timestamp;
-    use nv_telemetry_orchestration::assemble;
-    use nv_telemetry_orchestration::endpoint_subtree;
     use nv_telemetry_orchestration::plan;
-    use nv_telemetry_orchestration::AcquisitionReport;
     use nv_telemetry_orchestration::Clock;
-    use nv_telemetry_orchestration::EndpointFault;
+    use nv_telemetry_orchestration::Collected;
+    use nv_telemetry_orchestration::Collector;
     use nv_telemetry_orchestration::EndpointPolicy;
+    use nv_telemetry_orchestration::EndpointUnits;
     use nv_telemetry_orchestration::Needs;
     use nv_telemetry_orchestration::Plan;
-    use nv_telemetry_orchestration::PollMeta;
     use nv_telemetry_orchestration::PollNeed;
     use nv_telemetry_orchestration::PollUnit;
-    use nv_telemetry_source::acquire;
+    use nv_telemetry_orchestration::Reports;
     use nv_telemetry_source::Acquire;
-    use nv_telemetry_source::Acquired;
     use nv_telemetry_source::AcquisitionFailure;
     use nv_telemetry_source::AcquisitionFailureClass;
     use nv_telemetry_source::AcquisitionParts;
@@ -90,23 +78,21 @@ mod unix {
     /// resolve in one configuration pass.
     const FLEET_NEEDS: usize = 1024;
 
-    /// Units under one endpoint subtree: a dense chassis.
-    const SUBTREE_UNITS: usize = 64;
+    /// Units under one endpoint: a dense chassis.
+    const ENDPOINT_UNITS: usize = 64;
 
-    /// Issues in the envelope-bearing assembly case.
+    /// Issues in the envelope-bearing case.
     const ISSUES: usize = 16;
 
     /// The regression gate for benchmarks whose counts sit under a few
     /// tens of thousands of instructions, where a single inlining decision
     /// moved by unrelated code is several percent by itself. The bulk
-    /// `configure` cases hold the strict default set at `main!`.
+    /// cases hold the strict default set at `main!`.
     const MICRO_IR_LIMIT: f64 = 15.0;
 
     const PROVIDER: &str = "redfish.sensor.odata";
     const REQUEST_CLASS: &str = "sensor-read";
     const BASE_SECONDS: i64 = 1_785_621_243;
-
-    type PollRuntime = Runtime<AcquisitionReport, EndpointFault, PollMeta>;
 
     fn endpoint() -> EndpointContext {
         EndpointContext::builder()
@@ -123,30 +109,17 @@ mod unix {
             .expect("a valid origin")
     }
 
-    fn at() -> Timestamp {
-        Timestamp::new(BASE_SECONDS, 0).expect("a valid instant")
-    }
-
     fn declaration() -> ProviderDeclaration {
         ProviderDeclaration::polled(PROVIDER, REQUEST_CLASS, 1)
     }
 
-    /// A unit whose acquisition is a stored clone: the leaf costs nothing
-    /// but the doctrine around it, which is what these benchmarks price.
+    /// A unit whose every acquisition is a stored clone: the leaf costs
+    /// nothing but the doctrine around it, which is what these benchmarks
+    /// price.
     struct FixtureUnit {
         endpoint: EndpointContext,
         origin: Origin,
-        parts: AcquisitionParts,
-    }
-
-    impl FixtureUnit {
-        fn shared() -> Arc<Self> {
-            Arc::new(Self {
-                endpoint: endpoint(),
-                origin: origin(),
-                parts: states_parts(Vec::new()),
-            })
-        }
+        outcome: Result<AcquisitionParts, AcquisitionFailure>,
     }
 
     impl Acquire for FixtureUnit {
@@ -161,24 +134,21 @@ mod unix {
         }
 
         async fn perform(&self) -> Result<AcquisitionParts, AcquisitionFailure> {
-            Ok(self.parts.clone())
+            self.outcome.clone()
         }
     }
 
-    /// A frozen timeline: instants come from the manual clock, wall time
-    /// is the base — deterministic instruction counts need no real clock.
-    #[derive(Clone)]
-    struct FrozenClock {
-        manual: ManualClock,
-    }
+    /// Tokio's paused clock as orchestration's; wall time stays at the
+    /// base, as no count depends on it.
+    struct PausedClock;
 
-    impl Clock for FrozenClock {
+    impl Clock for PausedClock {
         fn timestamp(&self) -> Timestamp {
-            at()
+            Timestamp::new(BASE_SECONDS, 0).expect("a valid instant")
         }
 
         fn instant(&self) -> Instant {
-            self.manual.now()
+            tokio::time::Instant::now().into_std()
         }
     }
 
@@ -204,37 +174,6 @@ mod unix {
             .collect()
     }
 
-    /// The fixture never awaits anything, so one poll completes it.
-    fn acquired(parts: AcquisitionParts) -> Acquired {
-        let unit = FixtureUnit {
-            endpoint: endpoint(),
-            origin: origin(),
-            parts,
-        };
-        let future = pin!(acquire(&unit, at()));
-        match future.poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(outcome) => outcome.expect("the fixture acquisition succeeds"),
-            Poll::Pending => unreachable!("the fixture future is ready on first poll"),
-        }
-    }
-
-    /// Everything `assemble` takes, in hand as the driver has it.
-    struct AssembleInput {
-        endpoint: EndpointContext,
-        origin: Origin,
-        at: Timestamp,
-        outcome: Result<Acquired, AcquisitionFailure>,
-    }
-
-    fn assemble_input(outcome: Result<Acquired, AcquisitionFailure>) -> AssembleInput {
-        AssembleInput {
-            endpoint: endpoint(),
-            origin: origin(),
-            at: at(),
-            outcome,
-        }
-    }
-
     fn fleet_needs(count: usize) -> Vec<PollNeed> {
         (0..count)
             .map(|index| {
@@ -248,127 +187,103 @@ mod unix {
             .collect()
     }
 
-    /// Everything `endpoint_subtree` takes: planned polls paired with
-    /// their units, plus the policy and clock.
-    struct SubtreeInput {
-        policy: EndpointPolicy,
-        clock: FrozenClock,
-        units: Vec<PollUnit>,
-    }
-
-    fn subtree_input(count: usize) -> SubtreeInput {
+    fn units(
+        count: usize,
+        outcome: &Result<AcquisitionParts, AcquisitionFailure>,
+    ) -> EndpointUnits {
         let plan = plan(
             Needs::default().with_polls(fleet_needs(count)),
             &[declaration()],
         )
         .expect("the declaration polls");
-        let clock = FrozenClock {
-            manual: ManualClock::new(),
+        let polls = plan.polls().iter().map(|planned| {
+            let unit = Arc::new(FixtureUnit {
+                endpoint: endpoint(),
+                origin: origin(),
+                outcome: outcome.clone(),
+            });
+            PollUnit::new(planned.clone(), unit)
+        });
+        EndpointUnits::new(EndpointPolicy::default()).with_polls(polls)
+    }
+
+    /// A collector on a one-thread tokio runtime with its clock paused.
+    struct Rig {
+        tokio: tokio::runtime::Runtime,
+        collector: Collector,
+        reports: Reports,
+    }
+
+    fn rig() -> Rig {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a current-thread runtime");
+        let (collector, reports) = {
+            let _entered = tokio.enter();
+            Collector::new(PausedClock)
         };
-        let units = plan
-            .polls()
-            .iter()
-            .map(|planned| PollUnit::new(planned.clone(), FixtureUnit::shared(), &clock))
-            .collect();
-        SubtreeInput {
-            policy: EndpointPolicy::default(),
-            clock,
-            units,
+        Rig {
+            tokio,
+            collector,
+            reports,
         }
     }
 
-    /// A runtime whose leaves are all due at construction: the next turn
-    /// is a full admit-dispatch-acquire-assemble cycle, contended by
-    /// however many peers the subtree holds.
-    fn primed_runtime(units: usize) -> PollRuntime {
-        let input = subtree_input(units);
-        let manual = input.clock.manual.clone();
-        let subtree = endpoint_subtree(&input.policy, &input.clock, input.units, Vec::new())
-            .expect("the units form a subtree");
-        Runtime::new(
-            RuntimeConfig {
-                global_max_in_flight: std::num::NonZeroUsize::MIN,
-                clock: ClockConfig::Manual(manual),
-            },
-            subtree,
-        )
+    fn next(rig: &mut Rig) -> Collected {
+        rig.tokio
+            .block_on(rig.reports.next())
+            .expect("the collector runs")
     }
 
-    /// One driver turn, panicking on a parked runtime — every benched
-    /// timeline has a turn to give.
-    fn turn(runtime: &mut PollRuntime) -> RuntimeOutput<AcquisitionReport, EndpointFault> {
-        let mut next = pin!(runtime.next());
-        match next.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(output) => output,
-            Poll::Pending => panic!("the runtime had a turn to give"),
+    /// An endpoint whose first round has been delivered: its next report
+    /// is a steady-state poll, one cadence away.
+    fn steady(count: usize, outcome: Result<AcquisitionParts, AcquisitionFailure>) -> Rig {
+        let mut rig = rig();
+        {
+            let _entered = rig.tokio.enter();
+            rig.collector
+                .add(units(count, &outcome))
+                .expect("the units form an endpoint");
         }
+        for _ in 0..count {
+            next(&mut rig);
+        }
+        rig
     }
 
-    // --- assemble: the per-acquisition doctrine price ---
+    fn adding(count: usize) -> (Rig, EndpointUnits) {
+        (rig(), units(count, &Ok(states_parts(Vec::new()))))
+    }
+
+    // --- deliver: one steady-state poll, timer to consumer ---
 
     #[library_benchmark(config = LibraryBenchmarkConfig::default()
         .tool(Callgrind::default().soft_limits([(EventKind::Ir, MICRO_IR_LIMIT)])))]
-    #[bench::success(assemble_input(Ok(acquired(states_parts(Vec::new())))))]
-    #[bench::success_with_issues(assemble_input(Ok(acquired(states_parts(issues(ISSUES))))))]
-    #[bench::request_scoped_failure(assemble_input(Err(AcquisitionFailure::new(
-        AcquisitionFailureClass::Protocol
-    ))))]
-    #[bench::endpoint_scoped_failure(assemble_input(Err(AcquisitionFailure::new(
-        AcquisitionFailureClass::Connectivity
-    ))))]
-    pub fn assemble_outcome(input: AssembleInput) -> Result<AcquisitionReport, EndpointFault> {
-        black_box(assemble(
-            &input.endpoint,
-            &input.origin,
-            input.at,
-            Some(Duration::from_millis(12)),
-            input.outcome,
-        ))
+    #[bench::success(steady(1, Ok(states_parts(Vec::new()))))]
+    #[bench::success_with_issues(steady(1, Ok(states_parts(issues(ISSUES)))))]
+    #[bench::request_scoped_failure(steady(
+        1,
+        Err(AcquisitionFailure::new(AcquisitionFailureClass::Protocol))
+    ))]
+    #[bench::endpoint_scoped_failure(steady(
+        1,
+        Err(AcquisitionFailure::new(AcquisitionFailureClass::Connectivity))
+    ))]
+    pub fn deliver_report(mut rig: Rig) -> (Rig, Collected) {
+        let collected = black_box(next(&mut rig));
+        (rig, collected)
     }
 
-    // --- tick: one runtime turn through the admission stack ---
-
-    /// The first turn, which every benched timeline owes as work.
-    fn work_turn(runtime: &mut PollRuntime) -> RuntimeOutput<AcquisitionReport, EndpointFault> {
-        match turn(runtime) {
-            output @ RuntimeOutput::Work { .. } => output,
-            _ => panic!("the first tick is due at construction"),
-        }
-    }
-
-    #[library_benchmark(config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default().soft_limits([(EventKind::Ir, MICRO_IR_LIMIT)])))]
-    #[bench::one_unit(primed_runtime(1))]
-    pub fn runtime_tick(
-        mut runtime: PollRuntime,
-    ) -> RuntimeOutput<AcquisitionReport, EndpointFault> {
-        black_box(work_turn(&mut runtime))
-    }
-
-    // Its own benchmark rather than a case of `runtime_tick`, because the
-    // gate is per benchmark and a dense turn is bulk-sized: it holds the
-    // strict default while the one-unit turn needs the micro one.
+    // Its own benchmark rather than a case of `deliver_report`, because the
+    // gate is per benchmark and a dense endpoint is bulk-sized: it holds
+    // the strict default while the one-unit poll needs the micro one.
     #[library_benchmark]
-    #[bench::dense_erased(primed_runtime(SUBTREE_UNITS))]
-    pub fn runtime_tick_dense(
-        mut runtime: PollRuntime,
-    ) -> RuntimeOutput<AcquisitionReport, EndpointFault> {
-        black_box(work_turn(&mut runtime))
-    }
-
-    // The steady-state pair: the work turn, then the turn that applies the
-    // completion — breaker sample, slot release — and hints the next
-    // deadline. Together they are one poll's full price to the driver;
-    // `runtime_tick` alone stops before the bookkeeping lands.
-    #[library_benchmark(config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default().soft_limits([(EventKind::Ir, MICRO_IR_LIMIT)])))]
-    #[bench::work_then_hint(primed_runtime(1))]
-    pub fn poll_cycle(mut runtime: PollRuntime) -> RuntimeOutput<AcquisitionReport, EndpointFault> {
-        black_box(work_turn(&mut runtime));
-        match turn(&mut runtime) {
-            output @ RuntimeOutput::SleepUntil(_) => black_box(output),
-            _ => panic!("the completed turn hints the next deadline"),
-        }
+    #[bench::dense_erased(steady(ENDPOINT_UNITS, Ok(states_parts(Vec::new()))))]
+    pub fn deliver_report_dense(mut rig: Rig) -> (Rig, Collected) {
+        let collected = black_box(next(&mut rig));
+        (rig, collected)
     }
 
     // --- configure: what a config change pays ---
@@ -383,44 +298,35 @@ mod unix {
     }
 
     #[library_benchmark]
-    #[bench::erased_chassis(subtree_input(SUBTREE_UNITS))]
-    pub fn build_subtree(input: SubtreeInput) -> nv_telemetry_orchestration::EndpointSubtree {
-        black_box(
-            endpoint_subtree(&input.policy, &input.clock, input.units, Vec::new())
-                .expect("the units form a subtree"),
-        )
+    #[bench::erased_chassis(adding(ENDPOINT_UNITS))]
+    pub fn add_endpoint((rig, units): (Rig, EndpointUnits)) -> Rig {
+        {
+            let _entered = rig.tokio.enter();
+            black_box(rig.collector.add(units)).expect("the units form an endpoint");
+        }
+        rig
     }
 }
 
 #[cfg(unix)]
-use unix::assemble_outcome;
+use unix::add_endpoint;
 #[cfg(unix)]
-use unix::build_subtree;
+use unix::deliver_report;
+#[cfg(unix)]
+use unix::deliver_report_dense;
 #[cfg(unix)]
 use unix::plan_fleet;
-#[cfg(unix)]
-use unix::poll_cycle;
-#[cfg(unix)]
-use unix::runtime_tick;
-#[cfg(unix)]
-use unix::runtime_tick_dense;
 
 #[cfg(unix)]
 gungraun::library_benchmark_group!(
-    name = assemble;
-    benchmarks = assemble_outcome
-);
-
-#[cfg(unix)]
-gungraun::library_benchmark_group!(
-    name = tick;
-    benchmarks = runtime_tick, runtime_tick_dense, poll_cycle
+    name = deliver;
+    benchmarks = deliver_report, deliver_report_dense
 );
 
 #[cfg(unix)]
 gungraun::library_benchmark_group!(
     name = configure;
-    benchmarks = plan_fleet, build_subtree
+    benchmarks = plan_fleet, add_endpoint
 );
 
 // The regression gate lives here rather than on the CI command line, so the
@@ -430,8 +336,7 @@ gungraun::library_benchmark_group!(
 gungraun::main!(
     config = gungraun::LibraryBenchmarkConfig::default()
         .tool(gungraun::Callgrind::default().soft_limits([(gungraun::EventKind::Ir, 2.0)]));
-    library_benchmark_groups = assemble,
-    tick,
+    library_benchmark_groups = deliver,
     configure
 );
 
