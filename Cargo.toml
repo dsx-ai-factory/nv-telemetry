@@ -105,8 +105,11 @@ uuid = { version = "1", features = ["v4"] }
 # over, so part of its public API; also the corpus fixtures' JSON.
 serde_json = "1"
 
-# Dev-only, and the probe's: the executor the async tests run on.
+# Dev-only, and the probe's.
 tempfile = { version = "3", default-features = false }
+# The collector's executor: one task per endpoint, its timers, and the
+# reports channel. No tokio type appears in a public signature. Also the
+# executor the async tests and the probe run on.
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
 # Dev-only: `tokio_stream::iter` builds a test fixture's streamed

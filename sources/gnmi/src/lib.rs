@@ -139,8 +139,8 @@
 //! issues are indexed under `notification[index]`. An empty response is a protocol
 //! failure. The target must send leaf-addressed scalar updates, as for subscriptions.
 //!
-//! The caller supplies the transport and adds the returned poll to its endpoint
-//! subtree. The same clock must be used for the poll and the subtree.
+//! The caller supplies the transport and adds the returned poll to the
+//! collector with the endpoint's other units.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -149,10 +149,10 @@
 //! use nv_telemetry_gnmi::{ConfiguredGet, GetDataType, GetSpec, Mapping,
 //!     NumericType, PathElement, SubscriptionPath};
 //! use nv_telemetry_model::{EndpointContext, SignalDescriptor, SignalKey, Subject};
-//! use nv_telemetry_orchestration::{plan, Needs, PollNeed, PollUnit, SystemClock};
+//! use nv_telemetry_orchestration::{plan, Needs, PollNeed, PollUnit};
 //! use nv_telemetry_source::{Acquire, AcquisitionParts};
 //!
-//! fn poll<T>(endpoint: EndpointContext, transport: T, clock: &SystemClock)
+//! fn poll<T>(endpoint: EndpointContext, transport: T)
 //!     -> Result<PollUnit, Box<dyn std::error::Error>>
 //! where ConfiguredGet<T>: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
 //! {
@@ -169,7 +169,7 @@
 //!     let planned = plan(needs, &[ConfiguredGet::<T>::declaration()])?;
 //!     let poll = planned.polls().first().ok_or("missing Get poll")?.clone();
 //!
-//!     Ok(PollUnit::new(poll, unit, clock))
+//!     Ok(PollUnit::new(poll, unit))
 //! }
 //! ```
 //!

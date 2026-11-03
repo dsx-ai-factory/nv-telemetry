@@ -4,8 +4,8 @@
 
 `nv-telemetry` is a read-only telemetry collection library for bare-metal
 systems. It accepts endpoint inventory and collection intent, plans how to
-obtain the requested data, executes collection through an embedder-owned
-dispatcher, and emits immutable observations.
+obtain the requested data, collects it on a dispatcher runtime per endpoint,
+and emits immutable observations.
 
 The observation model is a versioned, annotated protobuf schema. Everything
 that depends on the model's shape — wire types, validators, in-process
@@ -38,10 +38,10 @@ The design has four planes:
 ```
 ┌─ Integration plane: embedding service ───────────────────────────────┐
 │ endpoint inventory, collection intent, configuration, reconciliation │
-│ loop, final dispatcher graph/runtime, consumers and output routing   │
+│ loop that adds and removes endpoints, consumers and output routing   │
 ├─ Orchestration plane: nv-telemetry ──────────────────────────────────┤
-│ data needs, provider planning, capability probing, dispatcher task   │
-│ vocabulary, typed policy, and standard subtree recipes               │
+│ data needs, provider planning, capability probing, typed policy,     │
+│ subtree recipes, and the collector running a runtime per endpoint    │
 ├─ Acquisition plane: one crate per protocol, over a shared contract ──┤
 │ Redfish, gNMI, and vendor-API sources that construct requests and    │
 │ parse responses; no scheduling, sink, health, or mutation policy     │
@@ -52,8 +52,8 @@ The design has four planes:
 ```
 
 The embedding service owns the application. The library provides reusable
-planning, acquisition, and data-model components without hiding an application
-runtime inside itself.
+planning, acquisition, and data-model components, and a collector that spawns
+its tasks on the embedder's tokio runtime rather than starting one of its own.
 
 One component exists at build time rather than run time: the schema compiler,
 which turns the data plane's contract into code. It is part of the library's
@@ -73,7 +73,7 @@ Generic data needs ─┘             │
     │         (acquisition tasks and capability probes)
     │                             │
     │                             v
-    │              embedder-owned dispatcher graph
+    │      collector: one dispatcher runtime per endpoint
     │                             │
     │                             v
     │                  read-only source tasks
@@ -89,10 +89,11 @@ Generic data needs ─┘             │
                  replan when capability is learned
 ```
 
-On an endpoint or policy change, the embedder invokes the planner and recipes
-to update only the affected portion of its dispatcher graph. Endpoint removal,
-task cancellation, draining, and final graph lifecycle remain under embedder
-control.
+On an endpoint or policy change, the embedder replans only the affected
+endpoint and seats it again: it removes the endpoint from the collector, waits
+for its retirement, and adds the new units. The embedder decides which
+endpoints are collected; the collector finishes the acquisitions in flight,
+cancels open streams, and announces each retirement.
 
 The loop on the left is why planning is not a single pass: a capability probe
 is itself dispatched work, so an unknown capability resolves only after its
@@ -204,8 +205,8 @@ Planning is therefore asynchronous rather than a single blocking pass. When a
 need has no cached capability result, the planner emits a probe task and leaves
 that need unresolved; the probe result lands as a control fact and triggers a
 replan for the affected endpoint. A resolved plan is consequently allowed to be
-partial, and the embedder reconciles its dispatcher graph incrementally as
-capability becomes known.
+partial, and the embedder seats the affected endpoint again as capability
+becomes known.
 
 An endpoint whose capability is still unknown produces no observations and no
 fabricated ones. Probe failures are reported as acquisition status like any
@@ -275,10 +276,19 @@ tasks rather than issuing them directly, so the question the planner needs
 answered is subject to the same limits, breakers, and request-class policy as
 the collection it enables.
 
-The library exposes dispatcher-compatible task types, typed tuning policy, and
-standard subtree recipes. The embedding service owns the final graph, graph
-reconciliation, node lifecycle, and the `Runtime` driving loop. This allows
-telemetry work to participate in a larger application dispatcher graph.
+The library exposes typed tuning policy and units that bind planned
+acquisitions to their sources. Its collector seats each endpoint's units in the
+standard recipe, on a dispatcher runtime and a task of the endpoint's own. The
+embedding service decides which endpoints are collected, adding and removing
+them, and consumes one bounded stream of reports. No dispatcher type is part of
+the public API, so a dispatcher release never forces a library release; the
+price is that telemetry work cannot join a larger application dispatcher graph.
+
+A runtime per endpoint rather than one root over the fleet: the dispatcher's
+round-robin visits every child on each dispatch and completion, so a fleet root
+costs the square of the fleet. Measured, it saturated one core at 500
+endpoints of 200 units on a 30-second cadence, while runtimes per endpoint
+held 16,000 such endpoints on four cores with a 62 ms p99 dispatch delay.
 
 Sources do not implement their own scheduling, retries, backoff, rate limiting,
 or sinks. Every task carries a request-class identity so those behaviors can be
@@ -298,6 +308,10 @@ global concurrency
                       └─ priority queue
                           └─ task leaves
 ```
+
+Each endpoint's stack runs on its own runtime, so a global layer would be a
+gate shared across endpoints rather than a scheduler node above them. The
+collector has none yet: endpoint admission is the only concurrency bound.
 
 The two breaker scopes serve different purposes:
 
@@ -974,7 +988,17 @@ builds the envelope, exactly as it builds `AcquisitionStatus`.
 
 The embedder owns fan-out and delivery. Consumer queues must be bounded and
 their overflow behavior explicit. A slow consumer must not retain unbounded
-history or silently impose application-wide backpressure.
+history or silently impose application-wide backpressure. The collector's own
+report stream is bounded and shared: when it is full, each endpoint's runtime
+clock stands still until the consumer catches up. Acquisitions in flight
+finish with their true durations and wait, and nothing new falls due, so a
+stalled consumer shows as late acquisition starts rather than as a growing
+queue or as device failures. The consumer therefore hands reports to its own
+bounded, explicitly overflowing queues and never blocks on a sink.
+
+An endpoint's retirement is the last item the collector delivers for it, so a
+replacement added after the retirement cannot interleave with the old
+endpoint's reports.
 
 The embedder fences endpoint and plan generations before delivery: an old
 acquisition completing after replacement must not overwrite the new plan's
@@ -1079,18 +1103,16 @@ at the device's pace:
   retrying is pointless — and the runtime sleeps to it as it sleeps to a
   poll's next tick. No loop and no timer exist beside the dispatcher.
 - **Items are pulled, not pushed.** The opened stream is drained outside the
-  dispatcher, because a work item completes once, through a stream of
-  reports the embedder pulls at its own pace. Backpressure is the consumer's
-  demand reaching the socket; the device's own overflow behavior is the
-  overflow policy, and it is reported as a coverage gap rather than absorbed
-  by an unbounded buffer.
-- **Cancellation belongs to the stream pair.** Dropping the report stream or
-  calling its cancellation handle stops reconnects and wakes pending connection
-  work and report consumers. The embedder keeps polling pending dispatcher work
-  and any retained report stream until cancellation is observed. Cancellation
-  produces no status or fault. Dropping the subtree lets the current instance
-  drain. To remove a subscription immediately, the embedder cancels its pair
-  before removing the subtree.
+  dispatcher, because a work item completes once: the endpoint's collector
+  task pulls an item only when the bounded report stream has room for it.
+  Backpressure is the consumer's demand reaching the socket; the device's own
+  overflow behavior is the overflow policy, and it is reported as a coverage
+  gap rather than absorbed by an unbounded buffer.
+- **Cancellation is retirement.** Removing the endpoint drops its streams:
+  a connect attempt in flight is aborted, so a hung connect cannot hold the
+  retirement, the open stream closes, and no reconnect follows. Cancellation
+  produces no status or fault. An endpoint that polls nothing retires once
+  every stream has stopped.
 - **Fairness covers connects.** The items themselves are not admitted: a
   stream's rate is the device's, and throttling it client-side would only
   move the overflow from the device's buffer, which reports it, to the

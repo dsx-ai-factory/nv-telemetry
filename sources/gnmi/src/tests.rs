@@ -17,12 +17,6 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use http_body_util::Full;
-use nv_redfish_dispatcher::ClockConfig;
-use nv_redfish_dispatcher::ManualClock;
-use nv_redfish_dispatcher::Runtime;
-use nv_redfish_dispatcher::RuntimeConfig;
-use nv_redfish_dispatcher::RuntimeOutput;
-use nv_redfish_dispatcher::Scheduler;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::FailureClass;
@@ -34,12 +28,19 @@ use nv_telemetry_model::SignalKey;
 use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
+use nv_telemetry_orchestration::AcquisitionReport;
 use nv_telemetry_orchestration::Clock;
+use nv_telemetry_orchestration::Collected;
+use nv_telemetry_orchestration::Collector;
 use nv_telemetry_orchestration::EndpointPolicy;
+use nv_telemetry_orchestration::EndpointUnits;
 use nv_telemetry_orchestration::Needs;
 use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
+use nv_telemetry_orchestration::ReconnectPolicy;
+use nv_telemetry_orchestration::Reports;
 use nv_telemetry_orchestration::StreamNeed;
+use nv_telemetry_orchestration::StreamUnit;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::AcquisitionFailureClass as Class;
 use prost::Message;
@@ -56,7 +57,7 @@ use crate::protocol::gnmi::typed_value::Value;
 struct Script {
     responses: Vec<wire::SubscribeResponse>,
     get_responses: Vec<wire::GetResponse>,
-    advance_clock: Option<(ManualClock, Duration)>,
+    advance_clock: Option<(GetClock, Duration)>,
     status: Option<Code>,
     opening_error: bool,
     hold_connect: bool,
@@ -240,6 +241,23 @@ impl Clock for FixedClock {
 
     fn instant(&self) -> Instant {
         Instant::now()
+    }
+}
+
+/// Collects one stream unit on the fixed clock.
+fn collect(stream: StreamUnit) -> (Collector, Reports) {
+    let (collector, reports) = Collector::new(FixedClock);
+    collector
+        .add(EndpointUnits::new(EndpointPolicy::default()).with_streams([stream]))
+        .expect("a stream forms an endpoint");
+    (collector, reports)
+}
+
+async fn next_report(reports: &mut Reports) -> AcquisitionReport {
+    match reports.next().await {
+        Some(Collected::Report(report)) => report,
+        Some(Collected::Retired(_)) => panic!("a report is due, not the retirement"),
+        None => panic!("a report is due, but the reports ended"),
     }
 }
 
@@ -1776,24 +1794,14 @@ async fn stream_unit_reports_mixed_notifications_transitions_and_distinct_collec
     )
     .expect("provider declaration");
 
-    let (mut leaf, mut reports) = nv_telemetry_orchestration::StreamUnit::new(
-        plan.streams()[0].clone(),
-        unit,
-        nv_telemetry_orchestration::ReconnectPolicy::default(),
-        FixedClock,
-    );
-
-    assert!(leaf.update_ready(Instant::now()).ready);
-    let work = leaf.take_next().expect("connect work");
-    let connected = work.payload.await.expect("connect report");
-
-    assert!(connected.is_empty());
+    let stream = StreamUnit::new(plan.streams()[0].clone(), unit, ReconnectPolicy::default());
+    let (_collector, mut reports) = collect(stream);
 
     for (index, (expected, count)) in [(Some(false), 2), (Some(true), 1), (None, 0)]
         .into_iter()
         .enumerate()
     {
-        let report = reports.next().await.expect("report").expect("projects");
+        let report = next_report(&mut reports).await;
 
         assert_eq!(report.status().provider(), "gnmi.configured");
         assert_eq!(report.status().request_class(), "configured-subscribe");
@@ -2508,17 +2516,10 @@ async fn collection_stream_reports_interfaces_components_and_issues_in_one_acqui
     )
     .unwrap();
 
-    let (mut leaf, mut reports) = nv_telemetry_orchestration::StreamUnit::new(
-        plan.streams()[0].clone(),
-        unit,
-        nv_telemetry_orchestration::ReconnectPolicy::default(),
-        FixedClock,
-    );
+    let stream = StreamUnit::new(plan.streams()[0].clone(), unit, ReconnectPolicy::default());
+    let (_collector, mut reports) = collect(stream);
 
-    assert!(leaf.update_ready(Instant::now()).ready);
-    assert!(leaf.take_next().unwrap().payload.await.unwrap().is_empty());
-
-    let report = reports.next().await.unwrap().unwrap();
+    let report = next_report(&mut reports).await;
 
     assert_eq!(report.status().outcome(), Outcome::Succeeded);
     assert_eq!(report.batches().len(), 2);
@@ -3038,15 +3039,33 @@ async fn get_bounds_issues_once_across_notifications() {
     );
 }
 
+/// Tokio's paused clock, plus the time the mock says its Gets took.
 #[derive(Clone)]
 struct GetClock {
-    manual: ManualClock,
-    epoch: Instant,
+    epoch: tokio::time::Instant,
+    taken: Arc<Mutex<Duration>>,
+}
+
+impl GetClock {
+    fn new() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            taken: Arc::default(),
+        }
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.taken.lock().unwrap() += by;
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.epoch.elapsed() + *self.taken.lock().unwrap()
+    }
 }
 
 impl Clock for GetClock {
     fn timestamp(&self) -> Timestamp {
-        let elapsed = self.manual.now().duration_since(self.epoch);
+        let elapsed = self.elapsed();
         Timestamp::new(
             99 + i64::try_from(elapsed.as_secs()).unwrap(),
             elapsed.subsec_nanos(),
@@ -3055,19 +3074,13 @@ impl Clock for GetClock {
     }
 
     fn instant(&self) -> Instant {
-        self.manual.now()
+        self.epoch.into_std() + self.elapsed()
     }
 }
 
-#[tokio::test]
-async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admission() {
-    let manual = ManualClock::new();
-
-    let clock = GetClock {
-        epoch: manual.now(),
-        manual: manual.clone(),
-    };
-
+#[tokio::test(start_paused = true)]
+async fn get_poll_reports_once_per_call_stamps_time_and_polls_again() {
+    let clock = GetClock::new();
     let elapsed = Duration::from_millis(25);
 
     let mock = Mock::new(Script {
@@ -3085,7 +3098,7 @@ async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admissi
                 ..Default::default()
             },
         ],
-        advance_clock: Some((manual.clone(), elapsed)),
+        advance_clock: Some((clock.clone(), elapsed)),
         ..Default::default()
     });
 
@@ -3102,25 +3115,15 @@ async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admissi
 
     assert_eq!(plan.polls()[0].cost(), 1);
 
-    let subtree = nv_telemetry_orchestration::endpoint_subtree(
-        &EndpointPolicy::default().with_max_in_flight(std::num::NonZeroU32::MIN),
-        &clock,
-        vec![PollUnit::new(
-            plan.polls()[0].clone(),
-            Arc::new(mock.get(get_spec())),
-            &clock,
-        )],
-        vec![],
-    )
-    .unwrap();
-
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            global_max_in_flight: std::num::NonZeroUsize::MIN,
-            clock: ClockConfig::Manual(manual.clone()),
-        },
-        subtree,
-    );
+    let (collector, mut reports) = Collector::new(clock.clone());
+    collector
+        .add(
+            EndpointUnits::new(EndpointPolicy::default()).with_polls([PollUnit::new(
+                plan.polls()[0].clone(),
+                Arc::new(mock.get(get_spec())),
+            )]),
+        )
+        .expect("a poll forms an endpoint");
 
     for (tick, (outcome, count, failure)) in [
         (Outcome::Succeeded, 2, None),
@@ -3130,22 +3133,14 @@ async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admissi
     .into_iter()
     .enumerate()
     {
-        let started_at = clock.timestamp();
-
-        let RuntimeOutput::Work { result, .. } = runtime.next().await else {
-            panic!("one completed Get work item")
-        };
-
-        let mut reports = result.expect("device outcomes produce reports");
-
-        assert_eq!(reports.len(), 1);
-
-        let report = reports.pop().unwrap();
+        let report = next_report(&mut reports).await;
+        let started_at = report.status().started_at();
 
         assert_eq!(report.status().failure_class(), failure);
         assert_eq!(report.status().provider(), "gnmi.configured");
         assert_eq!(report.status().request_class(), "configured-get");
-        assert_eq!(report.status().started_at(), &started_at);
+        // One Get a second, each taking its 25 ms.
+        assert_eq!(started_at.seconds(), 99 + i64::try_from(tick).unwrap());
 
         assert_eq!(
             report.status().duration_nanos(),
@@ -3157,7 +3152,7 @@ async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admissi
 
         for (index, batch) in report.batches().iter().enumerate() {
             assert_eq!(batch.endpoint(), &endpoint());
-            assert_eq!(batch.window().start(), &started_at);
+            assert_eq!(batch.window().start(), started_at);
 
             let Payload::Readings(readings) = batch.payload() else {
                 panic!("readings")
@@ -3176,13 +3171,5 @@ async fn get_poll_runtime_reports_once_per_call_stamps_time_and_releases_admissi
         }
 
         assert_eq!(mock.get_requests.lock().unwrap().len(), tick + 1);
-
-        if tick < 2 {
-            let RuntimeOutput::SleepUntil(deadline) = runtime.next().await else {
-                panic!("next polling deadline after released admission")
-            };
-
-            manual.advance_to(deadline);
-        }
     }
 }

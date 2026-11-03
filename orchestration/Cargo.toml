@@ -1,6 +1,6 @@
 [package]
 name = "nv-telemetry-orchestration"
-description = "Planning and dispatcher vocabulary for nv-telemetry"
+description = "Planning and collection for nv-telemetry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,9 +15,11 @@ futures-util.workspace = true
 nv-redfish-dispatcher.workspace = true
 nv-telemetry-model.workspace = true
 nv-telemetry-source.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 gungraun.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "orchestration"

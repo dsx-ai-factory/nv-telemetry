@@ -11,7 +11,6 @@ repository.workspace = true
 futures-util.workspace = true
 nv-redfish = { workspace = true, features = ["bmc-http"] }
 nv-redfish-bmc-mock.workspace = true
-nv-redfish-dispatcher.workspace = true
 nv-telemetry-model.workspace = true
 nv-telemetry-orchestration.workspace = true
 nv-telemetry-redfish.workspace = true
@@ -22,6 +21,7 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
