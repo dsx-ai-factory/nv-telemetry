@@ -70,8 +70,9 @@ pinned by a fixture corpus that asserts batches and issue lists together.
 values. Applications supply the transport, paths, and mappings. The
 `gnmi.configured` provider supports exact leaf mappings and collection mappings
 that derive subjects from list keys. It checks values at runtime and keeps strings
-as received. It does not validate against YANG or traverse JSON subtrees. See the
-crate's API documentation for a construction example.
+as received. Updates may address individual leaves or JSON objects containing
+mapped leaves. The provider does not validate against YANG. See the crate's API
+documentation for a construction example.
 
 Exporters are separate crates because their dependency trees are disjoint;
 `export` holds only what they share, such as joining readings to descriptors

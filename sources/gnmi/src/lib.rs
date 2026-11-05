@@ -127,17 +127,33 @@
 //! omitted with projection issues. Invalid values do not participate in collisions.
 //! Each notification is projected independently.
 //!
-//! The target must send updates for individual leaves, even when the request
-//! selects a parent path. Ancestor updates produce projection issues; the provider
-//! does not traverse JSON subtrees. Use
-//! [`Mapping::boolean_state`] to collect a boolean state. A subscription may
+//! Updates may address individual leaves or JSON objects containing mapped leaves.
+//! Object member names extend the update path and match mapping elements exactly,
+//! including module prefixes. Keys must come from the received path; JSON fields
+//! do not supply list keys. Arrays on mapped branches produce issues.
+//!
+//! For example, an update at `/telemetry/entry[name=sensor-a]/state` with
+//! `{"count":42,"enabled":false}` supplies the mapped `state/count` and
+//! `state/enabled` leaves for `sensor-a`.
+//!
+//! Repeated update paths keep only the final update, including malformed objects.
+//! Overlapping object and leaf updates keep the final contribution to each leaf.
+//! An absent member does not imply deletion. Malformed objects or duplicate member
+//! names discard that object's contribution with an issue.
+//! An invalid mapped scalar produces an issue while valid sibling values are kept.
+//! Duplicate names are checked on unmapped object branches too.
+//! Member issue locations use JSON Pointer escaping and must fit the model's path
+//! limit, including acquisition indexes. An overlong location rejects that object.
+//! Arrays are opaque; their contents are not checked for duplicate member names.
+//!
+//! Use [`Mapping::boolean_state`] to collect a boolean state. A subscription may
 //! contain only state mappings.
 //!
 //! [`ConfiguredGet`] collects small snapshots through the existing polling APIs.
 //! One Get call produces one acquisition report, even when the target returns
 //! several notifications. Each notification retains its device timestamp and its
 //! issues are indexed under `notification[index]`. An empty response is a protocol
-//! failure. The target must send leaf-addressed scalar updates, as for subscriptions.
+//! failure. Get uses the same leaf and JSON object projection as subscriptions.
 //!
 //! The caller supplies the transport and adds the returned poll to the
 //! collector with the endpoint's other units.

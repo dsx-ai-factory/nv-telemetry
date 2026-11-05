@@ -901,9 +901,10 @@ impl MappingSpec {
 /// Validated request paths and signal mappings for one subscription.
 ///
 /// Request paths select what the target sends. Mappings match leaf paths
-/// after notification prefixes are applied. A parent request is supported when
-/// the target sends updates for individual leaves. The provider does not traverse
-/// JSON subtrees.
+/// after notification prefixes are applied. Updates may contain individual leaves
+/// or JSON objects whose members extend the update path. Member names match path
+/// elements literally. List keys must be present in the received path; arrays
+/// cannot supply list entries.
 /// Validation checks the configuration without a YANG schema or target lookup.
 #[derive(Clone, Debug)]
 pub struct SubscriptionSpec {
@@ -1019,8 +1020,7 @@ impl SubscriptionSpec {
 
 /// Validated paths and scalar mappings for one unary Get request.
 ///
-/// Paths and mappings use the same rules as [`SubscriptionSpec`]. The target
-/// must return leaf-addressed updates; mapped JSON containers produce issues.
+/// Paths, mappings, and JSON object extraction use the same rules as [`SubscriptionSpec`].
 /// Get requests default to [`GetDataType::All`] and [`Encoding::Json`].
 #[derive(Clone, Debug)]
 pub struct GetSpec {

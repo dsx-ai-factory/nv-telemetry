@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod json;
+
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -55,11 +57,12 @@ pub(super) fn project(
     .map_err(|error| model_error(&error))?;
 
     let mut issues = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut candidates = BTreeMap::new();
+    let mut updates_seen = BTreeSet::new();
+    let mut leaves = Vec::new();
 
-    // Mark full concrete paths before decoding: an invalid final value suppresses
-    // earlier updates for that entry, without suppressing other list entries.
+    // Walk backward so only the final update at each original path is decoded,
+    // even if that update is malformed. Expanded leaves are deduplicated later
+    // because a parent object and a leaf update can address the same leaf.
     for (index, update) in notification.update.into_iter().enumerate().rev() {
         let path = match resolve(spec, notification.prefix.as_ref(), update.path.as_ref()) {
             Ok(path) => path,
@@ -69,60 +72,62 @@ pub(super) fn project(
             }
         };
 
+        if spec.mapping(&path).is_none() && !spec.mappings.iter().any(|m| m.covers(&path)) {
+            continue;
+        }
+
+        if !updates_seen.insert(path.clone()) {
+            continue;
+        }
+
+        expand_update(
+            spec,
+            path,
+            update.val.and_then(|v| v.value),
+            index,
+            &mut leaves,
+            &mut issues,
+        );
+    }
+
+    let mut leaves_seen = BTreeSet::new();
+    let mut candidates = BTreeMap::new();
+
+    for (path, value, location) in leaves {
+        // Claim the concrete leaf before conversion, including invalid values.
+        if !leaves_seen.insert(path.clone()) {
+            continue;
+        }
+
         let Some(mapping) = spec.mapping(&path) else {
-            if spec.mappings.iter().any(|mapping| mapping.covers(&path)) {
-                issues.push(
-                    ProjectionIssue::invalid(
-                        "path",
-                        "update covers mapped leaves; individual leaf updates are required",
-                    )
-                    .at_index("update", index),
-                );
-            }
+            issues.push(location.issue(
+                "path",
+                "mapped leaf cannot be resolved from the value and response path keys",
+            ));
 
             continue;
         };
 
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-
-        let Some(projected) = project_value(
-            mapping,
-            &path,
-            update.val.and_then(|value| value.value),
-            observed_at,
-            index,
-            &mut issues,
-        )?
+        let Some(projected) =
+            project_value(mapping, &path, value, observed_at, &location, &mut issues)?
         else {
             continue;
         };
 
-        // Resolve collisions before splitting payloads. A None entry keeps an
-        // identity excluded if another path produces it.
+        // Resolve identities only after the final contribution for each leaf.
+        // A None entry keeps a collided identity excluded from later candidates.
         match candidates.entry(projected.identity()) {
             Entry::Vacant(entry) => {
-                entry.insert(Some((index, projected)));
+                entry.insert(Some((location, projected)));
             }
             Entry::Occupied(mut entry) => {
+                let detail = "different paths produce the same observation identity";
+
                 if let Some((previous, _)) = entry.get_mut().take() {
-                    issues.push(
-                        ProjectionIssue::invalid(
-                            "path",
-                            "different paths produce the same observation identity",
-                        )
-                        .at_index("update", previous),
-                    );
+                    issues.push(previous.issue("path", detail));
                 }
 
-                issues.push(
-                    ProjectionIssue::invalid(
-                        "path",
-                        "different paths produce the same observation identity",
-                    )
-                    .at_index("update", index),
-                );
+                issues.push(location.issue("path", detail));
             }
         }
     }
@@ -137,6 +142,73 @@ pub(super) fn project(
     );
 
     Ok((payloads, issues))
+}
+
+/// Locates an original update field or a member inside its JSON value.
+struct UpdateLocation {
+    update: usize,
+
+    /// `None` uses the field name; `Some("")` identifies the JSON object root.
+    pointer: Option<String>,
+}
+
+impl UpdateLocation {
+    fn issue(&self, field: &str, detail: &str) -> ProjectionIssue {
+        let path = self
+            .pointer
+            .as_ref()
+            .map_or_else(|| field.to_owned(), |pointer| format!("val{pointer}"));
+
+        ProjectionIssue::invalid(path, detail).at_index("update", self.update)
+    }
+}
+
+type LeafUpdate = (SubscriptionPath, Option<Value>, UpdateLocation);
+
+fn expand_update(
+    spec: &MappingSpec,
+    path: SubscriptionPath,
+    value: Option<Value>,
+    index: usize,
+    leaves: &mut Vec<LeafUpdate>,
+    issues: &mut Vec<ProjectionIssue>,
+) {
+    let location = UpdateLocation {
+        update: index,
+        pointer: None,
+    };
+
+    let Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes)) = &value else {
+        leaves.push((path, value, location));
+        return;
+    };
+
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        leaves.push((path, value, location));
+        return;
+    }
+
+    match json::expand(spec, path, bytes) {
+        Ok(expanded) => leaves.extend(expanded.into_iter().map(|leaf| {
+            (
+                leaf.path,
+                leaf.value,
+                UpdateLocation {
+                    update: index,
+                    pointer: Some(leaf.pointer),
+                },
+            )
+        })),
+        Err(error) => {
+            issues.push(
+                UpdateLocation {
+                    update: index,
+                    pointer: Some(error.pointer),
+                }
+                .issue("val", error.detail),
+            );
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -168,7 +240,7 @@ fn project_value(
     path: &SubscriptionPath,
     value: Option<Value>,
     observed_at: Timestamp,
-    index: usize,
+    location: &UpdateLocation,
     issues: &mut Vec<ProjectionIssue>,
 ) -> Result<Option<ProjectedObservation>, AcquisitionFailure> {
     let result = match &mapping.kind {
@@ -187,7 +259,7 @@ fn project_value(
             let subject = match subject_template.subject(path) {
                 Ok(subject) => subject,
                 Err(detail) => {
-                    issues.push(ProjectionIssue::invalid("path", detail).at_index("update", index));
+                    issues.push(location.issue("path", detail));
                     return Ok(None);
                 }
             };
@@ -218,13 +290,10 @@ fn project_value(
     };
 
     if result.is_none() {
-        issues.push(
-            ProjectionIssue::invalid(
-                "val",
-                "value does not match the declared type or exceeds the model limit",
-            )
-            .at_index("update", index),
-        );
+        issues.push(location.issue(
+            "val",
+            "value does not match the declared type or exceeds the model limit",
+        ));
     }
 
     Ok(result)
