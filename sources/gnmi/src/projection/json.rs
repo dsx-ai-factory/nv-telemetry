@@ -68,44 +68,63 @@ impl Extractor<'_> {
     fn walk(
         &mut self,
         path: &mut SubscriptionPath,
-        raw: &RawValue,
+        mut raw: &RawValue,
         pointer: &mut String,
     ) -> Result<(), InvalidJson> {
-        let is_object = raw.get().starts_with('{');
-        let mapped = self.spec.mapping(path).is_some();
+        // Keep parent iterators and path lengths on the heap so object nesting
+        // does not consume a call-stack frame for each member.
+        let mut parents = Vec::new();
 
-        // An object at a scalar mapping is invalid there, but its descendants
-        // can still match other mappings. Arrays remain opaque.
-        if mapped || (!is_object && self.spec.mappings.iter().any(|m| m.covers(path))) {
-            let value = (!is_object && !raw.get().starts_with('['))
-                .then(|| Value::JsonVal(raw.get().as_bytes().to_vec()));
+        loop {
+            let is_object = raw.get().starts_with('{');
+            let mapped = self.spec.mapping(path).is_some();
 
-            self.leaves.push(Leaf {
-                path: path.clone(),
-                value,
-                pointer: pointer.clone(),
-            });
-        }
+            // An object at a scalar mapping is invalid there, but its descendants
+            // can still match other mappings. Arrays remain opaque.
+            if mapped || (!is_object && self.spec.mappings.iter().any(|m| m.covers(path))) {
+                let value = (!is_object && !raw.get().starts_with('['))
+                    .then(|| Value::JsonVal(raw.get().as_bytes().to_vec()));
 
-        if !is_object {
-            return Ok(());
-        }
+                self.leaves.push(Leaf {
+                    path: path.clone(),
+                    value,
+                    pointer: pointer.clone(),
+                });
+            }
 
-        let mut failure = None;
-        let mut decoder = serde_json::Deserializer::from_str(raw.get());
+            if is_object {
+                let mut failure = None;
+                let mut decoder = serde_json::Deserializer::from_str(raw.get());
 
-        // Validate unmapped object branches too; a duplicate rejects the whole update.
-        let fields = decoder
-            .deserialize_map(Object {
-                failure: &mut failure,
-            })
-            .map_err(|_| InvalidJson {
-                pointer: pointer.clone(),
-                detail: failure.unwrap_or("malformed JSON object"),
-            })?;
+                // Validate unmapped object branches too; a duplicate rejects the whole update.
+                let fields = decoder
+                    .deserialize_map(Object {
+                        failure: &mut failure,
+                    })
+                    .map_err(|_| InvalidJson {
+                        pointer: pointer.clone(),
+                        detail: failure.unwrap_or("malformed JSON object"),
+                    })?;
 
-        for (name, value) in fields {
-            let previous = pointer.len();
+                parents.push((fields.into_iter(), path.0.len(), pointer.len()));
+            }
+
+            // Restore each parent's path before advancing to a sibling or
+            // returning to the next outer object.
+            let (name, value) = loop {
+                let Some((members, path_len, pointer_len)) = parents.last_mut() else {
+                    return Ok(());
+                };
+
+                path.0.truncate(*path_len);
+                pointer.truncate(*pointer_len);
+
+                if let Some(member) = members.next() {
+                    break member;
+                }
+
+                parents.pop();
+            };
 
             pointer.push('/');
             pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
@@ -120,12 +139,8 @@ impl Extractor<'_> {
             }
 
             path.0.push(PathElement::new(name));
-            self.walk(path, value, pointer)?;
-            path.0.pop();
-            pointer.truncate(previous);
+            raw = value;
         }
-
-        Ok(())
     }
 }
 

@@ -2876,6 +2876,73 @@ fn json_objects_accept_deep_objects_and_many_members() {
 }
 
 #[test]
+fn deep_json_objects_project_on_a_caller_thread_stack() {
+    std::thread::Builder::new()
+        .name("gnmi-json-projection".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("caller runtime");
+
+            runtime.block_on(async {
+                // Empty names keep issue paths short, isolating call-stack growth.
+                let text = format!(
+                    "{{\"leaf\":7,\"unused\":{}0{}}}",
+                    "{\"\":".repeat(900),
+                    "}".repeat(900)
+                );
+
+                for value in [
+                    Value::JsonVal(text.as_bytes().to_vec()),
+                    Value::JsonIetfVal(text.as_bytes().to_vec()),
+                ] {
+                    let notification = snapshot(
+                        0,
+                        vec![wire::Update {
+                            path: Some(wire_path(&[])),
+                            ..update(value)
+                        }],
+                    );
+
+                    let mock = Mock::new(Script {
+                        get_responses: vec![wire::GetResponse {
+                            notification: vec![notification.clone()],
+                            ..Default::default()
+                        }],
+                        responses: vec![wire::SubscribeResponse {
+                            response: Some(wire::subscribe_response::Response::Update(
+                                notification,
+                            )),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    });
+
+                    let get = mock.get(get_spec()).perform().await.unwrap();
+                    let mut stream = mock.subscription().perform().await.unwrap();
+                    let item = stream.next().await.unwrap().unwrap();
+
+                    assert_eq!(get.payloads(), item.payloads());
+                    assert!(get.issues().is_empty());
+                    assert!(item.issues().is_empty());
+
+                    let [(_, Payload::Readings(readings))] = get.payloads() else {
+                        panic!("expected one readings payload")
+                    };
+
+                    assert_eq!(readings.samples().len(), 1);
+                    assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(7));
+                }
+            });
+        })
+        .expect("caller thread")
+        .join()
+        .expect("caller projection");
+}
+
+#[test]
 fn json_member_issues_use_unique_escaped_locations() {
     let spec = SubscriptionSpec::new(
         vec![path(&["root"])],
