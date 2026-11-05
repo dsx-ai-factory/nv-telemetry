@@ -11,6 +11,7 @@ members = [
     "exporters/otlp",
     "exporters/prometheus",
     "examples/probe",
+    "examples/fleet",
 ]
 resolver = "2"
 
@@ -104,6 +105,9 @@ uuid = { version = "1", features = ["v4"] }
 # Documents and event payloads as `sources/redfish`'s transport hands them
 # over, so part of its public API; also the corpus fixtures' JSON.
 serde_json = "1"
+
+# The fleet example's config file.
+toml = "0.9"
 
 # Dev-only, and the probe's.
 tempfile = { version = "3", default-features = false }

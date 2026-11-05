@@ -1,0 +1,82 @@
+# Two bmc-mock BMCs from ../bare-metal-manager-core (see README.md) and one
+# gNMI switch. Passwords come from the environment variables named here.
+
+[defaults.policy]
+# Requests that may leave back to back, then `refill` per `per`.
+burst = 8
+refill = 4
+per = "1s"
+max_in_flight = 2
+# Event stream and subscription reconnects.
+first_retry = "1s"
+max_retry = "1m"
+
+[defaults.intervals]
+sensors = "30s"
+chassis = "5m"
+firmware = "30m"
+logs = "1m"
+
+[[redfish]]
+id = "mock-dell"
+url = "https://127.0.0.1:18266"
+username = "dummy"
+password_env = "FLEET_BMC_PASSWORD"
+insecure = true
+labels = { rack = "r1", vendor = "dell" }
+
+[redfish.intervals]
+sensors = "10s"
+
+[[redfish]]
+id = "mock-gb200"
+url = "https://127.0.0.1:18267"
+username = "dummy"
+password_env = "FLEET_BMC_PASSWORD"
+insecure = true
+labels = { rack = "r1", vendor = "wiwynn" }
+
+[redfish.domains]
+# Every domain is on unless switched off.
+events = false
+
+[[gnmi]]
+id = "switch-a"
+address = "http://127.0.0.1:9339"
+username = "admin"
+password_env = "FLEET_SWITCH_PASSWORD"
+encoding = "json_ietf"
+labels = { rack = "r1" }
+
+# Streamed over one Subscribe call. `[key=*]` matches every entry; its value
+# names the subject.
+[[gnmi.subscribe]]
+path = "interfaces/interface[name=*]/state/counters/in-octets"
+mode = "sample"
+interval = "10s"
+suppress_redundant = true
+heartbeat = "1m"
+subject = "interface"
+facet = "in-octets"
+unit = "By"
+type = "uint"
+
+[[gnmi.subscribe]]
+path = "interfaces/interface[name=*]/state/oper-status"
+mode = "on_change"
+subject = "interface"
+facet = "oper-status"
+type = "string"
+
+# A snapshot read by Get on its own interval. A path without `[key=*]`
+# names its subject with `subject_id`.
+[[gnmi.get]]
+name = "system"
+interval = "1m"
+
+[[gnmi.get.leaves]]
+path = "system/state/hostname"
+subject = "system"
+subject_id = "switch-a"
+facet = "hostname"
+type = "string"
