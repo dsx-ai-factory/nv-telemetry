@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! What one acquisition produced, paired and stamped: the report the
-//! driver fans out, and the leaf future that yields it.
+//! collector delivers, and the leaf future that yields it.
 //!
 //! Every acquisition yields exactly one [`AcquisitionStatus`], and the
 //! report type makes anything else unrepresentable. Which channel carries
@@ -18,7 +18,8 @@
 //! faults with such answers rightly trips later than one that never
 //! answers. `Internal` — our own bug — says nothing about the endpoint and
 //! rides the same channel; that imprecision is accepted. Both channels
-//! reach the driver; no status is ever lost to scheduling policy.
+//! reach the collector, which delivers them as one kind of report; no
+//! status is ever lost to scheduling policy.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +39,7 @@ use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::SubscriptionItem;
 
-use crate::clock::Clock;
+use crate::clock::SharedClock;
 use crate::status::failed_status;
 use crate::status::success_status;
 use crate::status::trips_endpoint_breaker;
@@ -87,30 +88,32 @@ impl AcquisitionReport {
 }
 
 /// An endpoint-scoped failure, carrying the status it earned. Rides the
-/// error channel so the endpoint breaker samples it; the driver still
-/// receives it as a completed work output. Boxed because the error arm
+/// error channel so the endpoint breaker samples it; the collector still
+/// delivers it, as a report with no batches. Boxed because the error arm
 /// travels through every completion the dispatcher hands back.
 #[derive(Clone, Debug)]
-pub struct EndpointFault {
+pub(crate) struct EndpointFault {
     status: Box<AcquisitionStatus>,
 }
 
 impl EndpointFault {
-    /// The status the failed acquisition earned.
-    #[must_use]
-    pub fn status(&self) -> &AcquisitionStatus {
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> &AcquisitionStatus {
         &self.status
     }
 
-    /// Consumes into the status stream's item.
-    #[must_use]
-    pub fn into_status(self) -> AcquisitionStatus {
-        *self.status
+    /// The report the collector delivers once the breaker has sampled it.
+    pub(crate) fn into_report(self) -> AcquisitionReport {
+        AcquisitionReport {
+            batches: Vec::new(),
+            issues: None,
+            status: *self.status,
+        }
     }
 }
 
 /// The dispatcher payload shape: one boxed acquisition per tick.
-pub type TelemetryWork = nv_redfish_dispatcher::FutureWork<AcquisitionReport, EndpointFault>;
+pub(crate) type TelemetryWork = nv_redfish_dispatcher::FutureWork<AcquisitionReport, EndpointFault>;
 
 /// Assembles one acquisition's outcome into its report. A failed streamed
 /// connection attempt comes through this boundary because no stream item
@@ -122,9 +125,9 @@ pub type TelemetryWork = nv_redfish_dispatcher::FutureWork<AcquisitionReport, En
 ///
 /// An [`EndpointFault`] when the failure's class is endpoint-scoped — not
 /// an error so much as the channel that lets the endpoint breaker sample
-/// exactly those classes. The fault still carries the status the driver
-/// reports.
-pub fn assemble(
+/// exactly those classes. The fault still carries the status the
+/// collector delivers.
+pub(crate) fn assemble(
     endpoint: &EndpointContext,
     origin: &Origin,
     at: Timestamp,
@@ -167,8 +170,8 @@ pub fn assemble(
 /// # Errors
 ///
 /// Returns an [`EndpointFault`] when the terminal failure is endpoint-scoped.
-/// The fault carries the failed status that the output driver must publish.
-pub fn assemble_stream_item<A>(
+/// The fault carries the failed status that the collector must deliver.
+pub(crate) fn assemble_stream_item<A>(
     acquisition: &A,
     at: Timestamp,
     item: SubscriptionItem,
@@ -245,10 +248,9 @@ fn issues_envelope(
 /// over the shared unit and the clock. The admitted instant is sampled at
 /// first poll — where the dispatcher dispatches — and duration is measured
 /// monotonically around the acquisition alone.
-pub fn poll_future<A, C>(unit: Arc<A>, clock: C) -> TelemetryWork
+pub(crate) fn poll_future<A>(unit: Arc<A>, clock: SharedClock) -> TelemetryWork
 where
     A: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
-    C: Clock + 'static,
 {
     Box::pin(async move {
         let begun = clock.instant();

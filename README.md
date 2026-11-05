@@ -6,8 +6,9 @@ Rust libraries for bare-metal telemetry collection.
 
 Use this workspace when building a service that reads BMC telemetry and needs a
 shared observation model for readings, states, inventory, and logs. The
-embedding service owns endpoint inventory, credentials, dispatch, timers, and
-consumer policy. The [probe example](examples/probe/src/main.rs) shows that
+embedding service supplies endpoint inventory, credentials, collection intent,
+and consumer policy. The collector owns per-endpoint dispatch and timers. The
+[probe example](examples/probe/src/main.rs) shows that
 integration with mock and HTTP transports.
 
 ## Current capabilities
@@ -84,8 +85,8 @@ which installs the formatting toolchain before the same checks. See
 
 `nv-telemetry` collects telemetry from bare-metal endpoints and emits immutable
 observations. It accepts endpoint inventory and collection intent from an
-embedding service, plans how to obtain the requested data, executes collection
-through an embedder-owned dispatcher, and reports what it observed. Sources
+embedding service, plans how to obtain the requested data, collects it on a
+dispatcher runtime per endpoint, and reports what it observed. Sources
 only read; health verdicts, thresholds, and remediation are consumer policy.
 
 The observation model is a versioned, annotated protobuf schema. Wire types,
@@ -109,7 +110,7 @@ source/               nv-telemetry-source         acquisition contract
 sources/
   redfish/            nv-telemetry-redfish        HTTP/JSON, OData, DMTF schemas
   gnmi/               nv-telemetry-gnmi           configured gNMI subscriptions and Get requests
-orchestration/        nv-telemetry-orchestration  planner, providers, recipes
+orchestration/        nv-telemetry-orchestration  planner, collector, recipes
 examples/
   probe/              nv-telemetry-probe          demo embedder (not published)
 export/               nv-telemetry-export         planned shared batch traversal
@@ -141,8 +142,8 @@ than sharing one.
 `orchestration`, and `examples/probe` carry code today. The Redfish providers
 cover sensor, chassis, log, firmware, and event acquisition; fixture tests
 assert batches and issue lists together. Orchestration plans polls and streams
-and builds the dispatcher admission stack; the probe owns the runtime and
-driving loop.
+and runs the per-endpoint collector and dispatcher admission stack; the probe
+supplies the collection plan and consumes reports.
 The export crates remain placeholders whose doc comments describe
 the intended boundaries.
 
