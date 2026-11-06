@@ -532,7 +532,7 @@ fn declared_state_types_preserve_native_and_json_scalars() {
 }
 
 #[test]
-fn ancestor_updates_report_issues_without_traversing_subtrees() {
+fn unsupported_ancestor_values_report_issues() {
     let keyed = SubscriptionPath::new(vec![
         PathElement::new("interface").with_key("name", "eth0"),
         PathElement::new("enabled"),
@@ -554,8 +554,8 @@ fn ancestor_updates_report_issues_without_traversing_subtrees() {
 
     for parent in [wire_path(&[]), wire_path(&["interface"]), matching] {
         for value in [
-            Value::JsonVal(br#"{"enabled":false}"#.to_vec()),
-            Value::JsonIetfVal(br#"{"enabled":false}"#.to_vec()),
+            Value::JsonVal(b"[]".to_vec()),
+            Value::JsonIetfVal(b"[]".to_vec()),
             Value::BoolVal(false),
         ] {
             let parts = projection::project(
@@ -2555,6 +2555,797 @@ async fn collection_stream_reports_interfaces_components_and_issues_in_one_acqui
     }
 }
 
+#[test]
+fn json_objects_match_leaf_updates_and_keep_received_keys() {
+    let subject = SubjectTemplate::new("sensor", IdentityValue::path_key(1, "name"));
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["telemetry"])],
+        vec![
+            Mapping::collection_reading(
+                path(&["telemetry", "entry", "state", "count"]),
+                subject.clone(),
+                ReadingTemplate::new(NumericType::Uint).with_facet("count"),
+            ),
+            Mapping::collection_boolean_state(
+                path(&["telemetry", "entry", "state", "enabled"]),
+                subject.clone(),
+                StateTemplate::new("enabled"),
+            ),
+            Mapping::collection_string_state(
+                path(&["telemetry", "entry", "state", "vendor:status"]),
+                subject,
+                StateTemplate::new("status"),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let mut prefix = wire_path(&["telemetry", "entry"]);
+    prefix.elem[1].key.insert("name".into(), "sensor-a".into());
+
+    let leaves = [
+        ("count", Value::UintVal(u64::MAX)),
+        ("enabled", Value::BoolVal(false)),
+        ("vendor:status", Value::StringVal("vendor:ACTIVE".into())),
+    ]
+    .into_iter()
+    .map(|(name, value)| wire::Update {
+        path: Some(wire_path(&["state", name])),
+        ..update(value)
+    })
+    .collect();
+
+    let expected = projection::project(
+        &spec.projection,
+        wire::Notification {
+            prefix: Some(prefix.clone()),
+            timestamp: 7_000_000_123,
+            update: leaves,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for value in [
+        Value::JsonVal(
+            br#"{"state":{"count":18446744073709551615,"enabled":false,"vendor:status":"vendor:ACTIVE"}}"#
+                .to_vec(),
+        ),
+        Value::JsonIetfVal(
+            br#"{"state":{"count":"18446744073709551615","enabled":false,"vendor:status":"vendor:ACTIVE"}}"#
+                .to_vec(),
+        ),
+    ] {
+        let actual = projection::project(
+            &spec.projection,
+            wire::Notification {
+                prefix: Some(prefix.clone()),
+                timestamp: 7_000_000_123,
+                update: vec![wire::Update {
+                    path: Some(wire_path(&[])),
+                    ..update(value)
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(actual.1.is_empty(), "{:?}", actual.1);
+        assert_eq!(actual.0, expected.0);
+    }
+}
+
+#[test]
+fn json_ietf_qualified_name_mismatches_keep_literal_siblings() {
+    let spec = SubscriptionSpec::new(
+        vec![
+            path(&["leaf"]),
+            path(&["other"]),
+            path(&["vendor:parent"]),
+            path(&["container"]),
+        ],
+        vec![
+            Mapping::new(path(&["leaf"]), descriptor("a"), NumericType::Uint),
+            Mapping::new(path(&["other"]), descriptor("b"), NumericType::Uint),
+            Mapping::new(
+                path(&["vendor:parent", "leaf"]),
+                descriptor("c"),
+                NumericType::Uint,
+            ),
+            Mapping::new(
+                path(&["container", "leaf"]),
+                descriptor("d"),
+                NumericType::Uint,
+            ),
+        ],
+    )
+    .unwrap();
+
+    for (json, pointer) in [
+        (r#"{"m:leaf":7,"other":9}"#, Some("update[0].val/m:leaf")),
+        (
+            r#"{"vendor:parent":{"m:leaf":7},"other":9}"#,
+            Some("update[0].val/vendor:parent/m:leaf"),
+        ),
+        (r#"{"m:leaf":[7],"other":9}"#, Some("update[0].val/m:leaf")),
+        (r#"{"m:leaf":{},"other":9}"#, Some("update[0].val/m:leaf")),
+        (
+            r#"{"m:container":{"leaf":7},"other":9}"#,
+            Some("update[0].val/m:container"),
+        ),
+        (
+            r#"{"m:container":{},"other":9}"#,
+            Some("update[0].val/m:container"),
+        ),
+        (r#"{"unmapped:field":7,"other":9}"#, None),
+        (r#"{"different:parent":{"leaf":7},"other":9}"#, None),
+    ] {
+        for ietf in [false, true] {
+            let value = if ietf {
+                Value::JsonIetfVal(json.as_bytes().to_vec())
+            } else {
+                Value::JsonVal(json.as_bytes().to_vec())
+            };
+
+            let parts = projection::project(
+                &spec.projection,
+                snapshot(
+                    0,
+                    vec![wire::Update {
+                        path: Some(wire_path(&[])),
+                        ..update(value)
+                    }],
+                ),
+            )
+            .unwrap();
+
+            let expected = pointer.filter(|_| ietf);
+
+            assert_eq!(parts.1.len(), usize::from(expected.is_some()), "{json}");
+
+            assert_eq!(
+                parts
+                    .1
+                    .first()
+                    .map(nv_telemetry_source::ProjectionIssue::path),
+                expected
+            );
+
+            let [(_, Payload::Readings(readings))] = parts.0.as_slice() else {
+                panic!("expected the literal sibling reading")
+            };
+
+            assert_eq!(readings.samples().len(), 1);
+            assert_eq!(readings.samples()[0].key().subject().id(), "b");
+            assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(9));
+        }
+    }
+}
+
+#[test]
+fn json_objects_preserve_numeric_tokens_and_scalar_validation() {
+    for (kind, raw, expected) in [
+        (
+            NumericType::Int,
+            "-9223372036854775808",
+            Some(NumericValue::Int(i64::MIN)),
+        ),
+        (
+            NumericType::Int,
+            "\"9223372036854775807\"",
+            Some(NumericValue::Int(i64::MAX)),
+        ),
+        (
+            NumericType::Uint,
+            "18446744073709551615",
+            Some(NumericValue::Uint(u64::MAX)),
+        ),
+        (
+            NumericType::Double,
+            "1.25",
+            Some(NumericValue::double(1.25).unwrap()),
+        ),
+        (NumericType::Int, "1.0", None),
+        (NumericType::Uint, "-1", None),
+        (NumericType::Uint, "18446744073709551616", None),
+        (NumericType::Double, "1e999", None),
+        (NumericType::Uint, "null", None),
+    ] {
+        let spec = spec(kind);
+        let object = format!("{{\"leaf\":{raw}}}");
+
+        let parts = projection::project(
+            &spec.projection,
+            snapshot(
+                0,
+                vec![wire::Update {
+                    path: Some(wire_path(&[])),
+                    ..update(Value::JsonVal(object.into_bytes()))
+                }],
+            ),
+        )
+        .unwrap();
+
+        let actual = parts.0.iter().find_map(|(_, payload)| match payload {
+            Payload::Readings(readings) => Some(*readings.samples()[0].value()),
+            _ => None,
+        });
+
+        assert_eq!(actual, expected, "{kind:?}: {raw}");
+        assert_eq!(parts.1.len(), usize::from(expected.is_none()));
+    }
+}
+
+#[test]
+fn json_container_and_leaf_overlaps_keep_final_contributions() {
+    let spec = spec(NumericType::Uint);
+
+    let container = |bytes: &[u8]| wire::Update {
+        path: Some(wire_path(&[])),
+        ..update(Value::JsonVal(bytes.to_vec()))
+    };
+
+    for (updates, expected, issue) in [
+        (
+            vec![container(br#"{"leaf":1}"#), update(Value::UintVal(2))],
+            Some(2),
+            None,
+        ),
+        (
+            vec![update(Value::UintVal(2)), container(br#"{"leaf":1}"#)],
+            Some(1),
+            None,
+        ),
+        (
+            vec![container(br#"{"leaf":1}"#), container(b"{}")],
+            None,
+            None,
+        ),
+        (
+            vec![container(br#"{"leaf":1}"#), container(b"{")],
+            None,
+            Some("update[1].val"),
+        ),
+        (
+            vec![container(br#"{"leaf":1}"#), container(br#"{"leaf":false}"#)],
+            None,
+            Some("update[1].val/leaf"),
+        ),
+        (
+            vec![update(Value::UintVal(1)), container(br#"{"leaf":false}"#)],
+            None,
+            Some("update[1].val/leaf"),
+        ),
+        (
+            vec![container(br#"{"leaf":false}"#), update(Value::UintVal(1))],
+            Some(1),
+            None,
+        ),
+        (
+            vec![update(Value::UintVal(1)), container(b"{}")],
+            Some(1),
+            None,
+        ),
+    ] {
+        let parts = projection::project(&spec.projection, snapshot(0, updates)).unwrap();
+
+        let actual = parts.0.iter().find_map(|(_, payload)| match payload {
+            Payload::Readings(readings) => Some(*readings.samples()[0].value()),
+            _ => None,
+        });
+
+        assert_eq!(actual, expected.map(NumericValue::Uint));
+
+        assert_eq!(
+            parts
+                .1
+                .first()
+                .map(nv_telemetry_source::ProjectionIssue::path),
+            issue
+        );
+
+        assert_eq!(parts.1.len(), usize::from(issue.is_some()));
+    }
+}
+
+#[test]
+fn json_object_validation_checks_syntax_and_traversed_member_names() {
+    let long_name = "m".repeat(1024);
+    let long_path = path(&[&long_name]);
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["leaf"]), path(&["other"]), long_path.clone()],
+        vec![
+            Mapping::new(path(&["leaf"]), descriptor("a"), NumericType::Uint),
+            Mapping::new(path(&["other"]), descriptor("b"), NumericType::Uint),
+            Mapping::new(long_path, descriptor("c"), NumericType::Uint),
+        ],
+    )
+    .expect("valid specification");
+
+    for (bytes, keep_leaf) in [
+        (br#"{"leaf":7,"unused":{"bad":}}"#.as_slice(), false),
+        (br#"{"leaf":7} trailing"#, false),
+        (br#"{"leaf":7,"leaf":8}"#, false),
+        (br#"{"leaf":7,"\u006ceaf":8}"#, false),
+        (br#"{"leaf":7,"unused":{"a":1,"a":2}}"#, true),
+        (br#"{"leaf":7,"unused":[{"a":1,"a":2}]}"#, true),
+        (
+            format!("{{\"leaf\":7,\"{}\":0}}", "p".repeat(1024)).as_bytes(),
+            true,
+        ),
+        (
+            format!("{{\"leaf\":7,\"{long_name}\":0}}").as_bytes(),
+            false,
+        ),
+    ] {
+        let parts = projection::project(
+            &spec.projection,
+            snapshot(
+                0,
+                vec![
+                    wire::Update {
+                        path: Some(wire_path(&[])),
+                        ..update(Value::JsonVal(bytes.to_vec()))
+                    },
+                    // A distinct path keeps deduplication from hiding a leaked leaf.
+                    wire::Update {
+                        path: Some(wire_path(&["other"])),
+                        ..update(Value::UintVal(9))
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(parts.0.len(), 1);
+        assert_eq!(parts.1.len(), usize::from(!keep_leaf));
+
+        let Payload::Readings(readings) = &parts.0[0].1 else {
+            panic!("readings")
+        };
+
+        assert_eq!(readings.samples().len(), 1 + usize::from(keep_leaf));
+
+        assert_eq!(
+            readings
+                .samples()
+                .iter()
+                .find(|s| s.key().subject().id() == "a")
+                .map(nv_telemetry_model::Reading::value),
+            keep_leaf.then_some(&NumericValue::Uint(7))
+        );
+
+        assert_eq!(
+            readings
+                .samples()
+                .iter()
+                .find(|s| s.key().subject().id() == "b")
+                .map(nv_telemetry_model::Reading::value),
+            Some(&NumericValue::Uint(9))
+        );
+
+        for issue in parts.1 {
+            assert!(issue.path().starts_with("update[0].val"));
+            assert!(issue
+                .at_index("notification", usize::MAX)
+                .into_model()
+                .is_ok());
+        }
+    }
+}
+
+#[test]
+fn json_objects_accept_deep_objects_and_many_members() {
+    let depth = 65;
+
+    let mut names = vec!["a"; depth - 1];
+    names.push("leaf");
+
+    let nested = SubscriptionSpec::new(
+        vec![path(&["a"])],
+        vec![Mapping::new(
+            path(&names),
+            descriptor("a"),
+            NumericType::Uint,
+        )],
+    )
+    .unwrap();
+
+    let text = format!(
+        "{}{{\"leaf\":7}}{}",
+        "{\"a\":".repeat(depth - 1),
+        "}".repeat(depth - 1)
+    );
+
+    let flat = spec(NumericType::Uint);
+
+    let mut fields = std::collections::BTreeMap::from([("leaf".to_owned(), 7)]);
+    fields.extend((1..65_537).map(|n| (format!("unused{n}"), 0)));
+
+    for (spec, bytes) in [
+        (&nested, text.into_bytes()),
+        (&flat, serde_json::to_vec(&fields).unwrap()),
+    ] {
+        let parts = projection::project(
+            &spec.projection,
+            snapshot(
+                0,
+                vec![wire::Update {
+                    path: Some(wire_path(&[])),
+                    ..update(Value::JsonVal(bytes))
+                }],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(parts.0.len(), 1);
+        assert!(parts.1.is_empty());
+
+        let Payload::Readings(readings) = &parts.0[0].1 else {
+            panic!("readings")
+        };
+
+        assert_eq!(readings.samples().len(), 1);
+        assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(7));
+    }
+}
+
+#[test]
+fn deep_json_objects_project_on_a_caller_thread_stack() {
+    std::thread::Builder::new()
+        .name("gnmi-json-projection".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("caller runtime");
+
+            runtime.block_on(async {
+                // Empty names keep issue paths short, isolating call-stack growth.
+                let text = format!(
+                    "{{\"leaf\":7,\"unused\":{}0{}}}",
+                    "{\"\":".repeat(900),
+                    "}".repeat(900)
+                );
+
+                for value in [
+                    Value::JsonVal(text.as_bytes().to_vec()),
+                    Value::JsonIetfVal(text.as_bytes().to_vec()),
+                ] {
+                    let notification = snapshot(
+                        0,
+                        vec![wire::Update {
+                            path: Some(wire_path(&[])),
+                            ..update(value)
+                        }],
+                    );
+
+                    let mock = Mock::new(Script {
+                        get_responses: vec![wire::GetResponse {
+                            notification: vec![notification.clone()],
+                            ..Default::default()
+                        }],
+                        responses: vec![wire::SubscribeResponse {
+                            response: Some(wire::subscribe_response::Response::Update(
+                                notification,
+                            )),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    });
+
+                    let get = mock.get(get_spec()).perform().await.unwrap();
+                    let mut stream = mock.subscription().perform().await.unwrap();
+                    let item = stream.next().await.unwrap().unwrap();
+
+                    assert_eq!(get.payloads(), item.payloads());
+                    assert!(get.issues().is_empty());
+                    assert!(item.issues().is_empty());
+
+                    let [(_, Payload::Readings(readings))] = get.payloads() else {
+                        panic!("expected one readings payload")
+                    };
+
+                    assert_eq!(readings.samples().len(), 1);
+                    assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(7));
+                }
+            });
+        })
+        .expect("caller thread")
+        .join()
+        .expect("caller projection");
+}
+
+#[test]
+fn json_member_issues_use_unique_escaped_locations() {
+    let spec = SubscriptionSpec::new(
+        vec![path(&["root"])],
+        [
+            vec!["root", "a/b"],
+            vec!["root", "a~1b"],
+            vec!["root", "a.b"],
+            vec!["root", "a", "b"],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, names)| {
+            Mapping::new(
+                path(&names),
+                descriptor(&index.to_string()),
+                NumericType::Uint,
+            )
+        })
+        .collect(),
+    )
+    .unwrap();
+
+    let parts = projection::project(
+        &spec.projection,
+        snapshot(
+            0,
+            vec![wire::Update {
+                path: Some(wire_path(&["root"])),
+                ..update(Value::JsonIetfVal(
+                    br#"{"a/b":false,"a~1b":false,"a.b":false,"a":{"b":false}}"#.to_vec(),
+                ))
+            }],
+        ),
+    )
+    .unwrap();
+
+    let paths: BTreeSet<_> = parts
+        .1
+        .iter()
+        .map(nv_telemetry_source::ProjectionIssue::path)
+        .collect();
+
+    assert!(parts.0.is_empty());
+
+    assert_eq!(
+        paths,
+        BTreeSet::from([
+            "update[0].val/a~1b",
+            "update[0].val/a~01b",
+            "update[0].val/a.b",
+            "update[0].val/a/b",
+        ])
+    );
+}
+
+#[test]
+fn json_objects_report_arrays_and_missing_keys_without_inferring_subjects() {
+    let spec = SubscriptionSpec::new(
+        vec![path(&["root"])],
+        vec![
+            Mapping::new(
+                path(&["root", "leaf"]),
+                descriptor("fixed"),
+                NumericType::Uint,
+            ),
+            Mapping::collection_reading(
+                path(&["root", "entry", "count"]),
+                SubjectTemplate::new("sensor", IdentityValue::path_key(1, "name")),
+                ReadingTemplate::new(NumericType::Uint),
+            ),
+        ],
+    )
+    .unwrap();
+
+    for text in [
+        r#"{"leaf":7,"entry":[{"name":"invented","count":1}],"unmapped":[1,2]}"#,
+        r#"{"leaf":7,"entry":{"name":"invented","count":1}}"#,
+    ] {
+        let parts = projection::project(
+            &spec.projection,
+            snapshot(
+                0,
+                vec![wire::Update {
+                    path: Some(wire_path(&["root"])),
+                    ..update(Value::JsonVal(text.as_bytes().to_vec()))
+                }],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(parts.0.len(), 1);
+        assert_eq!(parts.1.len(), 1);
+
+        let Payload::Readings(readings) = &parts.0[0].1 else {
+            panic!("readings")
+        };
+
+        assert_eq!(readings.samples().len(), 1);
+        assert_eq!(readings.samples()[0].key().subject().id(), "fixed");
+    }
+}
+
+#[test]
+fn json_objects_keep_parent_type_errors_and_distinct_collision_locations() {
+    let entry = PathElement::new("entry").with_key("name", "fixed");
+
+    let fixed = |names: &[&str]| {
+        let mut elements = vec![entry.clone()];
+        elements.extend(names.iter().map(|name| PathElement::new(*name)));
+        SubscriptionPath::new(elements)
+    };
+
+    let spec = SubscriptionSpec::new(
+        vec![path(&["entry"])],
+        vec![
+            Mapping::new(fixed(&[]), descriptor("parent"), NumericType::Uint),
+            Mapping::new(fixed(&["exact"]), descriptor("fixed"), NumericType::Uint),
+            Mapping::new(
+                fixed(&["sibling"]),
+                descriptor("sibling"),
+                NumericType::Uint,
+            ),
+            Mapping::collection_reading(
+                path(&["entry", "count"]),
+                SubjectTemplate::new("sensor", IdentityValue::path_key(0, "name")),
+                ReadingTemplate::new(NumericType::Uint),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let mut prefix = wire_path(&["entry"]);
+    prefix.elem[0].key.insert("name".into(), "fixed".into());
+
+    let parts = projection::project(
+        &spec.projection,
+        wire::Notification {
+            prefix: Some(prefix),
+            update: vec![wire::Update {
+                path: Some(wire_path(&[])),
+                ..update(Value::JsonVal(
+                    br#"{"count":3,"exact":7,"sibling":9}"#.to_vec(),
+                ))
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let Payload::Readings(readings) = &parts.0[0].1 else {
+        panic!("readings")
+    };
+
+    assert_eq!(readings.samples().len(), 1);
+    assert_eq!(readings.samples()[0].key().subject().id(), "sibling");
+
+    assert_eq!(
+        parts
+            .1
+            .iter()
+            .map(nv_telemetry_source::ProjectionIssue::path)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "update[0].val",
+            "update[0].val/count",
+            "update[0].val/exact"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn json_objects_share_get_and_subscribe_projection_boundaries() {
+    let notifications: Vec<_> = [7_000_000_123, 8_000_000_456]
+        .into_iter()
+        .enumerate()
+        .map(|(index, timestamp)| {
+            let json = if index == 0 {
+                br#"{"leaf":42}"#.as_slice()
+            } else {
+                br#"{"leaf":42,"m:leaf":43}"#
+            };
+
+            snapshot(
+                timestamp,
+                vec![wire::Update {
+                    path: Some(wire_path(&[])),
+                    ..update(Value::JsonIetfVal(json.to_vec()))
+                }],
+            )
+        })
+        .collect();
+
+    let mock = Mock::new(Script {
+        get_responses: vec![wire::GetResponse {
+            notification: notifications.clone(),
+            ..Default::default()
+        }],
+        responses: notifications
+            .into_iter()
+            .map(|notification| wire::SubscribeResponse {
+                response: Some(wire::subscribe_response::Response::Update(notification)),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    });
+
+    let get = mock.get(get_spec()).perform().await.unwrap();
+    let mut subscription = mock.subscription().perform().await.unwrap();
+
+    for (index, expected) in get.payloads().chunks_exact(1).enumerate() {
+        let item = subscription.next().await.unwrap().unwrap();
+
+        assert_eq!(item.payloads(), expected);
+        assert_eq!(item.issues().len(), index);
+
+        if index == 1 {
+            assert_eq!(item.issues()[0].path(), "update[0].val/m:leaf");
+        }
+    }
+
+    assert_eq!(get.payloads().len(), 2);
+    assert_eq!(get.issues().len(), 1);
+
+    assert_eq!(
+        get.issues()[0].path(),
+        "notification[1].update[0].val/m:leaf"
+    );
+}
+
+#[tokio::test]
+async fn json_objects_ignore_nested_arrays_on_unmapped_branches() {
+    let text =
+        serde_json::to_string(&format!("{}\\\"{}", "[".repeat(200), "]".repeat(200))).unwrap();
+
+    for json in [
+        format!(
+            r#"{{"leaf":7,"unused":{}0{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        ),
+        format!(r#"{{"leaf":7,"unused":{text}}}"#),
+    ] {
+        for value in [
+            Value::JsonVal(json.as_bytes().to_vec()),
+            Value::JsonIetfVal(json.as_bytes().to_vec()),
+        ] {
+            let notification = snapshot(
+                0,
+                vec![wire::Update {
+                    path: Some(wire_path(&[])),
+                    ..update(value)
+                }],
+            );
+
+            let mock = Mock::new(Script {
+                get_responses: vec![wire::GetResponse {
+                    notification: vec![notification.clone()],
+                    ..Default::default()
+                }],
+                responses: vec![wire::SubscribeResponse {
+                    response: Some(wire::subscribe_response::Response::Update(notification)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+
+            let get = mock.get(get_spec()).perform().await.unwrap();
+            let mut stream = mock.subscription().perform().await.unwrap();
+            let item = stream.next().await.unwrap().unwrap();
+
+            assert_eq!(get.payloads(), item.payloads());
+            assert_eq!(get.payloads().len(), 1);
+            assert!(get.issues().is_empty());
+            assert!(item.issues().is_empty());
+
+            let Payload::Readings(readings) = &get.payloads()[0].1 else {
+                panic!("readings")
+            };
+
+            assert_eq!(readings.samples().len(), 1);
+            assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(7));
+        }
+    }
+}
+
 fn get_spec() -> GetSpec {
     GetSpec::new(
         vec![path(&["leaf"])],
@@ -2807,7 +3598,7 @@ async fn get_collection_and_fixed_mappings_keep_valid_siblings_of_bad_keys_and_c
                     make("", "count", Value::UintVal(8)),
                     wire::Update {
                         path: Some(wire_path(&["entry"])),
-                        ..update(Value::JsonVal(b"{}".to_vec()))
+                        ..update(Value::JsonVal(b"[]".to_vec()))
                     },
                 ],
             )],

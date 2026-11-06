@@ -722,7 +722,8 @@ total.
 `gnmi.configured` uses caller-supplied paths, value types, and identities. Collection
 mappings can take subject components from received list keys. Configuration checks
 and model validation run without a YANG index; they do not establish path support
-or schema correctness. The provider requires leaf-addressed scalar updates.
+or schema correctness. The provider projects scalar leaf updates and mapped leaves
+inside JSON objects. List keys come from received paths; JSON arrays are unsupported.
 
 What being proto-native does buy is real but narrower: decode comes from the
 protobuf runtime rather than hand-written parsing, there is no vendor-leniency
