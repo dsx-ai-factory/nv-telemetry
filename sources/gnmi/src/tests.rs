@@ -2637,6 +2637,93 @@ fn json_objects_match_leaf_updates_and_keep_received_keys() {
 }
 
 #[test]
+fn json_ietf_qualified_name_mismatches_keep_literal_siblings() {
+    let spec = SubscriptionSpec::new(
+        vec![
+            path(&["leaf"]),
+            path(&["other"]),
+            path(&["vendor:parent"]),
+            path(&["container"]),
+        ],
+        vec![
+            Mapping::new(path(&["leaf"]), descriptor("a"), NumericType::Uint),
+            Mapping::new(path(&["other"]), descriptor("b"), NumericType::Uint),
+            Mapping::new(
+                path(&["vendor:parent", "leaf"]),
+                descriptor("c"),
+                NumericType::Uint,
+            ),
+            Mapping::new(
+                path(&["container", "leaf"]),
+                descriptor("d"),
+                NumericType::Uint,
+            ),
+        ],
+    )
+    .unwrap();
+
+    for (json, pointer) in [
+        (r#"{"m:leaf":7,"other":9}"#, Some("update[0].val/m:leaf")),
+        (
+            r#"{"vendor:parent":{"m:leaf":7},"other":9}"#,
+            Some("update[0].val/vendor:parent/m:leaf"),
+        ),
+        (r#"{"m:leaf":[7],"other":9}"#, Some("update[0].val/m:leaf")),
+        (r#"{"m:leaf":{},"other":9}"#, Some("update[0].val/m:leaf")),
+        (
+            r#"{"m:container":{"leaf":7},"other":9}"#,
+            Some("update[0].val/m:container"),
+        ),
+        (
+            r#"{"m:container":{},"other":9}"#,
+            Some("update[0].val/m:container"),
+        ),
+        (r#"{"unmapped:field":7,"other":9}"#, None),
+        (r#"{"different:parent":{"leaf":7},"other":9}"#, None),
+    ] {
+        for ietf in [false, true] {
+            let value = if ietf {
+                Value::JsonIetfVal(json.as_bytes().to_vec())
+            } else {
+                Value::JsonVal(json.as_bytes().to_vec())
+            };
+
+            let parts = projection::project(
+                &spec.projection,
+                snapshot(
+                    0,
+                    vec![wire::Update {
+                        path: Some(wire_path(&[])),
+                        ..update(value)
+                    }],
+                ),
+            )
+            .unwrap();
+
+            let expected = pointer.filter(|_| ietf);
+
+            assert_eq!(parts.1.len(), usize::from(expected.is_some()), "{json}");
+
+            assert_eq!(
+                parts
+                    .1
+                    .first()
+                    .map(nv_telemetry_source::ProjectionIssue::path),
+                expected
+            );
+
+            let [(_, Payload::Readings(readings))] = parts.0.as_slice() else {
+                panic!("expected the literal sibling reading")
+            };
+
+            assert_eq!(readings.samples().len(), 1);
+            assert_eq!(readings.samples()[0].key().subject().id(), "b");
+            assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(9));
+        }
+    }
+}
+
+#[test]
 fn json_objects_preserve_numeric_tokens_and_scalar_validation() {
     for (kind, raw, expected) in [
         (
@@ -2763,23 +2850,35 @@ fn json_container_and_leaf_overlaps_keep_final_contributions() {
 }
 
 #[test]
-fn invalid_json_objects_discard_their_contributions_and_keep_other_updates() {
+fn json_object_validation_checks_syntax_and_traversed_member_names() {
+    let long_name = "m".repeat(1024);
+    let long_path = path(&[&long_name]);
+
     let spec = SubscriptionSpec::new(
-        vec![path(&["leaf"]), path(&["other"])],
+        vec![path(&["leaf"]), path(&["other"]), long_path.clone()],
         vec![
             Mapping::new(path(&["leaf"]), descriptor("a"), NumericType::Uint),
             Mapping::new(path(&["other"]), descriptor("b"), NumericType::Uint),
+            Mapping::new(long_path, descriptor("c"), NumericType::Uint),
         ],
     )
     .expect("valid specification");
 
-    for bytes in [
-        br#"{"leaf":7,"bad":}"#.as_slice(),
-        br#"{"leaf":7} trailing"#,
-        br#"{"leaf":7,"leaf":8}"#,
-        br#"{"leaf":7,"\u006ceaf":8}"#,
-        br#"{"leaf":7,"unused":{"a":1,"a":2}}"#,
-        format!("{{\"leaf\":7,\"{}\":0}}", "p".repeat(1024)).as_bytes(),
+    for (bytes, keep_leaf) in [
+        (br#"{"leaf":7,"unused":{"bad":}}"#.as_slice(), false),
+        (br#"{"leaf":7} trailing"#, false),
+        (br#"{"leaf":7,"leaf":8}"#, false),
+        (br#"{"leaf":7,"\u006ceaf":8}"#, false),
+        (br#"{"leaf":7,"unused":{"a":1,"a":2}}"#, true),
+        (br#"{"leaf":7,"unused":[{"a":1,"a":2}]}"#, true),
+        (
+            format!("{{\"leaf\":7,\"{}\":0}}", "p".repeat(1024)).as_bytes(),
+            true,
+        ),
+        (
+            format!("{{\"leaf\":7,\"{long_name}\":0}}").as_bytes(),
+            false,
+        ),
     ] {
         let parts = projection::project(
             &spec.projection,
@@ -2801,21 +2900,39 @@ fn invalid_json_objects_discard_their_contributions_and_keep_other_updates() {
         .unwrap();
 
         assert_eq!(parts.0.len(), 1);
-        assert_eq!(parts.1.len(), 1);
+        assert_eq!(parts.1.len(), usize::from(!keep_leaf));
 
         let Payload::Readings(readings) = &parts.0[0].1 else {
             panic!("readings")
         };
 
-        assert_eq!(readings.samples().len(), 1);
-        assert_eq!(readings.samples()[0].key().subject().id(), "b");
-        assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(9));
-        assert!(parts.1[0].path().starts_with("update[0].val"));
-        assert!(parts.1[0]
-            .clone()
-            .at_index("notification", usize::MAX)
-            .into_model()
-            .is_ok());
+        assert_eq!(readings.samples().len(), 1 + usize::from(keep_leaf));
+
+        assert_eq!(
+            readings
+                .samples()
+                .iter()
+                .find(|s| s.key().subject().id() == "a")
+                .map(nv_telemetry_model::Reading::value),
+            keep_leaf.then_some(&NumericValue::Uint(7))
+        );
+
+        assert_eq!(
+            readings
+                .samples()
+                .iter()
+                .find(|s| s.key().subject().id() == "b")
+                .map(nv_telemetry_model::Reading::value),
+            Some(&NumericValue::Uint(9))
+        );
+
+        for issue in parts.1 {
+            assert!(issue.path().starts_with("update[0].val"));
+            assert!(issue
+                .at_index("notification", usize::MAX)
+                .into_model()
+                .is_ok());
+        }
     }
 }
 
@@ -3117,12 +3234,19 @@ fn json_objects_keep_parent_type_errors_and_distinct_collision_locations() {
 async fn json_objects_share_get_and_subscribe_projection_boundaries() {
     let notifications: Vec<_> = [7_000_000_123, 8_000_000_456]
         .into_iter()
-        .map(|timestamp| {
+        .enumerate()
+        .map(|(index, timestamp)| {
+            let json = if index == 0 {
+                br#"{"leaf":42}"#.as_slice()
+            } else {
+                br#"{"leaf":42,"m:leaf":43}"#
+            };
+
             snapshot(
                 timestamp,
                 vec![wire::Update {
                     path: Some(wire_path(&[])),
-                    ..update(Value::JsonIetfVal(br#"{"leaf":42}"#.to_vec()))
+                    ..update(Value::JsonIetfVal(json.to_vec()))
                 }],
             )
         })
@@ -3146,15 +3270,24 @@ async fn json_objects_share_get_and_subscribe_projection_boundaries() {
     let get = mock.get(get_spec()).perform().await.unwrap();
     let mut subscription = mock.subscription().perform().await.unwrap();
 
-    for expected in get.payloads().chunks_exact(1) {
+    for (index, expected) in get.payloads().chunks_exact(1).enumerate() {
         let item = subscription.next().await.unwrap().unwrap();
 
         assert_eq!(item.payloads(), expected);
-        assert!(item.issues().is_empty());
+        assert_eq!(item.issues().len(), index);
+
+        if index == 1 {
+            assert_eq!(item.issues()[0].path(), "update[0].val/m:leaf");
+        }
     }
 
     assert_eq!(get.payloads().len(), 2);
-    assert!(get.issues().is_empty());
+    assert_eq!(get.issues().len(), 1);
+
+    assert_eq!(
+        get.issues()[0].path(),
+        "notification[1].update[0].val/m:leaf"
+    );
 }
 
 #[tokio::test]

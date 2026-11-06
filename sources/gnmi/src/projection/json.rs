@@ -32,13 +32,15 @@ pub(super) struct InvalidJson {
     pub(super) detail: &'static str,
 }
 
-/// Extracts leaves at a resolved response path, retaining its received list keys.
-/// Invalid syntax, duplicate names, or overlong issue paths discard all leaves.
+/// Extracts leaves and member issues, retaining received path names and list keys.
+/// Invalid syntax, duplicate names in traversed objects, or overlong issue paths
+/// discard all leaves from the update.
 pub(super) fn expand(
     spec: &MappingSpec,
     mut path: SubscriptionPath,
     bytes: &[u8],
-) -> Result<Vec<Leaf>, InvalidJson> {
+    ietf: bool,
+) -> Result<Vec<Result<Leaf, InvalidJson>>, InvalidJson> {
     let raw = serde_json::from_slice::<&RawValue>(bytes).map_err(|_| InvalidJson {
         pointer: String::new(),
         detail: "malformed JSON object",
@@ -50,6 +52,7 @@ pub(super) fn expand(
             format!("notification[{}].update[{}].val", usize::MAX, usize::MAX).len(),
         ),
         leaves: Vec::new(),
+        json_start: ietf.then_some(path.0.len()),
     };
 
     extractor.walk(&mut path, raw, &mut String::new())?;
@@ -61,7 +64,10 @@ pub(super) fn expand(
 struct Extractor<'a> {
     spec: &'a MappingSpec,
     pointer_limit: usize,
-    leaves: Vec<Leaf>,
+    leaves: Vec<Result<Leaf, InvalidJson>>,
+
+    /// First path element supplied by a `JSON_IETF` member.
+    json_start: Option<usize>,
 }
 
 impl Extractor<'_> {
@@ -78,25 +84,46 @@ impl Extractor<'_> {
         loop {
             let is_object = raw.get().starts_with('{');
             let mapped = self.spec.mapping(path).is_some();
+            let relevant = self.spec.mappings.iter().any(|m| m.covers(path));
 
-            // An object at a scalar mapping is invalid there, but its descendants
-            // can still match other mappings. Arrays remain opaque.
-            if mapped || (!is_object && self.spec.mappings.iter().any(|m| m.covers(path))) {
-                let value = (!is_object && !raw.get().starts_with('['))
-                    .then(|| Value::JsonVal(raw.get().as_bytes().to_vec()));
+            let mismatch = !relevant
+                && self
+                    .json_start
+                    .is_some_and(|start| qualification_mismatch(self.spec, path, start));
 
-                self.leaves.push(Leaf {
-                    path: path.clone(),
-                    value,
-                    pointer: pointer.clone(),
+            // Reserve both indexes for locations that may produce an issue,
+            // including Get's notification index. Unrelated members need no locator.
+            if (relevant || mismatch) && pointer.len() > self.pointer_limit {
+                return Err(InvalidJson {
+                    pointer: String::new(),
+                    detail: "JSON member path exceeds the projection issue path limit",
                 });
             }
 
-            if is_object {
+            // An object at a scalar mapping is invalid there, but its descendants
+            // can still match other mappings. Arrays remain opaque.
+            if mapped || (!is_object && relevant) {
+                let value = (!is_object && !raw.get().starts_with('['))
+                    .then(|| Value::JsonVal(raw.get().as_bytes().to_vec()));
+
+                self.leaves.push(Ok(Leaf {
+                    path: path.clone(),
+                    value,
+                    pointer: pointer.clone(),
+                }));
+            } else if mismatch {
+                self.leaves.push(Err(InvalidJson {
+                    pointer: pointer.clone(),
+                    detail: "module-qualified JSON_IETF member does not match the configured literal path",
+                }));
+            }
+
+            if is_object && relevant {
                 let mut failure = None;
                 let mut decoder = serde_json::Deserializer::from_str(raw.get());
 
-                // Validate unmapped object branches too; a duplicate rejects the whole update.
+                // Only traverse branches that can reach a literal mapping. A
+                // qualified-only branch reports its mismatch above and stops here.
                 let fields = decoder
                     .deserialize_map(Object {
                         failure: &mut failure,
@@ -129,19 +156,42 @@ impl Extractor<'_> {
             pointer.push('/');
             pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
 
-            // Reserve both indexes even for Subscribe, so the same locator is
-            // valid after Get prefixes it with a notification index.
-            if pointer.len() > self.pointer_limit {
-                return Err(InvalidJson {
-                    pointer: String::new(),
-                    detail: "JSON member path exceeds the projection issue path limit",
-                });
-            }
-
             path.0.push(PathElement::new(name));
             raw = value;
         }
     }
+}
+
+// Detect paths that would match only after removing a JSON_IETF module qualifier.
+fn qualification_mismatch(spec: &MappingSpec, path: &SubscriptionPath, start: usize) -> bool {
+    spec.mappings.iter().any(|mapping| {
+        if path.0.len() > mapping.path.0.len()
+            || !path.0.iter().zip(&mapping.path.0).enumerate().all(
+                |(index, (received, configured))| {
+                    let name = if index >= start && !configured.name.contains(':') {
+                        received
+                            .name
+                            .split_once(':')
+                            .map_or(received.name.as_str(), |(_, name)| name)
+                    } else {
+                        &received.name
+                    };
+
+                    name == configured.name
+                },
+            )
+        {
+            return false;
+        }
+
+        let mut candidate = path.clone();
+
+        for (received, configured) in candidate.0.iter_mut().zip(&mapping.path.0).skip(start) {
+            received.name.clone_from(&configured.name);
+        }
+
+        mapping.covers(&candidate)
+    })
 }
 
 // Borrow scalar tokens so integer values use the same parser as leaf updates.

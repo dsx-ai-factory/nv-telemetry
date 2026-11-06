@@ -131,6 +131,8 @@
 //! Object member names extend the update path and match mapping elements exactly,
 //! including module prefixes. Keys must come from the received path; JSON fields
 //! do not supply list keys. Arrays on mapped branches produce issues.
+//! A `JSON_IETF` member produces an issue when its branch can reach a mapping only
+//! if a module qualifier is ignored. That branch is skipped.
 //!
 //! For example, an update at `/telemetry/entry[name=sensor-a]/state` with
 //! `{"count":42,"enabled":false}` supplies the mapped `state/count` and
@@ -138,12 +140,14 @@
 //!
 //! Repeated update paths keep only the final update, including malformed objects.
 //! Overlapping object and leaf updates keep the final contribution to each leaf.
-//! An absent member does not imply deletion. Malformed objects or duplicate member
-//! names discard that object's contribution with an issue.
+//! An absent member does not imply deletion. Malformed JSON or duplicate member
+//! names in a traversed object discard the update's contribution with an issue.
 //! An invalid mapped scalar produces an issue while valid sibling values are kept.
-//! Duplicate names are checked on unmapped object branches too.
-//! Member issue locations use JSON Pointer escaping and must fit the model's path
-//! limit, including acquisition indexes. An overlong location rejects that object.
+//! Objects that cannot reach a mapping are skipped. Their syntax is still checked,
+//! but their member names are not checked for duplicates.
+//! Member issue locations use JSON Pointer escaping. Locations on mapped branches
+//! and qualified-name mismatches must fit the model's path limit, including
+//! acquisition indexes. An overlong location rejects that object.
 //! Arrays are opaque; their contents are not checked for duplicate member names.
 //!
 //! Use [`Mapping::boolean_state`] to collect a boolean state. A subscription may

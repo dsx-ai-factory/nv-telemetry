@@ -188,25 +188,28 @@ fn expand_update(
         return;
     }
 
-    match json::expand(spec, path, bytes) {
-        Ok(expanded) => leaves.extend(expanded.into_iter().map(|leaf| {
-            (
+    let ietf = matches!(value, Some(Value::JsonIetfVal(_)));
+    let expanded = json::expand(spec, path, bytes, ietf).unwrap_or_else(|error| vec![Err(error)]);
+
+    for leaf in expanded {
+        match leaf {
+            Ok(leaf) => leaves.push((
                 leaf.path,
                 leaf.value,
                 UpdateLocation {
                     update: index,
                     pointer: Some(leaf.pointer),
                 },
-            )
-        })),
-        Err(error) => {
-            issues.push(
-                UpdateLocation {
-                    update: index,
-                    pointer: Some(error.pointer),
-                }
-                .issue("val", error.detail),
-            );
+            )),
+            Err(error) => {
+                issues.push(
+                    UpdateLocation {
+                        update: index,
+                        pointer: Some(error.pointer),
+                    }
+                    .issue("val", error.detail),
+                );
+            }
         }
     }
 }
