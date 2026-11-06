@@ -21,9 +21,9 @@
 //! An invalid mapped value produces a projection
 //! issue; valid updates in the same notification are still collected. Readings
 //! and states from the same notification share the same acquisition item.
-//! Deletes that affect a mapped leaf produce issues and cannot remove earlier
-//! observations. The provider validates mappings and received values without a
-//! YANG schema.
+//! Standard acquisition APIs report mapped deletes as issues. Use
+//! [`ConfiguredSubscription::subscribe_with_sources`] for structured deletion paths.
+//! The provider validates mappings and received values without a YANG schema.
 //! Unsupported request paths can cause the target to reject Subscribe.
 //!
 //! ```
@@ -266,9 +266,54 @@
 //! produces a `count` reading of `42` for `sensor-a`. List keys come from the
 //! received path. JSON member names still match mapping elements literally.
 //!
+//! [`ConfiguredSubscription::subscribe_with_sources`] returns [`ProjectedNotification`]s
+//! for caller-owned consumers. Each result carries acquisition parts, the source of
+//! every emitted observation, and relevant deleted paths. Keep a separate ownership
+//! table for each endpoint and subscription instance. Apply deletes before replacement
+//! updates, and publish only after accepting the notification's parts.
+//!
+//! The following consumer accepts 1 notification and returns batches, status, and
+//! identities to remove from its retained output. The caller applies those removals
+//! before publishing the returned batches. The standard `Collector` output carries
+//! acquisition parts rather than gNMI source metadata.
+//!
+//! ```
+//! use std::collections::BTreeMap;
+//! use nv_telemetry_gnmi::{ConfiguredSubscription, ObservationIdentity,
+//!     ProjectedNotification, SourcePath};
+//! use nv_telemetry_model::{AcquisitionStatus, Timestamp};
+//! use nv_telemetry_orchestration::success_status;
+//! use nv_telemetry_source::{stamp_item, Acquire, Acquired, AcquisitionFailure};
+//!
+//! fn accept<T>(source: &ConfiguredSubscription<T>, notification: ProjectedNotification,
+//!     at: Timestamp, owners: &mut BTreeMap<ObservationIdentity, SourcePath>)
+//!     -> Result<(Acquired, AcquisitionStatus, Vec<ObservationIdentity>), AcquisitionFailure>
+//! where ConfiguredSubscription<T>: Acquire,
+//! {
+//!     let (parts, bindings, deletions) = notification.into_parts();
+//!     let acquired = stamp_item(source, at, Ok(parts))?;
+//!     let status = success_status(source.endpoint(), source.origin(), at, None);
+//!
+//!     // Accept the result before changing retained ownership.
+//!     let removed: Vec<_> = owners.iter()
+//!         .filter(|(_, path)| deletions.iter().any(|deleted| deleted.covers(path)))
+//!         .map(|(identity, _)| identity.clone()).collect();
+//!     for identity in &removed {
+//!         owners.remove(identity);
+//!     }
+//!     for binding in bindings {
+//!         let (identity, source) = binding.into_parts();
+//!         owners.insert(identity, source);
+//!     }
+//!
+//!     Ok((acquired, status, removed))
+//! }
+//! ```
+//!
 //! Run `make codegen` to regenerate the bindings and `make check-codegen`
 //! to check them. Builds use the checked-in files and do not need `protoc`.
 
+mod notification;
 mod projection;
 #[path = "generated/protocol/mod.rs"]
 mod protocol;
@@ -279,6 +324,10 @@ use std::sync::Arc;
 
 use futures_util::stream;
 use futures_util::Stream;
+pub use notification::ObservationIdentity;
+pub use notification::ProjectedNotification;
+pub use notification::SourceBinding;
+pub use notification::SourcePath;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Invalid;
 use nv_telemetry_model::Origin;
@@ -362,7 +411,7 @@ impl<T> ConfiguredSubscription<T> {
     }
 }
 
-impl<T> Acquire for ConfiguredSubscription<T>
+impl<T> ConfiguredSubscription<T>
 where
     T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
     T::Error: Into<StdError>,
@@ -370,17 +419,49 @@ where
     T::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<StdError> + Send,
 {
-    type Output = Pin<Box<dyn Stream<Item = SubscriptionItem> + Send + 'static>>;
-
-    fn endpoint(&self) -> &EndpointContext {
-        &self.endpoint
+    /// Opens a STREAM subscription with resolved source bindings and deletion paths.
+    ///
+    /// Each notification is returned with its projected acquisition parts. The caller
+    /// accepts/stamps those parts before applying deletes and replacement updates to
+    /// retained values. Endpoint and subscription-instance isolation are caller-owned.
+    /// Synchronization produces no item. A terminal failure produces 1 error and ends
+    /// the stream; dropping the future or returned stream cancels the RPC.
+    ///
+    /// This output is for caller-owned consumers. The standard `Collector` consumes
+    /// only acquisition parts and does not carry these gNMI source facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified acquisition failure when the subscription cannot open.
+    pub async fn subscribe_with_sources(
+        &self,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn Stream<Item = Result<ProjectedNotification, AcquisitionFailure>>
+                    + Send
+                    + 'static,
+            >,
+        >,
+        AcquisitionFailure,
+    > {
+        self.subscribe(projection::project_with_sources).await
     }
 
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
-
-    async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+    // Both output paths share opening, controls, cancellation and terminal errors.
+    async fn subscribe<P, F>(
+        &self,
+        project: F,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<P, AcquisitionFailure>> + Send + 'static>>,
+        AcquisitionFailure,
+    >
+    where
+        P: Send + 'static,
+        F: Fn(&spec::MappingSpec, protocol::gnmi::Notification) -> Result<P, AcquisitionFailure>
+            + Send
+            + 'static,
+    {
         use protocol::gnmi::subscribe_response::Response;
 
         let mut client = protocol::gnmi::g_nmi_client::GNmiClient::new(self.transport.clone());
@@ -395,20 +476,18 @@ where
         let spec = Arc::clone(&self.spec);
 
         Ok(Box::pin(stream::unfold(
-            Some((response, spec)),
+            Some((response, spec, project)),
             |state| async move {
-                let (mut response, spec) = state?;
+                let (mut response, spec, project) = state?;
 
                 loop {
                     let item = match response.message().await {
                         Ok(Some(message)) => match message.response {
                             Some(Response::SyncResponse(_)) => continue,
                             Some(Response::Update(notification)) => {
-                                let item = projection::project(&spec.projection, notification).map(
-                                    |(payloads, issues)| AcquisitionParts::new(payloads, issues),
-                                );
+                                let item = project(&spec.projection, notification);
 
-                                let next = item.is_ok().then_some((response, spec));
+                                let next = item.is_ok().then_some((response, spec, project));
 
                                 return Some((item, next));
                             }
@@ -429,6 +508,33 @@ where
                 }
             },
         )))
+    }
+}
+
+impl<T> Acquire for ConfiguredSubscription<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
+    T::Error: Into<StdError>,
+    T::Future: Send,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
+    type Output = Pin<Box<dyn Stream<Item = SubscriptionItem> + Send + 'static>>;
+
+    fn endpoint(&self) -> &EndpointContext {
+        &self.endpoint
+    }
+
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+        self.subscribe(|spec, notification| {
+            projection::project(spec, notification)
+                .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+        })
+        .await
     }
 }
 
