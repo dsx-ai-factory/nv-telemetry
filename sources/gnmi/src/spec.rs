@@ -1110,6 +1110,117 @@ impl GetSpec {
     }
 }
 
+/// Validated paths and mappings for 1 finite Subscribe ONCE snapshot.
+///
+/// Request paths and mappings follow [`SubscriptionSpec`]'s validation and JSON
+/// projection rules. Each acquisition opens a new RPC. The default encoding is JSON.
+///
+/// ```
+/// use nv_telemetry_gnmi::{Mapping, NumericType, OnceSpec, PathElement, SubscriptionPath};
+/// use nv_telemetry_model::{SignalDescriptor, SignalKey, Subject};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let subject = Subject::builder().kind("sensor").id("sensor-a").build()?;
+/// let key = SignalKey::builder().subject(subject).facet("count").build()?;
+/// let descriptor = SignalDescriptor::builder().key(key).unit("1").build()?;
+/// let path = SubscriptionPath::new(vec![PathElement::new("count")]);
+/// let spec = OnceSpec::new(vec![path.clone()],
+///     vec![Mapping::new(path, descriptor, NumericType::Uint)])?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct OnceSpec {
+    pub(super) projection: MappingSpec,
+    requests: Vec<gnmi::Path>,
+    encoding: Encoding,
+}
+
+impl OnceSpec {
+    /// Validates paths and mappings before acquisition, without a target lookup.
+    /// Request order, duplicates, and overlapping request paths are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or invalid paths or mappings, uncovered mappings,
+    /// duplicate mapping paths or output identities, or invalid templates.
+    pub fn new(
+        requests: Vec<SubscriptionPath>,
+        mappings: Vec<Mapping>,
+    ) -> Result<Self, InvalidOnce> {
+        let projection = MappingSpec::new(&requests.iter(), mappings)
+            .map_err(|InvalidSubscription(detail)| InvalidOnce(detail))?;
+
+        Ok(Self {
+            projection,
+            requests: requests.into_iter().map(|path| path.wire()).collect(),
+            encoding: Encoding::default(),
+        })
+    }
+
+    /// Sets the origin for all request paths. An empty string leaves the origin unspecified.
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.projection.origin = origin.into();
+        self
+    }
+
+    /// Sets the target for all request paths. An empty string leaves the target unspecified.
+    #[must_use]
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.projection.target = target.into();
+        self
+    }
+
+    /// Selects the requested encoding. The target must support the selection.
+    #[must_use]
+    pub const fn with_encoding(mut self, encoding: Encoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    pub(super) fn request(&self) -> gnmi::SubscribeRequest {
+        gnmi::SubscribeRequest {
+            request: Some(gnmi::subscribe_request::Request::Subscribe(
+                gnmi::SubscriptionList {
+                    prefix: Some(gnmi::Path {
+                        origin: self.projection.origin.clone(),
+                        target: self.projection.target.clone(),
+                        ..Default::default()
+                    }),
+                    subscription: self
+                        .requests
+                        .iter()
+                        .map(|path| gnmi::Subscription {
+                            path: Some(path.clone()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    mode: gnmi::subscription_list::Mode::Once.into(),
+                    encoding: match self.encoding {
+                        Encoding::Json => gnmi::Encoding::Json,
+                        Encoding::JsonIetf => gnmi::Encoding::JsonIetf,
+                    }
+                    .into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+}
+
+/// An invalid ONCE request path or mapping configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidOnce(&'static str);
+
+impl fmt::Display for InvalidOnce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidOnce {}
+
 /// An invalid Get request path or mapping configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidGet(&'static str);
