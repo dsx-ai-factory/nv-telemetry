@@ -193,6 +193,79 @@
 //! }
 //! ```
 //!
+//! [`ConfiguredOnce`] collects a finite snapshot through Subscribe ONCE. Use
+//! [`OnceSpec`] for parent request paths and separate leaf mappings. Each poll
+//! opens a fresh RPC and returns 1 acquisition after `SyncResponse(true)` and clean
+//! RPC closure. No results are published if the RPC fails. An empty synchronized
+//! snapshot succeeds without batches.
+//!
+//! Projected results are buffered until completion. Choose request scope and
+//! concurrency for the expected snapshot size. A caller deadline must cover the
+//! complete acquisition future, including the wait for final RPC status. A channel
+//! connection or response-header timeout alone does not bound that wait.
+//!
+//! The following caller-owned adapter applies a timeout when the acquisition runs
+//! in a `PollUnit`. The application supplies the poll interval and timeout.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! use nv_telemetry_gnmi::{ConfiguredOnce, Encoding, IdentityValue, Mapping,
+//!     NumericType, OnceSpec, PathElement, ReadingTemplate, SubjectTemplate, SubscriptionPath};
+//! use nv_telemetry_model::{EndpointContext, Origin};
+//! use nv_telemetry_orchestration::{plan, Needs, PollNeed, PollUnit};
+//! use nv_telemetry_source::{Acquire, AcquisitionFailure, AcquisitionFailureClass,
+//!     AcquisitionParts};
+//!
+//! // Forward identity so admission, results, and timeout failures share the same origin.
+//! struct Deadline<A> {
+//!     unit: A,
+//!     timeout: Duration,
+//! }
+//!
+//! impl<A> Acquire for Deadline<A>
+//! where A: Acquire<Output = AcquisitionParts> + Send + Sync,
+//! {
+//!     type Output = AcquisitionParts;
+//!
+//!     fn endpoint(&self) -> &EndpointContext { self.unit.endpoint() }
+//!     fn origin(&self) -> &Origin { self.unit.origin() }
+//!
+//!     async fn perform(&self) -> Result<AcquisitionParts, AcquisitionFailure> {
+//!         tokio::time::timeout(self.timeout, self.unit.perform()).await.map_err(|_| {
+//!             AcquisitionFailure::new(AcquisitionFailureClass::Timeout)
+//!                 .with_retryable(true)
+//!                 .with_detail("snapshot acquisition deadline exceeded")
+//!         })?
+//!     }
+//! }
+//!
+//! fn once_poll<T>(endpoint: EndpointContext, transport: T,
+//!     interval: Duration, timeout: Duration) -> Result<PollUnit, Box<dyn std::error::Error>>
+//! where ConfiguredOnce<T>: Acquire<Output = AcquisitionParts> + Send + Sync + 'static,
+//! {
+//!     let path = |names: &[&str]| SubscriptionPath::new(
+//!         names.iter().map(|name| PathElement::new(*name)).collect());
+//!     let spec = OnceSpec::new(vec![path(&["telemetry", "entry"])], vec![
+//!         Mapping::collection_reading(path(&["telemetry", "entry", "state", "count"]),
+//!             SubjectTemplate::new("sensor", IdentityValue::path_key(1, "name")),
+//!             ReadingTemplate::new(NumericType::Uint).with_facet("count").with_unit("1")),
+//!     ])?.with_encoding(Encoding::JsonIetf);
+//!     let unit = ConfiguredOnce::new(endpoint.clone(), transport, spec)?;
+//!     let needs = Needs::default().with_polls([PollNeed::new(endpoint,
+//!         ConfiguredOnce::<T>::REQUEST_CLASS, "snapshot", interval)]);
+//!     let planned = plan(needs, &[ConfiguredOnce::<T>::declaration()])?;
+//!     let poll = planned.polls().first().ok_or("missing ONCE poll")?.clone();
+//!
+//!     Ok(PollUnit::new(poll, Arc::new(Deadline { unit, timeout })))
+//! }
+//! ```
+//!
+//! An update at `/telemetry/entry[name=sensor-a]/state` containing `{"count":"42"}`
+//! produces a `count` reading of `42` for `sensor-a`. List keys come from the
+//! received path. JSON member names still match mapping elements literally.
+//!
 //! Run `make codegen` to regenerate the bindings and `make check-codegen`
 //! to check them. Builds use the checked-in files and do not need `protoc`.
 
@@ -220,9 +293,11 @@ pub use spec::GetDataType;
 pub use spec::GetSpec;
 pub use spec::IdentityValue;
 pub use spec::InvalidGet;
+pub use spec::InvalidOnce;
 pub use spec::InvalidSubscription;
 pub use spec::Mapping;
 pub use spec::NumericType;
+pub use spec::OnceSpec;
 pub use spec::PathElement;
 pub use spec::ReadingTemplate;
 pub use spec::StateIdentity;
@@ -462,6 +537,158 @@ where
             );
         }
 
+        Ok(AcquisitionParts::new(payloads, issues))
+    }
+}
+
+/// A configured finite Subscribe ONCE acquisition for 1 endpoint.
+///
+/// Each [`Acquire::perform`] call opens a new RPC and buffers projected results
+/// until `SyncResponse(true)` and a successful RPC close. A failure discards the
+/// buffered results. An empty synchronized snapshot succeeds without batches.
+///
+/// Each notification is projected separately and retains its device timestamp,
+/// even when notifications arrive out of order. Coverage is partial; missing
+/// leaves do not imply deletion.
+///
+/// Memory grows with the projected snapshot. The caller supplies transport security,
+/// credentials, request scope, and a deadline covering the complete acquisition
+/// future. Dropping that future cancels the RPC and releases its buffered results.
+/// See the crate example for scheduling through a caller-owned timeout adapter.
+///
+/// ```
+/// use nv_telemetry_gnmi::{ConfiguredOnce, OnceSpec};
+/// use nv_telemetry_model::{EndpointContext, Invalid};
+/// fn snapshot<T>(endpoint: EndpointContext, transport: T, spec: OnceSpec)
+///     -> Result<ConfiguredOnce<T>, Invalid>
+/// {
+///     ConfiguredOnce::new(endpoint, transport, spec)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ConfiguredOnce<T> {
+    endpoint: EndpointContext,
+    origin: Origin,
+    transport: T,
+    spec: OnceSpec,
+}
+
+impl<T> ConfiguredOnce<T> {
+    /// Provider identity used in declarations and observations.
+    pub const PROVIDER: &str = ConfiguredSubscription::<T>::PROVIDER;
+
+    /// Request class used for ONCE admission.
+    pub const REQUEST_CLASS: &str = "configured-once";
+
+    /// Creates an acquisition. [`Acquire::perform`] sends the validated specification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a model validation error if the provider origin cannot be built.
+    pub fn new(endpoint: EndpointContext, transport: T, spec: OnceSpec) -> Result<Self, Invalid> {
+        let origin = Origin::builder()
+            .provider(Self::PROVIDER)
+            .request_class(Self::REQUEST_CLASS)
+            .build()?;
+
+        Ok(Self {
+            endpoint,
+            origin,
+            transport,
+            spec,
+        })
+    }
+
+    /// Declares a polled provider with an admission cost of 1.
+    #[must_use]
+    pub fn declaration() -> ProviderDeclaration {
+        ProviderDeclaration::polled(Self::PROVIDER, Self::REQUEST_CLASS, 1)
+    }
+}
+
+impl<T> Acquire for ConfiguredOnce<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
+    T::Error: Into<StdError>,
+    T::Future: Send,
+    T::ResponseBody: Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<StdError> + Send,
+{
+    type Output = AcquisitionParts;
+
+    fn endpoint(&self) -> &EndpointContext {
+        &self.endpoint
+    }
+
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+        use protocol::gnmi::subscribe_response::Response;
+
+        let mut client = protocol::gnmi::g_nmi_client::GNmiClient::new(self.transport.clone());
+
+        let mut response = client
+            .subscribe(stream::iter([self.spec.request()]))
+            .await
+            .map_err(|status| failure("Subscribe ONCE", status.code()))?
+            .into_inner();
+
+        let mut synced = false;
+
+        let mut index = 0;
+
+        let mut payloads = Vec::new();
+
+        let mut issues = Vec::new();
+
+        // Consume through EOF: synchronization alone does not verify the final status.
+        while let Some(message) = response
+            .message()
+            .await
+            .map_err(|status| failure("Subscribe ONCE", status.code()))?
+        {
+            match message.response {
+                Some(Response::Update(notification)) => {
+                    if synced {
+                        return Err(AcquisitionFailure::new(Class::Protocol)
+                            .with_retryable(false)
+                            .with_detail("gNMI ONCE received an update after synchronization"));
+                    }
+
+                    // Keep projection local to each notification; timestamps and
+                    // duplicate paths can differ between notifications.
+                    let (projected, notification_issues) =
+                        projection::project(&self.spec.projection, notification)?;
+
+                    payloads.extend(projected);
+
+                    issues.extend(
+                        notification_issues
+                            .into_iter()
+                            .map(|issue| issue.at_index("notification", index)),
+                    );
+
+                    index += 1;
+                }
+                // False or repeated controls do not reset synchronization.
+                Some(Response::SyncResponse(done)) => synced |= done,
+                #[allow(deprecated)]
+                Some(Response::Error(error)) => {
+                    return Err(legacy_failure("Subscribe ONCE", error.code))
+                }
+                None => return Err(failure("Subscribe ONCE", Code::DataLoss)),
+            }
+        }
+
+        if !synced {
+            return Err(AcquisitionFailure::new(Class::Protocol)
+                .with_retryable(false)
+                .with_detail("gNMI ONCE closed before synchronization"));
+        }
+
+        // Apply the issue bound once across all notifications.
         Ok(AcquisitionParts::new(payloads, issues))
     }
 }
