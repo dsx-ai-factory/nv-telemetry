@@ -20,11 +20,11 @@ use nv_telemetry_model::SignalDescriptor;
 use nv_telemetry_model::SignalKey;
 use nv_telemetry_model::StateObservation;
 use nv_telemetry_model::States;
-use nv_telemetry_model::Subject;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value as ModelValue;
 use nv_telemetry_source::AcquisitionFailure;
 use nv_telemetry_source::AcquisitionFailureClass;
+use nv_telemetry_source::AcquisitionParts;
 use nv_telemetry_source::ProjectionIssue;
 use serde::de::DeserializeOwned;
 
@@ -36,7 +36,11 @@ use crate::spec::MappingSpec;
 use crate::spec::StateType;
 use crate::Mapping;
 use crate::NumericType;
+use crate::ObservationIdentity;
 use crate::PathElement;
+use crate::ProjectedNotification;
+use crate::SourceBinding;
+use crate::SourcePath;
 use crate::StateIdentity;
 use crate::SubscriptionPath;
 
@@ -46,6 +50,38 @@ pub(super) fn project(
     spec: &MappingSpec,
     notification: gnmi::Notification,
 ) -> Result<ProjectionParts, AcquisitionFailure> {
+    let projected = project_notification(spec, notification, false)?;
+    Ok((projected.payloads, projected.issues))
+}
+
+pub(super) fn project_with_sources(
+    spec: &MappingSpec,
+    notification: gnmi::Notification,
+) -> Result<ProjectedNotification, AcquisitionFailure> {
+    let projected = project_notification(spec, notification, true)?;
+
+    Ok(ProjectedNotification {
+        parts: AcquisitionParts::new(projected.payloads, projected.issues),
+        bindings: projected.bindings,
+        deletions: projected.deletions,
+        observed_at: projected.observed_at,
+    })
+}
+
+// Default Get/ONCE callers retain unbounded issues until the whole acquisition ends.
+struct Projection {
+    payloads: Vec<(Coverage, Payload)>,
+    issues: Vec<ProjectionIssue>,
+    bindings: Vec<SourceBinding>,
+    deletions: Vec<SourcePath>,
+    observed_at: Timestamp,
+}
+
+fn project_notification(
+    spec: &MappingSpec,
+    notification: gnmi::Notification,
+    with_sources: bool,
+) -> Result<Projection, AcquisitionFailure> {
     const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
     // Timestamps before the Unix epoch still need a nonnegative nanosecond remainder.
@@ -76,7 +112,11 @@ pub(super) fn project(
             continue;
         }
 
-        if !updates_seen.insert(path.clone()) {
+        let context = with_sources
+            .then(|| source_context(spec, notification.prefix.as_ref(), update.path.as_ref()));
+
+        // Opt-in paths include origin/target; default acquisitions keep element/key precedence.
+        if !updates_seen.insert((path.clone(), context.clone())) {
             continue;
         }
 
@@ -85,6 +125,7 @@ pub(super) fn project(
             path,
             update.val.and_then(|v| v.value),
             index,
+            context,
             &mut leaves,
             &mut issues,
         );
@@ -93,9 +134,9 @@ pub(super) fn project(
     let mut leaves_seen = BTreeSet::new();
     let mut candidates = BTreeMap::new();
 
-    for (path, value, location) in leaves {
+    for (path, value, location, context) in leaves {
         // Claim the concrete leaf before conversion, including invalid values.
-        if !leaves_seen.insert(path.clone()) {
+        if !leaves_seen.insert((path.clone(), context.clone())) {
             continue;
         }
 
@@ -114,16 +155,22 @@ pub(super) fn project(
             continue;
         };
 
+        let source = context.map(|(origin, target)| SourcePath {
+            path,
+            origin,
+            target,
+        });
+
         // Resolve identities only after the final contribution for each leaf.
         // A None entry keeps a collided identity excluded from later candidates.
         match candidates.entry(projected.identity()) {
             Entry::Vacant(entry) => {
-                entry.insert(Some((location, projected)));
+                entry.insert(Some((location, projected, source)));
             }
             Entry::Occupied(mut entry) => {
                 let detail = "different paths produce the same observation identity";
 
-                if let Some((previous, _)) = entry.get_mut().take() {
+                if let Some((previous, _, _)) = entry.get_mut().take() {
                     issues.push(previous.issue("path", detail));
                 }
 
@@ -132,16 +179,36 @@ pub(super) fn project(
         }
     }
 
-    let payloads = split_payloads(candidates.into_values().flatten().map(|(_, value)| value))?;
+    let mut bindings = Vec::new();
 
-    delete_issues(
+    // Bind only accepted candidates, after collision rejection and before splitting.
+    let payloads = split_payloads(candidates.into_iter().filter_map(|(identity, candidate)| {
+        candidate.map(|(_, observation, source)| {
+            if let Some(source) = source {
+                bindings.push(SourceBinding { identity, source });
+            }
+
+            observation
+        })
+    }))?;
+
+    let mut deletions = Vec::new();
+
+    project_deletes(
         spec,
         notification.prefix.as_ref(),
         &notification.delete,
+        with_sources.then_some(&mut deletions),
         &mut issues,
     );
 
-    Ok((payloads, issues))
+    Ok(Projection {
+        payloads,
+        issues,
+        bindings,
+        deletions,
+        observed_at,
+    })
 }
 
 /// Locates an original update field or a member inside its JSON value.
@@ -163,13 +230,19 @@ impl UpdateLocation {
     }
 }
 
-type LeafUpdate = (SubscriptionPath, Option<Value>, UpdateLocation);
+type LeafUpdate = (
+    SubscriptionPath,
+    Option<Value>,
+    UpdateLocation,
+    Option<(String, String)>,
+);
 
 fn expand_update(
     spec: &MappingSpec,
     path: SubscriptionPath,
     value: Option<Value>,
     index: usize,
+    context: Option<(String, String)>,
     leaves: &mut Vec<LeafUpdate>,
     issues: &mut Vec<ProjectionIssue>,
 ) {
@@ -179,12 +252,12 @@ fn expand_update(
     };
 
     let Some(Value::JsonVal(bytes) | Value::JsonIetfVal(bytes)) = &value else {
-        leaves.push((path, value, location));
+        leaves.push((path, value, location, context));
         return;
     };
 
     if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-        leaves.push((path, value, location));
+        leaves.push((path, value, location, context));
         return;
     }
 
@@ -200,6 +273,7 @@ fn expand_update(
                     update: index,
                     pointer: Some(leaf.pointer),
                 },
+                context.clone(),
             )),
             Err(error) => {
                 issues.push(
@@ -214,26 +288,20 @@ fn expand_update(
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum OutputIdentity {
-    Reading(SignalKey),
-    State(Subject, Option<String>, String),
-}
-
 enum ProjectedObservation {
     Reading(SignalDescriptor, Reading),
     State(StateObservation),
 }
 
 impl ProjectedObservation {
-    fn identity(&self) -> OutputIdentity {
+    fn identity(&self) -> ObservationIdentity {
         match self {
-            Self::Reading(descriptor, _) => OutputIdentity::Reading(descriptor.key().clone()),
-            Self::State(state) => OutputIdentity::State(
-                state.subject().clone(),
-                state.facet().map(str::to_owned),
-                state.name().to_owned(),
-            ),
+            Self::Reading(descriptor, _) => ObservationIdentity::Reading(descriptor.key().clone()),
+            Self::State(state) => ObservationIdentity::State {
+                subject: state.subject().clone(),
+                facet: state.facet().map(str::to_owned),
+                name: state.name().to_owned(),
+            },
         }
     }
 }
@@ -350,21 +418,34 @@ fn split_payloads(
     Ok(payloads)
 }
 
-/// Reports deletes that name a mapped leaf or one of its ancestors.
-/// The model has no deletion observation, so deletes produce issues only.
-fn delete_issues(
+/// Captures relevant deletes for opt-in consumers; existing acquisitions keep issues.
+fn project_deletes(
     spec: &MappingSpec,
     prefix: Option<&gnmi::Path>,
     deletes: &[gnmi::Path],
+    mut sources: Option<&mut Vec<SourcePath>>,
     issues: &mut Vec<ProjectionIssue>,
 ) {
     for (index, delete) in deletes.iter().enumerate() {
         match resolve(spec, prefix, Some(delete)) {
             Ok(path) if spec.mappings.iter().any(|mapping| mapping.covers(&path)) => {
-                issues.push(
-                    ProjectionIssue::invalid("", "mapped delete cannot remove prior observations")
+                if let Some(sources) = &mut sources {
+                    let (origin, target) = source_context(spec, prefix, Some(delete));
+
+                    sources.push(SourcePath {
+                        path,
+                        origin,
+                        target,
+                    });
+                } else {
+                    issues.push(
+                        ProjectionIssue::invalid(
+                            "",
+                            "mapped delete cannot remove prior observations",
+                        )
                         .at_index("delete", index),
-                );
+                    );
+                }
             }
             Err(detail) => {
                 issues.push(ProjectionIssue::invalid("path", detail).at_index("delete", index));
@@ -372,6 +453,35 @@ fn delete_issues(
             Ok(_) => {}
         }
     }
+}
+
+// gNMI 2.7.1 assigns openconfig when origin is unspecified. Targets have no default name.
+fn source_context(
+    spec: &MappingSpec,
+    prefix: Option<&gnmi::Path>,
+    path: Option<&gnmi::Path>,
+) -> (String, String) {
+    const DEFAULT_ORIGIN: &str = "openconfig";
+
+    let origin = [
+        spec.origin.as_str(),
+        prefix.map_or("", |p| &p.origin),
+        path.map_or("", |p| &p.origin),
+    ]
+    .into_iter()
+    .find(|value| !value.is_empty())
+    .unwrap_or(DEFAULT_ORIGIN);
+
+    let target = [
+        spec.target.as_str(),
+        prefix.map_or("", |p| &p.target),
+        path.map_or("", |p| &p.target),
+    ]
+    .into_iter()
+    .find(|value| !value.is_empty())
+    .unwrap_or_default();
+
+    (origin.to_owned(), target.to_owned())
 }
 
 fn payload(
