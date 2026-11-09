@@ -412,6 +412,7 @@ impl SubjectTemplate {
 #[derive(Clone, Debug)]
 pub struct ReadingTemplate {
     pub(super) numeric_type: NumericType,
+    pub(super) parse_text: bool,
     facet: Option<String>,
     kind: Option<String>,
     unit: Option<String>,
@@ -420,15 +421,34 @@ pub struct ReadingTemplate {
 
 impl ReadingTemplate {
     /// Creates a template with the required numeric representation.
+    ///
+    /// Native string and ASCII values require [`Self::with_text_parsing`].
     #[must_use]
     pub fn new(numeric_type: NumericType) -> Self {
         Self {
             numeric_type,
+            parse_text: false,
             facet: None,
             kind: None,
             unit: None,
             range: None,
         }
+    }
+
+    /// Enables numeric parsing of native `string_val` and `ascii_val` values.
+    ///
+    /// Uses Rust's numeric string parsers. Integers accept decimal digits and a
+    /// leading `+`; signed integers also accept `-`. Leading zeros are accepted.
+    /// `Double` accepts decimal and exponent notation with `f64` rounding.
+    /// Empty text, whitespace, suffixes, overflow, and non-finite doubles produce
+    /// projection issues without readings. Integer types reject fractions and exponents.
+    /// Parsing failures do not stop acquisition; other updates are still processed.
+    /// The acquisition spec selects request encoding. Quoted JSON numbers are
+    /// accepted without enabling native text parsing.
+    #[must_use]
+    pub fn with_text_parsing(mut self) -> Self {
+        self.parse_text = true;
+        self
     }
 
     /// Sets the signal facet on each derived subject.
@@ -564,6 +584,7 @@ pub(super) enum MappingKind {
     Reading {
         descriptor: SignalDescriptor,
         numeric_type: NumericType,
+        parse_text: bool,
     },
     State {
         target: StateIdentity,
@@ -632,6 +653,8 @@ pub struct Mapping {
 
 impl Mapping {
     /// Creates a mapping using an already validated descriptor.
+    ///
+    /// Native string and ASCII values require [`Self::numeric_with_text`].
     #[must_use]
     pub fn new(
         path: SubscriptionPath,
@@ -643,6 +666,28 @@ impl Mapping {
             kind: MappingKind::Reading {
                 descriptor,
                 numeric_type,
+                parse_text: false,
+            },
+        }
+    }
+
+    /// Creates a numeric mapping that also parses native `string_val` and `ascii_val`.
+    ///
+    /// Uses the declared numeric type and the parsing rules of
+    /// [`ReadingTemplate::with_text_parsing`]. Invalid text produces a projection
+    /// issue without a reading. The acquisition spec selects request encoding.
+    #[must_use]
+    pub fn numeric_with_text(
+        path: SubscriptionPath,
+        descriptor: SignalDescriptor,
+        numeric_type: NumericType,
+    ) -> Self {
+        Self {
+            path,
+            kind: MappingKind::Reading {
+                descriptor,
+                numeric_type,
+                parse_text: true,
             },
         }
     }
