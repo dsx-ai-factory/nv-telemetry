@@ -772,6 +772,42 @@ fn a_stream_connects_before_due_polls() {
 }
 
 #[test]
+fn a_reconnect_waits_for_the_bucket_to_refill_twice_its_cost() {
+    // One token every ten seconds and a connect that costs one: a stream
+    // that keeps closing reconnects every twenty at the soonest, however
+    // short its first retry, so polls keep half the refill.
+    let manual = ManualClock::new();
+    let clock = TestClock::shared(&manual);
+    let unit = FixtureSubscription::scripted(endpoint(), vec![Ok(Vec::new())]);
+    let stream = StreamUnit::new(planned_stream(endpoint(), STREAM_PROVIDER), unit, policy());
+    let rate = RatePolicy::default()
+        .with_burst(4)
+        .with_refill(1, Duration::from_secs(10));
+    let Seated {
+        subtree,
+        mut streams,
+        ..
+    } = endpoint_subtree(
+        &EndpointPolicy::default().with_rate(rate),
+        &clock,
+        clock.instant(),
+        vec![planned_poll(endpoint())],
+        vec![stream],
+    )
+    .expect("a poll and a stream on one endpoint form a subtree");
+    let mut runtime = runtime(subtree, &manual);
+    let mut reports = streams.pop().expect("the stream's reports");
+
+    work_outcome(&mut runtime).expect("the connect attempt succeeds");
+    work_outcome(&mut runtime).expect("the poll succeeds");
+    assert!(next(&mut reports).is_pending(), "the stream closed at once");
+    assert_eq!(
+        sleep_deadline(&mut runtime),
+        manual.now() + Duration::from_secs(20)
+    );
+}
+
+#[test]
 fn a_stream_unit_is_checked_against_its_plan() {
     let manual = ManualClock::new();
     let clock = TestClock::shared(&manual);

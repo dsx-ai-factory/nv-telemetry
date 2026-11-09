@@ -6,11 +6,12 @@
 //!
 //! The milestone-1 slice of the architecture's admission stack — endpoint
 //! admission over the endpoint breaker over the rate bucket over the unit
-//! leaves. Stream connects take priority over polls, so a stream opens
-//! as soon as the bucket admits anything, not behind a round of polls;
-//! within each, units of different request classes share one round-robin
-//! ring. Per-class lanes and the class breaker are deliberately absent
-//! until class-level policy exists. The collector seats each subtree on
+//! leaves. Stream connects are taken before polls, so a stream opens as
+//! soon as the bucket admits anything, not behind a round of polls, and
+//! reconnects are spaced so that they leave polls half the refill. Connects
+//! take turns among themselves, as polls do, whatever their request
+//! classes. Request-class lanes and the request-class breaker are
+//! deliberately absent until class-level policy exists. The collector seats each subtree on
 //! its own runtime; policy types here convert privately into dispatcher
 //! configuration, so the dispatcher's own vocabulary never leaks into
 //! embedder policy.
@@ -201,17 +202,33 @@ pub(crate) type SubtreeMeta = WithPriority<UnitMeta>;
 /// One unit leaf, polled or streamed.
 type Unit = Box<dyn Scheduler<TelemetryWork, Meta = UnitMeta>>;
 
-/// Stream connects over polls; the units of each class share its
-/// round-robin ring.
+/// Stream connects over polls; connects take turns among themselves, and
+/// so do polls.
 type Units = StrictPriority<TelemetryWork, Unit>;
 
-/// Priority class of stream connects. A connect is rare, since its
-/// reconnect policy backs off, and cheap; a stream that waits behind
-/// polls misses the events sent before it opens.
+/// Priority of stream connects. A stream that waits behind polls misses
+/// the events sent before it opens.
 const STREAM_PRIORITY: u8 = 1;
 
-/// Priority class of polls.
+/// Priority of polls.
 const POLL_PRIORITY: u8 = 0;
+
+/// The share of the bucket's refill that reconnects may spend; polls keep
+/// the rest.
+const RECONNECT_REFILL_SHARE: u32 = 2;
+
+/// The shortest delay before any stream of a polled endpoint reconnects: the
+/// time the bucket takes to refill what all of them cost to connect, over
+/// their share. Without it, a stream that keeps closing could be due
+/// before each refill and, taken first, leave polls nothing. Zero when
+/// the rate is unlimited.
+fn reconnect_floor(rate: &RatePolicy, connects_cost: u64) -> Duration {
+    let refills = connects_cost
+        .saturating_mul(u64::from(RECONNECT_REFILL_SHARE))
+        .div_ceil(rate.refill.max(1));
+    rate.per
+        .saturating_mul(u32::try_from(refills).unwrap_or(u32::MAX))
+}
 
 /// The standard endpoint subtree: endpoint admission over the endpoint
 /// breaker over the rate bucket over the unit leaves.
@@ -477,6 +494,16 @@ pub(crate) fn endpoint_subtree(
         by_priority.add_child(Box::new(FixedCost::new(cost, leaf)), POLL_PRIORITY);
     }
     let mut reports = Vec::with_capacity(streams.len());
+    let connects_cost = streams.iter().fold(0_u64, |cost, stream| {
+        cost.saturating_add(stream.planned().cost())
+    });
+    // With no polls there is nothing to starve, and the bucket alone
+    // paces the connects.
+    let floor = if polled {
+        reconnect_floor(&policy.rate, connects_cost)
+    } else {
+        Duration::ZERO
+    };
     for stream in streams {
         let planned = stream.planned();
         if planned.endpoint().endpoint_id() != subtree_endpoint {
@@ -499,7 +526,7 @@ pub(crate) fn endpoint_subtree(
         }
         validate_reconnect(stream.policy())?;
         let cost = CostUnits::new(planned.cost());
-        let (leaf, stream_reports) = stream.bind(clock);
+        let (leaf, stream_reports) = stream.bind(clock, floor);
         by_priority.add_child(Box::new(FixedCost::new(cost, leaf)), STREAM_PRIORITY);
         reports.push(stream_reports);
     }

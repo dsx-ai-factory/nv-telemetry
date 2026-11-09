@@ -1098,8 +1098,9 @@ at the device's pace:
   endpoint subtree with the poll leaves, under the same concurrency limit,
   breaker, and token bucket, and is charged the provider's declared cost.
   It is taken ahead of due polls: a stream that waits behind a round of
-  polls misses the events sent before it opens, and a connect is rare,
-  since reconnects back off. A failed connect is a status like a failed
+  polls misses the events sent before it opens. Reconnects are spaced by
+  the endpoint's rate so that a stream that keeps closing leaves polls
+  half the refill. A failed connect is a status like a failed
   poll, and an endpoint-scoped one reaches the endpoint breaker.
 - **Reconnection is dispatcher scheduling.** When an instance ends, the leaf
   computes the next due instant from a typed reconnect policy — a delay that

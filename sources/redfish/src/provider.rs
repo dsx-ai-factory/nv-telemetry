@@ -365,20 +365,23 @@ fn assemble_sensor(parts: SensorParts) -> Result<AcquisitionParts, Invalid> {
     // tier — never a reading that vanishes.
     if !parts.signal_descriptors.is_empty() || !parts.readings.is_empty() {
         // `SensorResetTime` dates peaks and averages too; only a running
-        // total's start is carried. One sensor is one signal.
-        let cumulative = parts
-            .signal_descriptors
-            .iter()
-            .any(|descriptor| descriptor.accumulation() == Some(Accumulation::Cumulative));
-        let samples = if cumulative {
-            parts.readings
-        } else {
-            parts
-                .readings
-                .into_iter()
-                .map(without_accumulation_start)
-                .collect::<Result<_, _>>()?
-        };
+        // total's start is carried.
+        let descriptors = &parts.signal_descriptors;
+        let samples = parts
+            .readings
+            .into_iter()
+            .map(|reading| {
+                let cumulative = descriptors.iter().any(|descriptor| {
+                    descriptor.key() == reading.key()
+                        && descriptor.accumulation() == Some(Accumulation::Cumulative)
+                });
+                if cumulative {
+                    Ok(reading)
+                } else {
+                    without_accumulation_start(reading)
+                }
+            })
+            .collect::<Result<_, Invalid>>()?;
         let readings = Readings::builder()
             .descriptors(parts.signal_descriptors)
             .samples(samples)

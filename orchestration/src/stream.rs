@@ -288,8 +288,9 @@ impl StreamUnit {
     }
 
     /// Splits the unit into the connect leaf and its reports, both stamping
-    /// on `clock`.
-    pub(crate) fn bind(self, clock: &SharedClock) -> (StreamLeaf, StreamReports) {
+    /// on `clock`. No reconnect comes sooner than `floor` after an
+    /// instance ends.
+    pub(crate) fn bind(self, clock: &SharedClock, floor: Duration) -> (StreamLeaf, StreamReports) {
         let shared = Arc::new(Mutex::new(Shared {
             phase: Phase::Due(None),
             connecting: None,
@@ -307,6 +308,7 @@ impl StreamUnit {
         let leaf = StreamLeaf {
             planned: self.planned,
             policy: self.policy,
+            floor,
             shared,
             unit: self.unit,
             clock: Arc::clone(clock),
@@ -346,6 +348,8 @@ impl fmt::Debug for StreamUnit {
 pub(crate) struct StreamLeaf {
     planned: PlannedStream,
     policy: ReconnectPolicy,
+    /// The endpoint's shortest reconnect delay, from its rate policy.
+    floor: Duration,
     shared: SharedState,
     unit: Arc<dyn Subscribe>,
     clock: SharedClock,
@@ -383,7 +387,7 @@ impl StreamLeaf {
                 self.unproductive,
                 self.planned.endpoint().endpoint_id(),
             )
-            .and_then(|delay| now.checked_add(delay));
+            .and_then(|delay| now.checked_add(delay.max(self.floor)));
         if let Some(at) = next {
             state.phase = Phase::Due(Some(at));
             Readiness::not_ready(Some(at))
