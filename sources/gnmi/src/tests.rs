@@ -4450,3 +4450,552 @@ async fn once_polls_report_one_complete_result_per_rpc_and_poll_again() {
         collector.shutdown();
     }
 }
+
+#[tokio::test]
+async fn source_notifications_bind_readings_and_preserve_deletes_without_issue_text() {
+    let mock = Mock::new(Script {
+        responses: vec![wire::SubscribeResponse {
+            response: Some(wire::subscribe_response::Response::Update(
+                wire::Notification {
+                    timestamp: 7_000_000_123,
+                    update: vec![update(Value::UintVal(9))],
+                    delete: vec![wire_path(&["leaf"])],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let source = mock.subscription();
+
+    let mut notifications = source.subscribe_with_sources().await.unwrap();
+
+    let notification = notifications.next().await.unwrap().unwrap();
+
+    assert_eq!(notification.observed_at(), Timestamp::new(7, 123).unwrap());
+
+    assert_eq!(notification.bindings().len(), 1);
+
+    let binding = &notification.bindings()[0];
+
+    assert_eq!(
+        binding.identity(),
+        &ObservationIdentity::Reading(descriptor("a").key().clone())
+    );
+
+    assert_eq!(binding.source().origin(), "openconfig");
+
+    assert_eq!(binding.source().target(), "");
+
+    assert_eq!(binding.source().elements()[0].name(), "leaf");
+
+    assert!(binding.source().elements()[0].keys().is_empty());
+
+    assert_eq!(notification.deletions().len(), 1);
+
+    assert!(notification.deletions()[0].covers(binding.source()));
+
+    assert!(notification.parts().issues().is_empty());
+
+    let (parts, bindings, deletions) = notification.into_parts();
+
+    let acquired =
+        nv_telemetry_source::stamp_item(&source, Timestamp::new(99, 0).unwrap(), Ok(parts))
+            .unwrap();
+
+    assert_eq!(acquired.batches().len(), 1);
+
+    assert_eq!(bindings.len(), 1);
+
+    assert_eq!(deletions.len(), 1);
+
+    let legacy = source
+        .perform()
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(legacy.issues().len(), 1);
+
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+fn source_collection_spec() -> SubscriptionSpec {
+    let subject = SubjectTemplate::new("interface", IdentityValue::path_key(1, "name"));
+    SubscriptionSpec::new(
+        vec![path(&["interfaces", "interface"])],
+        vec![
+            Mapping::collection_reading(
+                path(&["interfaces", "interface", "count"]),
+                subject.clone(),
+                ReadingTemplate::new(NumericType::Uint).with_facet("count"),
+            ),
+            Mapping::collection_string_state(
+                path(&["interfaces", "interface", "status"]),
+                subject.clone(),
+                StateTemplate::new("status").with_facet("status"),
+            ),
+            Mapping::collection_boolean_state(
+                path(&["interfaces", "interface", "enabled"]),
+                subject,
+                StateTemplate::new("enabled"),
+            ),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn source_bindings_follow_final_json_values_and_preserve_state_identity() {
+    let spec = source_collection_spec()
+        .with_origin("vendor")
+        .with_target("device");
+
+    let mut prefix = wire_path(&["interfaces", "interface"]);
+    prefix.elem[1].key.insert("name".into(), "eth0".into());
+    prefix.elem[1].key.insert("slot".into(), "2".into());
+
+    let updates = vec![
+        wire::Update {
+            path: Some(wire_path(&[])),
+            ..update(Value::JsonIetfVal(
+                br#"{"count":1,"status":"vendor:ACTIVE","enabled":false}"#.to_vec(),
+            ))
+        },
+        wire::Update {
+            path: Some(wire_path(&["count"])),
+            ..update(Value::UintVal(7))
+        },
+        wire::Update {
+            path: Some(wire_path(&["count"])),
+            ..update(Value::BoolVal(true))
+        },
+    ];
+
+    let notification = wire::Notification {
+        prefix: Some(prefix),
+        ..snapshot(7_000_000_123, updates)
+    };
+
+    let actual = projection::project_with_sources(&spec.projection, notification.clone()).unwrap();
+    let (payloads, issues) = projection::project(&spec.projection, notification).unwrap();
+
+    assert_eq!(actual.parts(), &AcquisitionParts::new(payloads, issues));
+    assert_eq!(actual.bindings().len(), 2);
+    assert_eq!(actual.parts().issues().len(), 1);
+
+    for binding in actual.bindings() {
+        let ObservationIdentity::State {
+            subject,
+            facet,
+            name,
+        } = binding.identity()
+        else {
+            panic!("state binding")
+        };
+
+        assert_eq!(subject.id(), "eth0");
+        assert_eq!(facet.as_deref(), (name == "status").then_some("status"));
+        assert!(name == "status" || name == "enabled");
+        assert_eq!(binding.source().elements().len(), 3);
+        assert_eq!(binding.source().elements()[2].name(), name);
+
+        assert_eq!(
+            binding.source().elements()[1]
+                .keys()
+                .get("slot")
+                .map(String::as_str),
+            Some("2")
+        );
+
+        assert_eq!(binding.source().origin(), "vendor");
+        assert_eq!(binding.source().target(), "device");
+    }
+}
+
+#[test]
+fn source_bindings_omit_collisions_and_do_not_bind_invalid_candidates() {
+    let spec = source_collection_spec();
+    let mut first = wire_path(&["interfaces", "interface", "count"]);
+    first.elem[1].key.insert("name".into(), "eth0".into());
+    first.elem[1].key.insert("slot".into(), "1".into());
+    let mut second = first.clone();
+    second.elem[1].key.insert("slot".into(), "2".into());
+
+    let updates = vec![
+        wire::Update {
+            path: Some(first.clone()),
+            ..update(Value::UintVal(1))
+        },
+        wire::Update {
+            path: Some(second),
+            ..update(Value::UintVal(2))
+        },
+    ];
+
+    let collided =
+        projection::project_with_sources(&spec.projection, snapshot(0, updates.clone())).unwrap();
+
+    assert!(collided.parts().payloads().is_empty());
+    assert!(collided.bindings().is_empty());
+    assert_eq!(collided.parts().issues().len(), 2);
+
+    let mut replacement = updates;
+
+    replacement.push(wire::Update {
+        path: Some(first),
+        ..update(Value::BoolVal(false))
+    });
+
+    let accepted =
+        projection::project_with_sources(&spec.projection, snapshot(0, replacement)).unwrap();
+
+    assert_eq!(accepted.bindings().len(), 1);
+
+    assert_eq!(
+        accepted.bindings()[0].source().elements()[1]
+            .keys()
+            .get("slot")
+            .map(String::as_str),
+        Some("2")
+    );
+
+    assert_eq!(accepted.parts().issues().len(), 1);
+}
+
+#[test]
+fn source_deletes_resolve_context_and_cover_paths_directionally() {
+    let spec = source_collection_spec();
+    let mut source = wire_path(&["interfaces", "interface", "count"]);
+    source.elem[1].key.insert("name".into(), "eth0".into());
+    source.elem[1].key.insert("slot".into(), "1".into());
+
+    let update = wire::Update {
+        path: Some(source.clone()),
+        ..update(Value::UintVal(5))
+    };
+
+    let mut keyed = wire_path(&["interfaces", "interface"]);
+    keyed.elem[1].key.insert("name".into(), "eth0".into());
+    let mut other = keyed.clone();
+    other.elem[1].key.insert("name".into(), "eth1".into());
+    let mut explicit_origin = keyed.clone();
+    explicit_origin.origin = "openconfig".into();
+
+    let deletes = vec![
+        source.clone(),
+        keyed.clone(),
+        wire_path(&["interfaces", "interface"]),
+        wire_path(&[]),
+        other,
+        explicit_origin,
+        keyed,
+        wire_path(&["unrelated"]),
+        wire_path(&[""]),
+    ];
+
+    let projected = projection::project_with_sources(
+        &spec.projection,
+        wire::Notification {
+            delete: deletes,
+            ..snapshot(0, vec![update.clone()])
+        },
+    )
+    .unwrap();
+
+    let retained = projected.bindings()[0].source();
+
+    let covers: Vec<_> = projected
+        .deletions()
+        .iter()
+        .map(|path| path.covers(retained))
+        .collect();
+
+    assert_eq!(covers, [true, true, true, true, false, true, true]);
+    assert!(projected.deletions()[3].elements().is_empty());
+    assert_eq!(projected.deletions()[1], projected.deletions()[6]);
+    assert!(!retained.covers(&projected.deletions()[1]));
+    assert_eq!(projected.parts().issues().len(), 1);
+}
+
+#[test]
+fn source_deletes_keep_prefix_origin_and_target_scopes() {
+    let spec = source_collection_spec();
+    let mut source = wire_path(&["interfaces", "interface", "count"]);
+    source.elem[1].key.insert("name".into(), "eth0".into());
+    source.elem[1].key.insert("slot".into(), "1".into());
+
+    let update = wire::Update {
+        path: Some(source.clone()),
+        ..update(Value::UintVal(5))
+    };
+
+    let projected = projection::project_with_sources(
+        &spec.projection,
+        wire::Notification {
+            delete: vec![wire_path(&[])],
+            ..snapshot(0, vec![update.clone()])
+        },
+    )
+    .unwrap();
+
+    let retained = projected.bindings()[0].source();
+
+    let mut relative = update.clone();
+    relative.path.as_mut().unwrap().elem.remove(0);
+
+    let mut relative_delete = wire_path(&["interface"]);
+    relative_delete.elem[0]
+        .key
+        .insert("name".into(), "eth0".into());
+
+    let prefixed = projection::project_with_sources(
+        &spec.projection,
+        wire::Notification {
+            prefix: Some(wire_path(&["interfaces"])),
+            delete: vec![relative_delete],
+            ..snapshot(0, vec![relative])
+        },
+    )
+    .unwrap();
+
+    assert!(prefixed.deletions()[0].covers(retained));
+
+    assert_eq!(prefixed.bindings()[0].source(), retained);
+
+    for (origin, target) in [("other", ""), ("", "other")] {
+        let prefix = wire::Path {
+            origin: origin.into(),
+            target: target.into(),
+            ..Default::default()
+        };
+
+        let different = projection::project_with_sources(
+            &spec.projection,
+            wire::Notification {
+                prefix: Some(prefix),
+                delete: vec![wire_path(&[])],
+                ..snapshot(0, vec![update.clone()])
+            },
+        )
+        .unwrap();
+
+        assert!(!projected.deletions()[0].covers(different.bindings()[0].source()));
+        assert!(!different.deletions()[0].covers(retained));
+    }
+
+    let scoped = spec.clone().with_origin("vendor").with_target("device");
+    let mut conflicting = source;
+    conflicting.target = "other".into();
+
+    let invalid = projection::project_with_sources(
+        &scoped.projection,
+        wire::Notification {
+            delete: vec![conflicting],
+            ..snapshot(0, vec![update])
+        },
+    )
+    .unwrap();
+
+    assert_eq!(invalid.bindings().len(), 1);
+    assert!(invalid.deletions().is_empty());
+    assert_eq!(invalid.parts().issues()[0].path(), "delete[0].path");
+}
+
+#[test]
+fn source_deletes_respect_literal_mapping_key_filters() {
+    let filtered = SubscriptionSpec::new(
+        vec![path(&["interfaces", "interface"])],
+        vec![Mapping::collection_reading(
+            SubscriptionPath::new(vec![
+                PathElement::new("interfaces"),
+                PathElement::new("interface").with_key("role", "front"),
+                PathElement::new("count"),
+            ]),
+            SubjectTemplate::new("interface", IdentityValue::path_key(1, "name")),
+            ReadingTemplate::new(NumericType::Uint),
+        )],
+    )
+    .unwrap();
+
+    let mut excluded = wire_path(&["interfaces", "interface"]);
+    excluded.elem[1].key.insert("role".into(), "back".into());
+
+    let mut included = excluded.clone();
+    included.elem[1].key.insert("role".into(), "front".into());
+
+    let relevance = projection::project_with_sources(
+        &filtered.projection,
+        wire::Notification {
+            delete: vec![excluded, included],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(relevance.deletions().len(), 1);
+
+    assert_eq!(
+        relevance.deletions()[0].elements()[1]
+            .keys()
+            .get("role")
+            .map(String::as_str),
+        Some("front")
+    );
+}
+
+#[tokio::test]
+async fn source_notifications_share_controls_terminal_failures_and_projection_errors() {
+    for opening in [false, true] {
+        let mock = Mock::new(Script {
+            responses: vec![
+                wire::SubscribeResponse {
+                    response: Some(wire::subscribe_response::Response::SyncResponse(true)),
+                    ..Default::default()
+                },
+                notification(vec![update(Value::UintVal(3))]),
+            ],
+            status: Some(Code::Unavailable),
+            opening_error: opening,
+            ..Default::default()
+        });
+
+        let source = mock.subscription();
+
+        if opening {
+            assert_eq!(
+                source.subscribe_with_sources().await.err().unwrap().class(),
+                Class::Connectivity
+            );
+        } else {
+            let mut stream = source.subscribe_with_sources().await.unwrap();
+
+            assert_eq!(stream.next().await.unwrap().unwrap().bindings().len(), 1);
+
+            assert_eq!(
+                stream.next().await.unwrap().unwrap_err().class(),
+                Class::Connectivity
+            );
+
+            assert!(stream.next().await.is_none());
+        }
+
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    let mock = Mock::new(Script {
+        responses: vec![
+            notification(vec![]),
+            notification(vec![update(Value::UintVal(1))]),
+        ],
+        ..Default::default()
+    });
+
+    let source = mock.subscription();
+
+    // The shared loop must end if projection fails, before any later notification.
+    let mut failed = source
+        .subscribe::<(), _>(|_, _| Err(AcquisitionFailure::new(Class::Internal)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        failed.next().await.unwrap().unwrap_err().class(),
+        Class::Internal
+    );
+
+    assert!(failed.next().await.is_none());
+}
+
+#[tokio::test]
+async fn source_notifications_cancel_pending_open_or_idle_stream_and_open_fresh_instances() {
+    let mock = Mock::new(Script {
+        hold_connect: true,
+        ..Default::default()
+    });
+
+    let source = mock.subscription();
+    let mut opening = Box::pin(source.subscribe_with_sources());
+
+    assert!(futures_util::poll!(&mut opening).is_pending());
+    drop(opening);
+
+    assert_eq!(mock.dropped.load(Ordering::SeqCst), 1);
+
+    let mock = Mock::new(Script {
+        responses: vec![notification(vec![])],
+        hold_open: true,
+        ..Default::default()
+    });
+
+    let source = mock.subscription();
+
+    for expected in 1..=2 {
+        let mut stream = source.subscribe_with_sources().await.unwrap();
+
+        let empty = stream.next().await.unwrap().unwrap();
+
+        assert!(empty.bindings().is_empty());
+        assert!(empty.deletions().is_empty());
+        assert!(futures_util::poll!(stream.next()).is_pending());
+        drop(stream);
+        assert_eq!(mock.dropped.load(Ordering::SeqCst), expected);
+    }
+
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn source_bindings_deduplicate_within_the_effective_origin() {
+    let spec = spec(NumericType::Uint);
+
+    for expanded in [false, true] {
+        for origins in [["openconfig", "vendor"], ["", "openconfig"]] {
+            let mut first = if expanded {
+                wire::Update {
+                    path: Some(wire_path(&[])),
+                    ..update(Value::JsonVal(br#"{"leaf":1}"#.to_vec()))
+                }
+            } else {
+                update(Value::UintVal(1))
+            };
+
+            first.path.as_mut().unwrap().origin = origins[0].into();
+
+            let mut last = update(Value::UintVal(2));
+            last.path.as_mut().unwrap().origin = origins[1].into();
+
+            let notification = snapshot(0, vec![first, last]);
+
+            let actual =
+                projection::project_with_sources(&spec.projection, notification.clone()).unwrap();
+
+            let (payloads, issues) = projection::project(&spec.projection, notification).unwrap();
+
+            // The standard acquisition keeps its existing element/key precedence.
+            assert_eq!(payloads.len(), 1);
+            assert!(issues.is_empty());
+
+            if origins[1] == "vendor" {
+                assert!(actual.parts().payloads().is_empty());
+                assert!(actual.bindings().is_empty());
+                assert_eq!(actual.parts().issues().len(), 2);
+            } else {
+                assert_eq!(actual.parts(), &AcquisitionParts::new(payloads, issues));
+                assert_eq!(actual.bindings().len(), 1);
+                assert_eq!(actual.bindings()[0].source().origin(), "openconfig");
+
+                let Payload::Readings(readings) = &actual.parts().payloads()[0].1 else {
+                    panic!("reading payload")
+                };
+
+                assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(2));
+            }
+        }
+    }
+}

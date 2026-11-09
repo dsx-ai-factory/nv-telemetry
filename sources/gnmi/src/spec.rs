@@ -85,6 +85,18 @@ impl PathElement {
         self
     }
 
+    /// The element name as configured or received.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The element's literal list keys.
+    #[must_use]
+    pub fn keys(&self) -> &BTreeMap<String, String> {
+        &self.keys
+    }
+
     // Elements are compatible when names match and shared keys have equal values.
     fn compatible(&self, other: &Self) -> bool {
         self.name == other.name
