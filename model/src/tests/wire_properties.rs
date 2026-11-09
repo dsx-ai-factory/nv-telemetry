@@ -132,6 +132,7 @@ fn a_batch_round_trips_byte_for_byte() {
                 kind: Some("temperature".into()),
                 unit: Some("Cel".into()),
                 range: None,
+                accumulation: None,
             }],
             samples: vec![wire::Reading {
                 key: Some(signal_key()),
@@ -139,6 +140,7 @@ fn a_batch_round_trips_byte_for_byte() {
                     kind: Some(wire::numeric_value::Kind::DoubleValue(47.5)),
                 }),
                 observed_at: None,
+                accumulation_start: None,
             }],
         })),
     };

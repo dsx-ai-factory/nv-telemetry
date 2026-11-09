@@ -35,6 +35,73 @@ use crate::Violation;
 use super::limits;
 use super::wire;
 
+/// Validated form of `nv.telemetry.v1.Accumulation`.
+///
+/// The unspecified value is unrepresentable: conversion rejects it, because
+/// every `nv.telemetry.v1.Accumulation` field in the contract declares `reject_unspecified`. A value
+/// newer than this build decodes as [`Accumulation::Unrecognized`] instead of
+/// failing, so additive schema evolution does not break older consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Accumulation {
+    /// `ACCUMULATION_INSTANT`.
+    Instant,
+    /// `ACCUMULATION_CUMULATIVE`.
+    Cumulative,
+    /// A value newer than this build. Interpreting it is the consumer's
+    /// decision; re-encoding preserves it.
+    Unrecognized(i32),
+}
+impl TryFrom<i32> for Accumulation {
+    type Error = Violation;
+    fn try_from(value: i32) -> Result<Self, Violation> {
+        match value {
+            0 => Err(Violation::Unspecified),
+            1 => Ok(Self::Instant),
+            2 => Ok(Self::Cumulative),
+            other => Ok(Self::Unrecognized(other)),
+        }
+    }
+}
+impl From<Accumulation> for i32 {
+    fn from(value: Accumulation) -> Self {
+        match value {
+            Accumulation::Instant => 1,
+            Accumulation::Cumulative => 2,
+            Accumulation::Unrecognized(other) => other,
+        }
+    }
+}
+impl crate::canonical::Canonical for Accumulation {
+    fn canonical_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        i32::from(*self).cmp(&i32::from(*other))
+    }
+}
+impl Accumulation {
+    /// Rejects an `Unrecognized` that aliases the unspecified value
+    /// or a variant this build recognizes: its bytes would not
+    /// round-trip — 0 is refused by decode outright, and an alias
+    /// silently comes back as the recognized variant instead of
+    /// itself.
+    fn check(self) -> Result<(), Violation> {
+        match self {
+            Self::Unrecognized(value) => {
+                match Self::try_from(value) {
+                    Ok(Self::Unrecognized(_)) => Ok(()),
+                    Ok(_) => {
+                        Err(
+                            Violation::Rule(
+                                "an unrecognized value must not alias a recognized one",
+                            ),
+                        )
+                    }
+                    Err(violation) => Err(violation),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
 /// Validated form of `nv.telemetry.v1.AcquisitionStatus.FailureClass`.
 ///
 /// The unspecified value is unrepresentable: conversion rejects it, because
@@ -3203,6 +3270,7 @@ pub struct Reading {
     key: SignalKey,
     value: NumericValue,
     observed_at: Option<Timestamp>,
+    accumulation_start: Option<Timestamp>,
 }
 impl crate::canonical::Canonical for Reading {
     fn canonical_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -3214,6 +3282,10 @@ impl crate::canonical::Canonical for Reading {
             .then_with(|| crate::canonical::cmp_option(
                 self.observed_at.as_ref(),
                 other.observed_at.as_ref(),
+            ))
+            .then_with(|| crate::canonical::cmp_option(
+                self.accumulation_start.as_ref(),
+                other.accumulation_start.as_ref(),
             ))
     }
 }
@@ -3227,6 +3299,10 @@ impl crate::canonical::Digest for Reading {
             crate::canonical::tag(state, 3);
             crate::canonical::Digest::digest(element, state);
         }
+        if let Some(element) = &self.accumulation_start {
+            crate::canonical::tag(state, 4);
+            crate::canonical::Digest::digest(element, state);
+        }
         crate::canonical::end(state);
     }
 }
@@ -3237,6 +3313,9 @@ impl crate::encode::Emit for Reading {
         if let Some(element) = &self.observed_at {
             crate::encode::nested(3, element, buf);
         }
+        if let Some(element) = &self.accumulation_start {
+            crate::encode::nested(4, element, buf);
+        }
     }
     fn emitted_len(&self) -> usize {
         crate::encode::nested_len(1, &self.key)
@@ -3245,6 +3324,10 @@ impl crate::encode::Emit for Reading {
                 .observed_at
                 .as_ref()
                 .map_or(0, |element| crate::encode::nested_len(3, element))
+            + self
+                .accumulation_start
+                .as_ref()
+                .map_or(0, |element| crate::encode::nested_len(4, element))
     }
 }
 impl Reading {
@@ -3268,6 +3351,11 @@ impl Reading {
     pub fn observed_at(&self) -> Option<&Timestamp> {
         self.observed_at.as_ref()
     }
+    /// The `accumulation_start`, when present.
+    #[must_use]
+    pub fn accumulation_start(&self) -> Option<&Timestamp> {
+        self.accumulation_start.as_ref()
+    }
     fn check(&self) -> Result<(), Invalid> {
         rules::reading(self)?;
         Ok(())
@@ -3280,6 +3368,7 @@ pub struct ReadingBuilder {
     key: Option<SignalKey>,
     value: Option<NumericValue>,
     observed_at: Option<Timestamp>,
+    accumulation_start: Option<Timestamp>,
 }
 impl ReadingBuilder {
     /// Sets `key`.
@@ -3300,6 +3389,12 @@ impl ReadingBuilder {
         self.observed_at = Some(observed_at);
         self
     }
+    /// Sets `accumulation_start`.
+    #[must_use]
+    pub fn accumulation_start(mut self, accumulation_start: Timestamp) -> Self {
+        self.accumulation_start = Some(accumulation_start);
+        self
+    }
     /// Validates and builds.
     ///
     /// # Errors
@@ -3311,6 +3406,7 @@ impl ReadingBuilder {
             key: self.key.ok_or_else(|| Invalid::field("key", Violation::Absent))?,
             value: self.value.ok_or_else(|| Invalid::field("value", Violation::Absent))?,
             observed_at: self.observed_at,
+            accumulation_start: self.accumulation_start,
         };
         built.check()?;
         Ok(built)
@@ -3333,6 +3429,11 @@ impl TryFrom<wire::Reading> for Reading {
                 .map(Timestamp::try_from)
                 .transpose()
                 .map_err(|error| error.at("observed_at"))?,
+            accumulation_start: wire
+                .accumulation_start
+                .map(Timestamp::try_from)
+                .transpose()
+                .map_err(|error| error.at("accumulation_start"))?,
         };
         built.check()?;
         Ok(built)
@@ -3344,6 +3445,7 @@ impl From<Reading> for wire::Reading {
             key: Some(value.key.into()),
             value: Some(value.value.into()),
             observed_at: value.observed_at.map(Into::into),
+            accumulation_start: value.accumulation_start.map(Into::into),
         }
     }
 }
@@ -3880,6 +3982,7 @@ pub struct SignalDescriptor {
     kind: Option<String>,
     unit: Option<String>,
     range: Option<ValueRange>,
+    accumulation: Option<Accumulation>,
 }
 impl crate::canonical::Canonical for SignalDescriptor {
     fn canonical_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -3895,6 +3998,10 @@ impl crate::canonical::Canonical for SignalDescriptor {
             .then_with(|| crate::canonical::cmp_option(
                 self.range.as_ref(),
                 other.range.as_ref(),
+            ))
+            .then_with(|| crate::canonical::cmp_option(
+                self.accumulation.as_ref(),
+                other.accumulation.as_ref(),
             ))
     }
 }
@@ -3914,6 +4021,10 @@ impl crate::canonical::Digest for SignalDescriptor {
             crate::canonical::tag(state, 4);
             crate::canonical::Digest::digest(element, state);
         }
+        if let Some(value) = self.accumulation {
+            crate::canonical::tag(state, 5);
+            crate::canonical::i32_value(state, i32::from(value));
+        }
         crate::canonical::end(state);
     }
 }
@@ -3928,6 +4039,9 @@ impl crate::encode::Emit for SignalDescriptor {
         }
         if let Some(element) = &self.range {
             crate::encode::nested(4, element, buf);
+        }
+        if let Some(value) = self.accumulation {
+            ::prost::encoding::int32::encode(5, &i32::from(value), buf);
         }
     }
     fn emitted_len(&self) -> usize {
@@ -3944,6 +4058,12 @@ impl crate::encode::Emit for SignalDescriptor {
                 .range
                 .as_ref()
                 .map_or(0, |element| crate::encode::nested_len(4, element))
+            + self
+                .accumulation
+                .map_or(
+                    0,
+                    |value| ::prost::encoding::int32::encoded_len(5, &i32::from(value)),
+                )
     }
 }
 impl SignalDescriptor {
@@ -3972,6 +4092,11 @@ impl SignalDescriptor {
     pub fn range(&self) -> Option<&ValueRange> {
         self.range.as_ref()
     }
+    /// The `accumulation`, when present.
+    #[must_use]
+    pub fn accumulation(&self) -> Option<Accumulation> {
+        self.accumulation
+    }
     fn check(&self) -> Result<(), Invalid> {
         if let Some(element) = &self.kind {
             if element.is_empty() {
@@ -3999,6 +4124,11 @@ impl SignalDescriptor {
                 return Err(Invalid::field("unit", violation));
             }
         }
+        if let Some(value) = self.accumulation {
+            value
+                .check()
+                .map_err(|violation| Invalid::field("accumulation", violation))?;
+        }
         rules::signal_descriptor(self)?;
         Ok(())
     }
@@ -4011,6 +4141,7 @@ pub struct SignalDescriptorBuilder {
     kind: Option<String>,
     unit: Option<String>,
     range: Option<ValueRange>,
+    accumulation: Option<Accumulation>,
 }
 impl SignalDescriptorBuilder {
     /// Sets `key`.
@@ -4037,6 +4168,12 @@ impl SignalDescriptorBuilder {
         self.range = Some(range);
         self
     }
+    /// Sets `accumulation`.
+    #[must_use]
+    pub fn accumulation(mut self, accumulation: Accumulation) -> Self {
+        self.accumulation = Some(accumulation);
+        self
+    }
     /// Validates and builds.
     ///
     /// # Errors
@@ -4049,6 +4186,7 @@ impl SignalDescriptorBuilder {
             kind: self.kind,
             unit: self.unit,
             range: self.range,
+            accumulation: self.accumulation,
         };
         built.check()?;
         Ok(built)
@@ -4069,6 +4207,11 @@ impl TryFrom<wire::SignalDescriptor> for SignalDescriptor {
                 .map(ValueRange::try_from)
                 .transpose()
                 .map_err(|error| error.at("range"))?,
+            accumulation: wire
+                .accumulation
+                .map(Accumulation::try_from)
+                .transpose()
+                .map_err(|violation| Invalid::field("accumulation", violation))?,
         };
         built.check()?;
         Ok(built)
@@ -4081,6 +4224,7 @@ impl From<SignalDescriptor> for wire::SignalDescriptor {
             kind: value.kind,
             unit: value.unit,
             range: value.range.map(Into::into),
+            accumulation: value.accumulation.map(Into::into),
         }
     }
 }

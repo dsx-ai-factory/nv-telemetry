@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use nv_redfish_bmc_mock::Bmc;
 use nv_redfish_bmc_mock::Expect;
+use nv_telemetry_model::Accumulation;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::Coverage;
 use nv_telemetry_model::EndpointContext;
@@ -134,6 +135,7 @@ fn nominal_descriptor() -> SignalDescriptor {
     SignalDescriptor::builder()
         .key(key())
         .kind("temperature")
+        .accumulation(Accumulation::Instant)
         .unit("Cel")
         .range(
             ValueRange::builder()
@@ -360,6 +362,7 @@ async fn an_inverted_range_costs_the_range_and_nothing_else() {
     let descriptor = SignalDescriptor::builder()
         .key(key())
         .kind("temperature")
+        .accumulation(Accumulation::Instant)
         .unit("Cel")
         .build()
         .expect("a valid descriptor");
@@ -386,6 +389,7 @@ async fn one_bound_is_a_legal_range() {
     let descriptor = SignalDescriptor::builder()
         .key(key())
         .kind("temperature")
+        .accumulation(Accumulation::Instant)
         .unit("Cel")
         .range(
             ValueRange::builder()
@@ -412,6 +416,7 @@ async fn an_empty_unit_is_not_dimensionless() {
     let descriptor = SignalDescriptor::builder()
         .key(key())
         .kind("temperature")
+        .accumulation(Accumulation::Instant)
         .range(
             ValueRange::builder()
                 .min(double(0.0))
@@ -565,4 +570,51 @@ async fn a_transport_failure_is_classified_never_a_batch() {
 
     assert_eq!(failure.class(), AcquisitionFailureClass::Internal);
     assert_eq!(failure.retryable(), Some(false));
+}
+
+#[tokio::test]
+async fn an_energy_total_is_cumulative_and_dates_its_start() {
+    let acquired = acquire(URI, include_str!("fixtures/sensor/energy-with-reset.json")).await;
+
+    let descriptor = SignalDescriptor::builder()
+        .key(key())
+        .kind("energy")
+        .accumulation(Accumulation::Cumulative)
+        .unit("kW.h")
+        .build()
+        .expect("a valid descriptor");
+    let sample = Reading::builder()
+        .key(key())
+        .value(double(1200.5))
+        .accumulation_start(Timestamp::new(1_785_446_043, 0).expect("a valid instant"))
+        .build()
+        .expect("a valid reading");
+    assert_eq!(
+        acquired.batches(),
+        [readings_batch(descriptor, Some(sample))]
+    );
+    assert_eq!(acquired.issues(), &[]);
+}
+
+#[tokio::test]
+async fn a_reset_time_on_an_instant_reading_is_not_its_start() {
+    // `SensorResetTime` dates the peak here, not a running total.
+    let acquired = acquire(
+        URI,
+        include_str!("fixtures/sensor/temperature-with-reset.json"),
+    )
+    .await;
+
+    let descriptor = SignalDescriptor::builder()
+        .key(key())
+        .kind("temperature")
+        .accumulation(Accumulation::Instant)
+        .unit("Cel")
+        .build()
+        .expect("a valid descriptor");
+    assert_eq!(
+        acquired.batches(),
+        [readings_batch(descriptor, Some(nominal_sample()))]
+    );
+    assert_eq!(acquired.issues(), &[]);
 }

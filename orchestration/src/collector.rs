@@ -53,10 +53,10 @@ use crate::clock::Clock;
 use crate::clock::SharedClock;
 use crate::recipe::endpoint_subtree;
 use crate::recipe::EndpointPolicy;
-use crate::recipe::PollMeta;
 use crate::recipe::PollUnit;
 use crate::recipe::RecipeError;
 use crate::recipe::Seated;
+use crate::recipe::SubtreeMeta;
 use crate::report::AcquisitionReport;
 use crate::report::EndpointFault;
 use crate::stream::StreamUnit;
@@ -349,7 +349,7 @@ impl Timeline {
     }
 }
 
-type EndpointRuntime = Runtime<AcquisitionReport, EndpointFault, PollMeta>;
+type EndpointRuntime = Runtime<AcquisitionReport, EndpointFault, SubtreeMeta>;
 
 /// One endpoint's task: runs the endpoint until it is retired or nobody
 /// listens, then delivers the reports it holds and gives up its seat.

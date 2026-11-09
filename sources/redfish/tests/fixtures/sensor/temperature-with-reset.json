@@ -1,0 +1,11 @@
+{
+  "@odata.id": "/redfish/v1/Chassis/1U/Sensors/CPU1Temp",
+  "@odata.type": "#Sensor.v1_2_0.Sensor",
+  "Id": "CPU1Temp",
+  "Name": "CPU 1 Temperature",
+  "ReadingType": "Temperature",
+  "Reading": 47.5,
+  "ReadingUnits": "Cel",
+  "PeakReading": 61.0,
+  "SensorResetTime": "2026-07-30T21:14:03Z"
+}

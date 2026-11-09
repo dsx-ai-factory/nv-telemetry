@@ -9,6 +9,7 @@
 mod support;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use futures_util::StreamExt as _;
 use nv_redfish_bmc_mock::Bmc;
@@ -18,8 +19,13 @@ use nv_telemetry_model::Payload;
 use nv_telemetry_model::Severity;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_model::Value;
+use nv_telemetry_redfish::EventFrames;
 use nv_telemetry_redfish::EventStream;
 use nv_telemetry_redfish::RedfishService;
+use nv_telemetry_redfish::RedfishTransport;
+use nv_telemetry_redfish::ResumePosition;
+use nv_telemetry_redfish::StreamRun;
+use nv_telemetry_redfish::TransportFault;
 use nv_telemetry_redfish::GAP_LOCATOR;
 use nv_telemetry_redfish::METRIC_REPORT_LOCATOR;
 use nv_telemetry_redfish::PAYLOAD_LOCATOR;
@@ -108,14 +114,7 @@ fn metric_report(id: &str) -> Json {
 /// A stream over `payloads`, scripted after the root and the event service.
 async fn open(payloads: &[Json]) -> Vec<SubscriptionItem> {
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
-    bmc.expect(Expect::get(
-        ROOT,
-        include_str!("fixtures/events/service-root.json"),
-    ));
-    bmc.expect(Expect::get(
-        EVENT_SERVICE,
-        include_str!("fixtures/events/event-service.json"),
-    ));
+    expect_discovery(&bmc);
     bmc.expect(Expect::stream(SSE, Json::Array(payloads.to_vec())));
     let stream = EventStream::new(endpoint(), scripted(&bmc));
     let items = stream.perform().await.expect("the stream opens");
@@ -362,6 +361,13 @@ fn expect_connect(
     after: Option<&str>,
     events: Vec<(Option<&str>, Json)>,
 ) {
+    expect_discovery(bmc);
+    bmc.expect(Expect::stream_events(SSE, after, events));
+}
+
+/// The reads a connect attempt makes before it opens the stream: the root,
+/// then the event service it names.
+fn expect_discovery(bmc: &Bmc<nv_redfish_bmc_mock::Error>) {
     bmc.expect(Expect::get(
         ROOT,
         include_str!("fixtures/events/service-root.json"),
@@ -370,7 +376,6 @@ fn expect_connect(
         EVENT_SERVICE,
         include_str!("fixtures/events/event-service.json"),
     ));
-    bmc.expect(Expect::stream_events(SSE, after, events));
 }
 
 /// The run a batch's scope names.
@@ -433,14 +438,7 @@ async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
     // its own run, since nothing says how their event ids relate.
     let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
     for _ in 0..2 {
-        bmc.expect(Expect::get(
-            ROOT,
-            include_str!("fixtures/events/service-root.json"),
-        ));
-        bmc.expect(Expect::get(
-            EVENT_SERVICE,
-            include_str!("fixtures/events/event-service.json"),
-        ));
+        expect_discovery(&bmc);
         bmc.expect(Expect::stream(SSE, Json::Array(vec![powered_on(7)])));
     }
     let stream = EventStream::new(endpoint(), scripted(&bmc));
@@ -472,4 +470,101 @@ async fn a_root_without_an_event_service_cannot_stream() {
         .expect("no event service, no stream");
     assert_eq!(error.class(), AcquisitionFailureClass::Unsupported);
     assert_eq!(error.retryable(), Some(false));
+}
+
+/// The scripted transport, its next stream open answered with a status.
+struct Refusing {
+    inner: MockTransport,
+    refusal: Mutex<Option<u16>>,
+}
+
+impl RedfishTransport for Refusing {
+    async fn get(&self, uri: &str) -> Result<Json, TransportFault> {
+        self.inner.get(uri).await
+    }
+
+    async fn events(
+        &self,
+        uri: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<EventFrames, TransportFault> {
+        if let Some(status) = self.refusal.lock().expect("not poisoned").take() {
+            return Err(TransportFault::Status(status));
+        }
+        self.inner.events(uri, last_event_id).await
+    }
+}
+
+/// A stream handed a position after event 41 of `run-a`, over a device
+/// that answers its first stream open with `status`.
+fn resuming_after_41(
+    bmc: &Arc<Bmc<nv_redfish_bmc_mock::Error>>,
+    status: u16,
+) -> EventStream<Refusing> {
+    expect_discovery(bmc);
+    let transport = Refusing {
+        inner: MockTransport::scripted(bmc),
+        refusal: Mutex::new(Some(status)),
+    };
+    let handed = ResumePosition::new("41", StreamRun::new("run-a").expect("a short run"))
+        .expect("a non-empty id");
+    EventStream::new(endpoint(), Arc::new(RedfishService::new(transport)))
+        .with_resume_position(handed)
+}
+
+#[tokio::test]
+async fn a_refused_position_is_dropped_and_the_stream_opens_live() {
+    // A restarted device refuses the id the stream resumes after. The same
+    // attempt opens live in a new run, its first item the gap the refusal
+    // left.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let stream = resuming_after_41(&bmc, 400);
+    bmc.expect(Expect::stream_events(
+        SSE,
+        None,
+        vec![(Some("1"), powered_on(1))],
+    ));
+
+    let items: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream opens live")
+        .collect()
+        .await;
+    assert_eq!(
+        items.len(),
+        3,
+        "the gap, one payload, then the stream's end"
+    );
+    assert_eq!(
+        parts(&items[0]).issues()[0],
+        ProjectionIssue::invalid(
+            GAP_LOCATOR,
+            "the device refused to resume after event 41; events since may be missing, \
+             and the polled log fills the gap",
+        )
+    );
+    assert_ne!(run_of(&items[1]), "run-a", "a new run");
+    assert_eq!(
+        stream
+            .resume_position()
+            .map(|position| position.last_event_id().to_owned()),
+        Some("1".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn any_other_failed_resume_keeps_the_position() {
+    // Only a refusal drops the position: a device that is briefly
+    // unavailable is resumed after the same id, in the same run.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    let stream = resuming_after_41(&bmc, 503);
+    let handed = stream.resume_position();
+
+    stream
+        .perform()
+        .await
+        .err()
+        .expect("the device is unavailable");
+    assert_eq!(stream.resume_position(), handed);
 }

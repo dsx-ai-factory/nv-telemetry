@@ -986,9 +986,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acd6484a6e5b88755fad4b0e2ba36c4bda0b701ba0946487988b151c6fd6a884"
+checksum = "48030567dcea6676a4c09ae4590df9a7644ab65533a4b6768ea5ba7e97abec02"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1004,17 +1004,15 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-bmc-http"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a50c9200ed52f628439eff21bb9504f168056e4004db90463593c74ed8935ff0"
+checksum = "b401beae283041fa586422c6b815daa3f60a73d74c40317acc23f5a662edfc85"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
  "http",
  "nv-redfish-core",
- "nv-redfish-csdl-compiler",
- "nv-redfish-schema",
  "reqwest",
  "serde",
  "serde_json",
@@ -1029,9 +1027,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-bmc-mock"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed8e4c36ed1f1f23c8e4ac98f46128e4f55e43c8f4938d885b6dfc3ad6e24e0"
+checksum = "e212d5542cbf92895a27504f8b5e0d6dc9fc2a891bf09ae6bc14c78143a6ff1b"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1042,9 +1040,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-core"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6504b43da56399b23255783ddd7c72e717f1d5dcf00113aa5fa5833ac19e11"
+checksum = "b9870fb103f830a1bcfd751aca75ebbcf321b2644f32f955dcaa3446d6c66a9e"
 dependencies = [
  "futures-core",
  "futures-io",
@@ -1058,9 +1056,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-csdl-compiler"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cc5b5991c63249233f89d58af7316fa18a12e7bd06a7eb99e8b4b3ee3727501"
+checksum = "350d328b929c48202a0f37464ea3418128e61660b0f5b45772f57ff0b652c252"
 dependencies = [
  "clap",
  "clap_derive",
@@ -1076,9 +1074,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-dispatcher"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b200ff267925477a2341cf2d29e39e57714b3bab91ceed2ce8d1a990274e553"
+checksum = "ae405af6cb426bcbaf6defac536697157834799d372f48b48708b13700db5293"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1086,21 +1084,22 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-quirks"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2682e8ad23f717d94460dfc57e3c418a53bf79fc8c3305a31b2f2f5474f177c2"
+checksum = "4f2eaa1367b5dafc8c3107848b634773fe98b60dd8e3fa9c09c647a1654a7d32"
 dependencies = [
  "futures-util",
  "nv-redfish-core",
  "serde",
  "serde_json",
+ "serde_path_to_error",
 ]
 
 [[package]]
 name = "nv-redfish-schema"
-version = "0.20.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ed4cfdf4afa05b3c96b3663d9694c2e05ab7fe1014e87f3e067be6d91a447b1"
+checksum = "12b683cd72e1962b4ae64a03641ac846f981db4a97bb082fa9340b23a2b983b1"
 dependencies = [
  "glob",
 ]
@@ -2002,6 +2001,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2025,15 +2030,18 @@ dependencies = [
 
 [[package]]
 name = "sse-stream"
-version = "0.2.5"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c123f296ade4ec4b8b0f6162116e6629f5146922ca5ab40ca9d3c2e73ab4761e"
+checksum = "d385160fc0fba84f7b9cc8ef3263e410d0e3ca7ab4927f1356df33145ace69a4"
 dependencies = [
  "bytes",
  "futures-util",
  "http-body",
  "http-body-util",
+ "memchr",
  "pin-project-lite",
+ "simdutf8",
+ "thiserror",
 ]
 
 [[package]]

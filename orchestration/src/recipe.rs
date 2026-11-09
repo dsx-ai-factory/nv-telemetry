@@ -6,8 +6,10 @@
 //!
 //! The milestone-1 slice of the architecture's admission stack — endpoint
 //! admission over the endpoint breaker over the rate bucket over the unit
-//! leaves. Units of different request classes share one round-robin
-//! ring; per-class lanes and the class breaker are deliberately absent
+//! leaves. Stream connects take priority over polls, so a stream opens
+//! as soon as the bucket admits anything, not behind a round of polls;
+//! within each, units of different request classes share one round-robin
+//! ring. Per-class lanes and the class breaker are deliberately absent
 //! until class-level policy exists. The collector seats each subtree on
 //! its own runtime; policy types here convert privately into dispatcher
 //! configuration, so the dispatcher's own vocabulary never leaks into
@@ -23,11 +25,13 @@ use nv_redfish_dispatcher::schedulers::CircuitBreaker;
 use nv_redfish_dispatcher::schedulers::CircuitBreakerConfig;
 use nv_redfish_dispatcher::schedulers::FixedCost;
 use nv_redfish_dispatcher::schedulers::PeriodicLeaf;
-use nv_redfish_dispatcher::schedulers::RoundRobin;
+use nv_redfish_dispatcher::schedulers::StrictPriority;
 use nv_redfish_dispatcher::schedulers::TokenBucket;
 use nv_redfish_dispatcher::schedulers::TokenBucketConfig;
 use nv_redfish_dispatcher::CostUnits;
+use nv_redfish_dispatcher::Scheduler;
 use nv_redfish_dispatcher::WithCost;
+use nv_redfish_dispatcher::WithPriority;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Origin;
 use nv_telemetry_source::Acquire;
@@ -188,14 +192,32 @@ impl EndpointPolicy {
     }
 }
 
-/// The meta every unit under an endpoint subtree carries.
-pub(crate) type PollMeta = WithCost<()>;
+/// The meta every unit leaf carries.
+type UnitMeta = WithCost<()>;
+
+/// The meta an endpoint subtree hands its runtime.
+pub(crate) type SubtreeMeta = WithPriority<UnitMeta>;
+
+/// One unit leaf, polled or streamed.
+type Unit = Box<dyn Scheduler<TelemetryWork, Meta = UnitMeta>>;
+
+/// Stream connects over polls; the units of each class share its
+/// round-robin ring.
+type Units = StrictPriority<TelemetryWork, Unit>;
+
+/// Priority class of stream connects. A connect is rare, since its
+/// reconnect policy backs off, and cheap; a stream that waits behind
+/// polls misses the events sent before it opens.
+const STREAM_PRIORITY: u8 = 1;
+
+/// Priority class of polls.
+const POLL_PRIORITY: u8 = 0;
 
 /// The standard endpoint subtree: endpoint admission over the endpoint
 /// breaker over the rate bucket over the unit leaves.
 pub(crate) type EndpointSubtree = BoundedConcurrency<
     TelemetryWork,
-    CircuitBreaker<TelemetryWork, TokenBucket<TelemetryWork, RoundRobin<TelemetryWork, PollMeta>>>,
+    CircuitBreaker<TelemetryWork, TokenBucket<TelemetryWork, Units>>,
 >;
 
 /// One endpoint's subtree, ready for its runtime, and the reports of the
@@ -398,9 +420,9 @@ impl std::fmt::Debug for PollUnit {
 /// Builds one endpoint's subtree from its planned polls and streams, each
 /// bound to its unit and stamping on `clock`. Leaf epochs and the bucket
 /// epoch are `now`, on the timeline of the runtime that will drive the
-/// subtree. Units of different request classes, polled or
-/// streamed, share the round-robin ring; per-class lanes and the class
-/// breaker remain deliberately absent.
+/// subtree. Stream connects are taken before polls; within each, units of
+/// different request classes share a round-robin ring. Per-class lanes and
+/// the class breaker remain deliberately absent.
 ///
 /// # Errors
 ///
@@ -427,7 +449,7 @@ pub(crate) fn endpoint_subtree(
     let polled = !units.is_empty();
     validate(policy)?;
 
-    let mut lanes = RoundRobin::new();
+    let mut by_priority: Units = StrictPriority::new();
     for unit in units {
         let planned = &unit.planned;
         if planned.endpoint().endpoint_id() != subtree_endpoint {
@@ -452,7 +474,7 @@ pub(crate) fn endpoint_subtree(
         let work = unit.work;
         let clock = Arc::clone(clock);
         let leaf = PeriodicLeaf::new(now, planned.cadence(), move || work(&clock));
-        lanes.add_child(FixedCost::new(cost, leaf));
+        by_priority.add_child(Box::new(FixedCost::new(cost, leaf)), POLL_PRIORITY);
     }
     let mut reports = Vec::with_capacity(streams.len());
     for stream in streams {
@@ -478,7 +500,7 @@ pub(crate) fn endpoint_subtree(
         validate_reconnect(stream.policy())?;
         let cost = CostUnits::new(planned.cost());
         let (leaf, stream_reports) = stream.bind(clock);
-        lanes.add_child(FixedCost::new(cost, leaf));
+        by_priority.add_child(Box::new(FixedCost::new(cost, leaf)), STREAM_PRIORITY);
         reports.push(stream_reports);
     }
 
@@ -486,7 +508,7 @@ pub(crate) fn endpoint_subtree(
         policy.max_in_flight,
         CircuitBreaker::new(
             breaker_config(&policy.breaker),
-            TokenBucket::new(now, bucket_config(&policy.rate), lanes),
+            TokenBucket::new(now, bucket_config(&policy.rate), by_priority),
         ),
     );
     Ok(Seated {

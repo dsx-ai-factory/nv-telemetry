@@ -64,6 +64,44 @@ projections {
     value_map { from: "Valve" to: "valve" }
   }
   # UCUM per DMTF; verbatim passthrough.
+  # Energy is the one total a Redfish sensor accumulates; every other
+  # reading type is the value now.
+  fields {
+    source_path: "ReadingType"
+    target_field: "accumulation"
+    null_policy: NULL_POLICY_ABSENT
+    value_map { from: "Temperature" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Humidity" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Power" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "EnergykWh" to: "ACCUMULATION_CUMULATIVE" }
+    value_map { from: "EnergyJoules" to: "ACCUMULATION_CUMULATIVE" }
+    value_map { from: "EnergyWh" to: "ACCUMULATION_CUMULATIVE" }
+    value_map { from: "ChargeAh" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Voltage" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Current" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Frequency" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Pressure" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "PressurekPa" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "PressurePa" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "LiquidLevel" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Rotational" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "AirFlow" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "AirFlowCMM" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "LiquidFlow" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "LiquidFlowLPM" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Barometric" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Altitude" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Percent" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "AbsoluteHumidity" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Heat" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "LinearPosition" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "LinearVelocity" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "LinearAcceleration" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "RotationalPosition" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "RotationalVelocity" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "RotationalAcceleration" to: "ACCUMULATION_INSTANT" }
+    value_map { from: "Valve" to: "ACCUMULATION_INSTANT" }
+  }
   fields {
     source_path: "ReadingUnits"
     target_field: "unit"
@@ -91,6 +129,13 @@ projections {
     source_path: "Reading"
     target_field: "value.double_value"
     anchor: true
+    null_policy: NULL_POLICY_ABSENT
+  }
+  # When the device last reset its time-based properties. The provider
+  # keeps it only on a running total, whose start it is.
+  fields {
+    source_path: "SensorResetTime"
+    target_field: "accumulation_start"
     null_policy: NULL_POLICY_ABSENT
   }
 }

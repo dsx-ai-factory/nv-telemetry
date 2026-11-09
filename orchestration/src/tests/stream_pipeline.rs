@@ -48,8 +48,9 @@ use crate::clock::SharedClock;
 use crate::plan;
 use crate::recipe::endpoint_subtree;
 use crate::recipe::EndpointSubtree;
-use crate::recipe::PollMeta;
+use crate::recipe::RatePolicy;
 use crate::recipe::Seated;
+use crate::recipe::SubtreeMeta;
 use crate::report::EndpointFault;
 use crate::stream::StreamReport;
 use crate::stream::StreamReports;
@@ -73,7 +74,7 @@ const STREAM_CLASS: &str = "fixture-subscribe";
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(8);
 
-type StreamRuntime = Runtime<AcquisitionReport, EndpointFault, PollMeta>;
+type StreamRuntime = Runtime<AcquisitionReport, EndpointFault, SubtreeMeta>;
 type Connect = Result<Vec<SubscriptionItem>, AcquisitionFailure>;
 
 fn endpoint() -> EndpointContext {
@@ -728,6 +729,46 @@ fn a_poll_and_a_stream_share_one_endpoints_subtree() {
     assert_eq!(report.status().request_class(), STREAM_CLASS);
     assert!(next(&mut reports).is_pending());
     assert_eq!(sleep_deadline(&mut runtime), manual.now() + FIRST_RETRY);
+}
+
+#[test]
+fn a_stream_connects_before_due_polls() {
+    let manual = ManualClock::new();
+    let clock = TestClock::shared(&manual);
+    let unit = FixtureSubscription::scripted(endpoint(), vec![Ok(vec![Ok(states_parts())])]);
+    let stream = StreamUnit::new(planned_stream(endpoint(), STREAM_PROVIDER), unit, policy());
+    // One token, refilled slowly: whatever runs first spends it.
+    let rate = RatePolicy::default()
+        .with_burst(1)
+        .with_refill(1, Duration::from_secs(10));
+    // The reports stay held: dropping them would stop the stream before
+    // it connects.
+    let Seated {
+        subtree,
+        streams: _reports,
+        ..
+    } = endpoint_subtree(
+        &EndpointPolicy::default().with_rate(rate),
+        &clock,
+        clock.instant(),
+        vec![planned_poll(endpoint())],
+        vec![stream],
+    )
+    .expect("a poll and a stream on one endpoint form a subtree");
+    let mut runtime = runtime(subtree, &manual);
+
+    // The poll was seated first and both are due, yet the connect takes
+    // the only token; the poll waits for the refill.
+    match drive(&mut runtime) {
+        Some(RuntimeOutput::Work { result, .. }) => {
+            assert!(result.expect("the connect succeeds").is_empty());
+        }
+        _ => panic!("the connect runs first"),
+    }
+    assert_eq!(
+        sleep_deadline(&mut runtime),
+        manual.now() + Duration::from_secs(10)
+    );
 }
 
 #[test]

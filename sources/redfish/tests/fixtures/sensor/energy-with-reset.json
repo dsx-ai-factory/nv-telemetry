@@ -1,0 +1,10 @@
+{
+  "@odata.id": "/redfish/v1/Chassis/1U/Sensors/CPU1Temp",
+  "@odata.type": "#Sensor.v1_2_0.Sensor",
+  "Id": "CPU1Temp",
+  "Name": "Energy since reset",
+  "ReadingType": "EnergykWh",
+  "Reading": 1200.5,
+  "ReadingUnits": "kW.h",
+  "SensorResetTime": "2026-07-30T21:14:03Z"
+}

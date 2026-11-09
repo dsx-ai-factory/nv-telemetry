@@ -168,6 +168,16 @@ fn classify_status(status: u16) -> AcquisitionFailure {
         .with_detail(format!("HTTP {status}"))
 }
 
+/// Whether a stream open that resumed after an event id was refused for that
+/// id: the 400 the mock gives for an id outside its history. On a plain GET,
+/// the table above reads 400 as a device quirk.
+pub(crate) fn refuses_position(error: &RepairError<LinkError>) -> bool {
+    matches!(
+        error,
+        RepairError::Transport(LinkError::Transport(TransportFault::Status(400)))
+    )
+}
+
 /// The link's failures: the transport's fault as its table says, a
 /// document that did not match its type as a protocol answer, and a refused
 /// write as this crate's bug.

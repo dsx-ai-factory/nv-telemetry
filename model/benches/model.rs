@@ -45,6 +45,7 @@ mod unix {
     use gungraun::Callgrind;
     use gungraun::EventKind;
     use gungraun::LibraryBenchmarkConfig;
+    use nv_telemetry_model::Accumulation;
     use nv_telemetry_model::AcquisitionStatus;
     use nv_telemetry_model::Completeness;
     use nv_telemetry_model::Coverage;
@@ -130,34 +131,52 @@ mod unix {
             .expect("a valid batch")
     }
 
+    /// What the readings measure.
+    #[derive(Clone, Copy)]
+    enum Signals {
+        /// Temperatures: values now.
+        Instant,
+        /// Energy totals, each sample dating the device's start.
+        Cumulative,
+    }
+
     /// Descriptor and sample vectors for `count` distinct signals, the parts
     /// a source has in hand before batch assembly.
-    fn reading_parts(count: usize) -> (Vec<SignalDescriptor>, Vec<Reading>) {
+    fn reading_parts(count: usize, signals: Signals) -> (Vec<SignalDescriptor>, Vec<Reading>) {
+        let start = Timestamp::new(1_785_000_000, 0).expect("a valid instant");
         let descriptors = (0..count)
             .map(|index| {
-                SignalDescriptor::builder()
-                    .key(key(index))
-                    .kind("temperature")
-                    .unit("Cel")
-                    .build()
-                    .expect("a valid descriptor")
+                let descriptor = SignalDescriptor::builder().key(key(index));
+                match signals {
+                    Signals::Instant => descriptor.kind("temperature").unit("Cel"),
+                    Signals::Cumulative => descriptor
+                        .kind("energy")
+                        .unit("kW.h")
+                        .accumulation(Accumulation::Cumulative),
+                }
+                .build()
+                .expect("a valid descriptor")
             })
             .collect();
         #[allow(clippy::cast_precision_loss)]
         let samples = (0..count)
             .map(|index| {
-                Reading::builder()
+                let reading = Reading::builder()
                     .key(key(index))
-                    .value(NumericValue::double(20.0 + index as f64 / 8.0).expect("finite"))
-                    .build()
-                    .expect("a valid reading")
+                    .value(NumericValue::double(20.0 + index as f64 / 8.0).expect("finite"));
+                match signals {
+                    Signals::Instant => reading,
+                    Signals::Cumulative => reading.accumulation_start(start),
+                }
+                .build()
+                .expect("a valid reading")
             })
             .collect();
         (descriptors, samples)
     }
 
-    fn reading_batch(count: usize) -> ObservationBatch {
-        let (descriptors, samples) = reading_parts(count);
+    fn reading_batch(count: usize, signals: Signals) -> ObservationBatch {
+        let (descriptors, samples) = reading_parts(count, signals);
         batch(Payload::Readings(
             Readings::builder()
                 .descriptors(descriptors)
@@ -251,7 +270,8 @@ mod unix {
     // --- boundary: the process edge ---
 
     #[library_benchmark]
-    #[bench::readings_bulk(reading_batch(BULK).encode_to_vec())]
+    #[bench::readings_bulk(reading_batch(BULK, Signals::Instant).encode_to_vec())]
+    #[bench::cumulative_bulk(reading_batch(BULK, Signals::Cumulative).encode_to_vec())]
     #[bench::graph(graph_batch().encode_to_vec())]
     pub fn decode(bytes: Vec<u8>) -> ObservationBatch {
         black_box(ObservationBatch::decode(&bytes).expect("a valid batch"))
@@ -261,7 +281,7 @@ mod unix {
     // per benchmark and a one-reading batch needs the micro one.
     #[library_benchmark(config = LibraryBenchmarkConfig::default()
         .tool(Callgrind::default().soft_limits([(EventKind::Ir, MICRO_IR_LIMIT)])))]
-    #[bench::readings_small(reading_batch(1).encode_to_vec())]
+    #[bench::readings_small(reading_batch(1, Signals::Instant).encode_to_vec())]
     pub fn decode_small(bytes: Vec<u8>) -> ObservationBatch {
         black_box(ObservationBatch::decode(&bytes).expect("a valid batch"))
     }
@@ -274,7 +294,8 @@ mod unix {
     }
 
     #[library_benchmark]
-    #[bench::readings_bulk(reading_batch(BULK))]
+    #[bench::readings_bulk(reading_batch(BULK, Signals::Instant))]
+    #[bench::cumulative_bulk(reading_batch(BULK, Signals::Cumulative))]
     #[bench::graph(graph_batch())]
     pub fn encode(batch: ObservationBatch) -> Vec<u8> {
         black_box(batch.encode_to_vec())
@@ -284,7 +305,7 @@ mod unix {
     // measured cost of duplicating the representation, which is what any
     // future by-value boundary would pay.
     #[library_benchmark]
-    #[bench::readings_bulk(reading_batch(BULK))]
+    #[bench::readings_bulk(reading_batch(BULK, Signals::Instant))]
     #[bench::graph(graph_batch())]
     pub fn clone_batch(batch: ObservationBatch) -> ObservationBatch {
         black_box(batch.clone())
@@ -320,7 +341,8 @@ mod unix {
     // cost — presence, bounds, the descriptor uniqueness set, and the
     // sample-key resolution rule.
     #[library_benchmark]
-    #[bench::bulk(reading_parts(BULK))]
+    #[bench::bulk(reading_parts(BULK, Signals::Instant))]
+    #[bench::cumulative_bulk(reading_parts(BULK, Signals::Cumulative))]
     pub fn build_readings(parts: (Vec<SignalDescriptor>, Vec<Reading>)) -> Readings {
         let (descriptors, samples) = parts;
         black_box(

@@ -151,10 +151,11 @@ message SignalKey {
 }
 
 message SignalDescriptor {
-  optional SignalKey  key   = 1;  // required
-  optional string     kind  = 2;  // ≤128,  what it measures
-  optional string     unit  = 3;  // ≤64,   UCUM
-  optional ValueRange range = 4;  //        what the sensor CAN read
+  optional SignalKey    key          = 1;  // required
+  optional string       kind         = 2;  // ≤128,  what it measures
+  optional string       unit         = 3;  // ≤64,   UCUM
+  optional ValueRange   range        = 4;  //        what the sensor CAN read
+  optional Accumulation accumulation = 5;  //        INSTANT | CUMULATIVE
 }
 ```
 
@@ -176,6 +177,16 @@ whose units it does not know, and an absent unit collapsing into "no unit" is
 how a temperature gets averaged with a fan speed. A projection sets `"1"` only
 when the source's type says so (a YANG counter is a count); it never guesses it
 for a bare number.
+
+`accumulation` says whether a sample is the value now (`INSTANT`: a
+temperature, a power draw) or a total the device accumulates (`CUMULATIVE`:
+energy, error counts), so a consumer can export the first as a gauge and the
+second as a counter. Absent means the source did not say. A running total
+falls when the device resets it, and a sample may carry the device's own
+`accumulation_start`, which a reset moves; a signal that is instant, or does
+not say, has none. It is the device's epoch: a collector's or exporter's start
+never stands in for it. Redfish marks energy sensors cumulative and
+carries their `SensorResetTime`; every other reading type is instant.
 
 A `Readings` payload carries its descriptors alongside its samples, so a batch
 is self-describing: a consumer arriving mid-stream, or reading one batch out

@@ -445,6 +445,46 @@ pub struct SignalDescriptor {
     pub unit: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]
     pub range: ::core::option::Option<ValueRange>,
+    /// Whether a sample is the signal's current value or a running total. Absent
+    /// when the source does not say; never UNSPECIFIED.
+    #[prost(enumeration = "Accumulation", optional, tag = "5")]
+    pub accumulation: ::core::option::Option<i32>,
+}
+/// How a signal's samples relate over time. A consumer exports a running total
+/// as a counter, which rates and sums correctly across scrapes, and a current
+/// value as a gauge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Accumulation {
+    Unspecified = 0,
+    /// The value now, which may rise or fall: a temperature, a power draw.
+    Instant = 1,
+    /// A total the device accumulates, such as energy or error counts. It only
+    /// grows, except when the device resets it, which a sample may date with
+    /// `Reading.accumulation_start`.
+    Cumulative = 2,
+}
+impl Accumulation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ACCUMULATION_UNSPECIFIED",
+            Self::Instant => "ACCUMULATION_INSTANT",
+            Self::Cumulative => "ACCUMULATION_CUMULATIVE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ACCUMULATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "ACCUMULATION_INSTANT" => Some(Self::Instant),
+            "ACCUMULATION_CUMULATIVE" => Some(Self::Cumulative),
+            _ => None,
+        }
+    }
 }
 /// One numeric sample. A reading always has a value: a sensor that answered
 /// without one is reporting state, not a reading, and state is its own payload
@@ -459,6 +499,12 @@ pub struct Reading {
     /// batch window covers samples that carry no time of their own.
     #[prost(message, optional, tag = "3")]
     pub observed_at: ::core::option::Option<Timestamp>,
+    /// When the device began accumulating a running total, as the source reports
+    /// it; a reset moves it. A signal that is instant, or does not say, has none
+    /// — a wrapper rule — and a collector's or exporter's start never stands in
+    /// for it.
+    #[prost(message, optional, tag = "4")]
+    pub accumulation_start: ::core::option::Option<Timestamp>,
 }
 /// The readings payload domain.
 #[derive(Clone, PartialEq, ::prost::Message)]

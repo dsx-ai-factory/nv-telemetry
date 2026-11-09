@@ -66,13 +66,17 @@ mod unix {
     use nv_telemetry_orchestration::Plan;
     use nv_telemetry_orchestration::PollNeed;
     use nv_telemetry_orchestration::PollUnit;
+    use nv_telemetry_orchestration::ReconnectPolicy;
     use nv_telemetry_orchestration::Reports;
+    use nv_telemetry_orchestration::StreamNeed;
+    use nv_telemetry_orchestration::StreamUnit;
     use nv_telemetry_source::Acquire;
     use nv_telemetry_source::AcquisitionFailure;
     use nv_telemetry_source::AcquisitionFailureClass;
     use nv_telemetry_source::AcquisitionParts;
     use nv_telemetry_source::ProjectionIssue;
     use nv_telemetry_source::ProviderDeclaration;
+    use nv_telemetry_source::SubscriptionItem;
 
     /// Needs in a fleet-size plan: endpoints × sensors an embedder might
     /// resolve in one configuration pass.
@@ -92,6 +96,8 @@ mod unix {
 
     const PROVIDER: &str = "redfish.sensor.odata";
     const REQUEST_CLASS: &str = "sensor-read";
+    const STREAM_PROVIDER: &str = "redfish.event-service.sse";
+    const STREAM_CLASS: &str = "event-stream";
     const BASE_SECONDS: i64 = 1_785_621_243;
 
     fn endpoint() -> EndpointContext {
@@ -109,8 +115,39 @@ mod unix {
             .expect("a valid origin")
     }
 
+    fn stream_origin() -> Origin {
+        Origin::builder()
+            .provider(STREAM_PROVIDER)
+            .request_class(STREAM_CLASS)
+            .build()
+            .expect("a valid origin")
+    }
+
     fn declaration() -> ProviderDeclaration {
         ProviderDeclaration::polled(PROVIDER, REQUEST_CLASS, 1)
+    }
+
+    /// A stream that opens and then stays quiet, as an idle event service
+    /// does: once connected, its leaf only sits beside the polls.
+    struct IdleStream {
+        endpoint: EndpointContext,
+        origin: Origin,
+    }
+
+    impl Acquire for IdleStream {
+        type Output = futures_util::stream::Pending<SubscriptionItem>;
+
+        fn endpoint(&self) -> &EndpointContext {
+            &self.endpoint
+        }
+
+        fn origin(&self) -> &Origin {
+            &self.origin
+        }
+
+        async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+            Ok(futures_util::stream::pending())
+        }
     }
 
     /// A unit whose every acquisition is a stored clone: the leaf costs
@@ -207,6 +244,28 @@ mod unix {
         EndpointUnits::new(EndpointPolicy::default()).with_polls(polls)
     }
 
+    /// `units` with an event stream seated beside the polls.
+    fn with_stream(units: EndpointUnits) -> EndpointUnits {
+        let plan = plan(
+            Needs::default().with_streams([StreamNeed::new(endpoint(), STREAM_CLASS)]),
+            &[ProviderDeclaration::streamed(
+                STREAM_PROVIDER,
+                STREAM_CLASS,
+                3,
+            )],
+        )
+        .expect("the declaration streams");
+        let unit = Arc::new(IdleStream {
+            endpoint: endpoint(),
+            origin: stream_origin(),
+        });
+        units.with_streams([StreamUnit::new(
+            plan.streams()[0].clone(),
+            unit,
+            ReconnectPolicy::default(),
+        )])
+    }
+
     /// A collector on a one-thread tokio runtime with its clock paused.
     struct Rig {
         tokio: tokio::runtime::Runtime,
@@ -240,21 +299,33 @@ mod unix {
     /// An endpoint whose first round has been delivered: its next report
     /// is a steady-state poll, one cadence away.
     fn steady(count: usize, outcome: Result<AcquisitionParts, AcquisitionFailure>) -> Rig {
+        settled(units(count, &outcome), count)
+    }
+
+    /// `steady`, with an open event stream that has nothing to say.
+    fn steady_with_stream(count: usize) -> Rig {
+        settled(
+            with_stream(units(count, &Ok(states_parts(Vec::new())))),
+            count,
+        )
+    }
+
+    fn settled(units: EndpointUnits, polls: usize) -> Rig {
         let mut rig = rig();
         {
             let _entered = rig.tokio.enter();
             rig.collector
-                .add(units(count, &outcome))
+                .add(units)
                 .expect("the units form an endpoint");
         }
-        for _ in 0..count {
+        for _ in 0..polls {
             next(&mut rig);
         }
         rig
     }
 
-    fn adding(count: usize) -> (Rig, EndpointUnits) {
-        (rig(), units(count, &Ok(states_parts(Vec::new()))))
+    fn adding(units: EndpointUnits) -> (Rig, EndpointUnits) {
+        (rig(), units)
     }
 
     // --- deliver: one steady-state poll, timer to consumer ---
@@ -281,6 +352,7 @@ mod unix {
     // the strict default while the one-unit poll needs the micro one.
     #[library_benchmark]
     #[bench::dense_erased(steady(ENDPOINT_UNITS, Ok(states_parts(Vec::new()))))]
+    #[bench::dense_with_stream(steady_with_stream(ENDPOINT_UNITS))]
     pub fn deliver_report_dense(mut rig: Rig) -> (Rig, Collected) {
         let collected = black_box(next(&mut rig));
         (rig, collected)
@@ -298,7 +370,11 @@ mod unix {
     }
 
     #[library_benchmark]
-    #[bench::erased_chassis(adding(ENDPOINT_UNITS))]
+    #[bench::erased_chassis(adding(units(ENDPOINT_UNITS, &Ok(states_parts(Vec::new())))))]
+    #[bench::chassis_with_stream(adding(with_stream(units(
+        ENDPOINT_UNITS,
+        &Ok(states_parts(Vec::new()))
+    ))))]
     pub fn add_endpoint((rig, units): (Rig, EndpointUnits)) -> Rig {
         {
             let _entered = rig.tokio.enter();

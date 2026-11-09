@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
+use crate::Accumulation;
 use crate::AcquisitionStatus;
 use crate::Completeness;
 use crate::Coverage;
@@ -115,22 +116,37 @@ pub(crate) fn reading(_reading: &Reading) -> Result<(), Invalid> {
 
 /// "Every key referenced by a sample must resolve here — a wrapper rule — so
 /// a batch is self-describing to a consumer that arrives mid-stream or reads
-/// it out of storage."
+/// it out of storage." And `Reading.accumulation_start`: "A signal that is
+/// instant, or does not say, has none — a wrapper rule."
 pub(crate) fn readings(readings: &Readings) -> Result<(), Invalid> {
     // Canonicalization has already sorted `descriptors`, and the key is the
     // canonical order's most significant field, so resolution is a binary
     // search over what is in hand — the set this rule once built duplicated,
     // measurably, the one the uniqueness check had just thrown away.
+    let descriptors = readings.descriptors();
     for (index, sample) in readings.samples().iter().enumerate() {
-        let described = readings
-            .descriptors()
-            .binary_search_by(|descriptor| descriptor.key().cmp(sample.key()))
-            .is_ok();
-        if !described {
+        let Ok(found) =
+            descriptors.binary_search_by(|descriptor| descriptor.key().cmp(sample.key()))
+        else {
             return Err(Invalid::element(
                 "samples",
                 index,
                 Violation::Rule("every sample's key resolves to a descriptor in this batch"),
+            ));
+        };
+        // A kind newer than this build may date its start too.
+        if sample.accumulation_start().is_some()
+            && matches!(
+                descriptors[found].accumulation(),
+                None | Some(Accumulation::Instant)
+            )
+        {
+            return Err(Invalid::element(
+                "samples",
+                index,
+                Violation::Rule(
+                    "an instant or undeclared signal's sample has no accumulation start",
+                ),
             ));
         }
     }

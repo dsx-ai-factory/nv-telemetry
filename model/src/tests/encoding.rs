@@ -130,12 +130,14 @@ fn every_numeric_arm_encodes_byte_identically_to_prost() {
         key: Some(key(id)),
         value: Some(wire::NumericValue { kind: Some(kind) }),
         observed_at: None,
+        accumulation_start: None,
     };
     let descriptor = |id: &str| wire::SignalDescriptor {
         key: Some(key(id)),
         kind: Some("counter".into()),
         unit: None,
         range: None,
+        accumulation: None,
     };
 
     assert_direct_encoder_matches_prost(wire::observation_batch::Payload::Readings(

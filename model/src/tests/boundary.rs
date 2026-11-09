@@ -7,6 +7,7 @@
 use prost::Message as _;
 
 use crate::generated::wire;
+use crate::Accumulation;
 use crate::AcquisitionStatus;
 use crate::Completeness;
 use crate::Coverage;
@@ -190,6 +191,34 @@ fn a_sample_without_its_descriptor_is_rejected() {
         .build()
         .unwrap_err();
     assert_eq!(error.path(), "samples[0]");
+}
+
+#[test]
+fn an_instant_or_undeclared_signal_has_no_accumulation_start() {
+    // "A signal that is instant, or does not say, has none — a wrapper rule."
+    let readings = |accumulation: Option<Accumulation>| {
+        let descriptor = SignalDescriptor::builder().key(built_key("PSU1"));
+        let descriptor = match accumulation {
+            Some(accumulation) => descriptor.accumulation(accumulation),
+            None => descriptor,
+        };
+        let sample = Reading::builder()
+            .key(built_key("PSU1"))
+            .value(NumericValue::double(1.0).expect("finite"))
+            .accumulation_start(Timestamp::new(10, 0).expect("a valid instant"))
+            .build()
+            .expect("a valid reading");
+        Readings::builder()
+            .descriptors(vec![descriptor.build().expect("a valid descriptor")])
+            .samples(vec![sample])
+            .build()
+    };
+    readings(Some(Accumulation::Cumulative)).expect("a running total dates its start");
+    readings(Some(Accumulation::Unrecognized(3))).expect("a newer kind may date one too");
+    for not_cumulative in [None, Some(Accumulation::Instant)] {
+        let error = readings(not_cumulative).unwrap_err();
+        assert_eq!(error.path(), "samples[0]", "{not_cumulative:?}");
+    }
 }
 
 #[test]
@@ -691,20 +720,39 @@ fn maximal_batches() -> Vec<wire::ObservationBatch> {
 
     let payloads = vec![
         wire::observation_batch::Payload::Readings(wire::Readings {
-            descriptors: vec![wire::SignalDescriptor {
-                key: Some(key("CPU1Temp")),
-                kind: Some("temperature".into()),
-                unit: Some("Cel".into()),
-                range: Some(wire::ValueRange {
-                    min: Some(numeric(0.0)),
-                    max: Some(numeric(100.0)),
-                }),
-            }],
-            samples: vec![wire::Reading {
-                key: Some(key("CPU1Temp")),
-                value: Some(numeric(47.5)),
-                observed_at: Some(ts(10)),
-            }],
+            descriptors: vec![
+                wire::SignalDescriptor {
+                    key: Some(key("CPU1Temp")),
+                    kind: Some("temperature".into()),
+                    unit: Some("Cel".into()),
+                    range: Some(wire::ValueRange {
+                        min: Some(numeric(0.0)),
+                        max: Some(numeric(100.0)),
+                    }),
+                    accumulation: Some(1),
+                },
+                wire::SignalDescriptor {
+                    key: Some(key("PSU1Energy")),
+                    kind: Some("energy".into()),
+                    unit: Some("kW.h".into()),
+                    range: None,
+                    accumulation: Some(2),
+                },
+            ],
+            samples: vec![
+                wire::Reading {
+                    key: Some(key("CPU1Temp")),
+                    value: Some(numeric(47.5)),
+                    observed_at: Some(ts(10)),
+                    accumulation_start: None,
+                },
+                wire::Reading {
+                    key: Some(key("PSU1Energy")),
+                    value: Some(numeric(1200.0)),
+                    observed_at: Some(ts(10)),
+                    accumulation_start: Some(ts(5)),
+                },
+            ],
         }),
         wire::observation_batch::Payload::Logs(wire::Logs {
             records: vec![wire::LogRecord {
