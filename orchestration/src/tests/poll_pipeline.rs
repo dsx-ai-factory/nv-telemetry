@@ -41,7 +41,7 @@ use nv_telemetry_source::ProviderDeclaration;
 use crate::clock::SharedClock;
 use crate::plan;
 use crate::recipe::endpoint_subtree;
-use crate::recipe::PollMeta;
+use crate::recipe::SubtreeMeta;
 use crate::report::EndpointFault;
 use crate::AcquisitionReport;
 use crate::BreakerPolicy;
@@ -57,7 +57,7 @@ const PROVIDER: &str = "fixture.sensor";
 const REQUEST_CLASS: &str = "fixture-read";
 const BASE_SECONDS: i64 = 1_785_621_243;
 
-type PollRuntime = Runtime<AcquisitionReport, EndpointFault, PollMeta>;
+type PollRuntime = Runtime<AcquisitionReport, EndpointFault, SubtreeMeta>;
 
 fn endpoint() -> EndpointContext {
     EndpointContext::builder()

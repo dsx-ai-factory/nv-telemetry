@@ -312,6 +312,8 @@ global concurrency
 Each endpoint's stack runs on its own runtime, so a global layer would be a
 gate shared across endpoints rather than a scheduler node above them. The
 collector has none yet: endpoint admission is the only concurrency bound.
+Until needs carry a priority, the priority queue ranks by acquisition mode:
+stream connects ahead of polls.
 
 The two breaker scopes serve different purposes:
 
@@ -823,12 +825,13 @@ descriptors and owns metadata revisions. A refresh that reports an unchanged
 definition keeps the existing descriptor, so revision counts real definition
 changes rather than polls and sharing survives across refreshes.
 
-A descriptor carries only what a signal *is*: its identity, kind, unit, and
-the range the sensor can read. Device-settable configuration, alarm thresholds
-being the obvious case, is observed as resource state instead. The line is
-mutability. A threshold is writable on most implementations, which makes it a
-convergence target rather than reading metadata, and carrying it in both
-places would give one fact two representations that can disagree. Consumers
+A descriptor carries only what a signal *is*: its identity, kind, unit, the
+range the sensor can read, and whether its samples accumulate.
+Device-settable configuration, alarm thresholds being the obvious case, is
+observed as resource state instead. The line is mutability. A threshold is
+writable on most implementations, which makes it a convergence target rather
+than reading metadata, and carrying it in both places would give one fact two
+representations that can disagree. Consumers
 that classify readings join by subject against the resource graph. Threshold
 units resolve through the exact `(StateObservation.subject,
 StateObservation.facet)` signal key. An absent facet matches only an absent
@@ -1092,10 +1095,13 @@ the second placement, and the choice holds for any stream whose items arrive
 at the device's pace:
 
 - **Connection is dispatched work.** A stream's connect leaf sits in the
-  endpoint subtree beside the poll leaves, under the same concurrency limit,
-  breaker, and token bucket, and is charged the provider's declared cost. A
-  failed connect is a status like a failed poll, and an endpoint-scoped one
-  reaches the endpoint breaker.
+  endpoint subtree with the poll leaves, under the same concurrency limit,
+  breaker, and token bucket, and is charged the provider's declared cost.
+  It is taken ahead of due polls: a stream that waits behind a round of
+  polls misses the events sent before it opens. Reconnects are spaced by
+  the endpoint's rate so that a stream that keeps closing leaves polls
+  half the refill. A failed connect is a status like a failed
+  poll, and an endpoint-scoped one reaches the endpoint breaker.
 - **Reconnection is dispatcher scheduling.** When an instance ends, the leaf
   computes the next due instant from a typed reconnect policy — a delay that
   doubles across instances that delivered nothing, capped, spread per
@@ -1114,7 +1120,7 @@ at the device's pace:
   retirement, the open stream closes, and no reconnect follows. Cancellation
   produces no status or fault. An endpoint that polls nothing retires once
   every stream has stopped.
-- **Fairness covers connects.** The items themselves are not admitted: a
+- **Admission covers connects, not items.** The items themselves are not admitted: a
   stream's rate is the device's, and throttling it client-side would only
   move the overflow from the device's buffer, which reports it, to the
   collector's, which cannot.

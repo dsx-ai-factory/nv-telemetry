@@ -29,6 +29,12 @@ message Reading {
   // When the source stamps individual samples, as a metric report does. The
   // batch window covers samples that carry no time of their own.
   optional Timestamp observed_at = 3;
+
+  // When the device began accumulating a running total, as the source reports
+  // it; a reset moves it. A signal that is instant, or does not say, has none
+  // — a wrapper rule — and a collector's or exporter's start never stands in
+  // for it.
+  optional Timestamp accumulation_start = 4;
 }
 
 // The readings payload domain.

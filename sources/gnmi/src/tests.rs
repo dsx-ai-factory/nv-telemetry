@@ -17,6 +17,7 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use http_body_util::Full;
+use nv_telemetry_model::Accumulation;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::FailureClass;
@@ -1870,7 +1871,8 @@ fn collection_subjects_use_full_path_keys_and_preserve_descriptor_metadata() {
             subject,
             ReadingTemplate::new(NumericType::Uint)
                 .with_facet("in-octets")
-                .with_unit("By"),
+                .with_unit("By")
+                .with_accumulation(Accumulation::Cumulative),
         )],
     )
     .expect("collection spec");
@@ -1914,6 +1916,7 @@ fn collection_subjects_use_full_path_keys_and_preserve_descriptor_metadata() {
         .iter()
         .map(|descriptor| {
             assert_eq!(descriptor.unit(), Some("By"));
+            assert_eq!(descriptor.accumulation(), Some(Accumulation::Cumulative));
             assert_eq!(descriptor.key().facet(), Some("in-octets"));
             assert_eq!(descriptor.key().subject().scope(), &["switch-a"]);
 

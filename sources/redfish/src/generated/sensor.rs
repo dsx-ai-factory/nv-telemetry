@@ -115,6 +115,116 @@ pub(crate) fn project_sensor(
         }
         _ => None,
     };
+    let sensor_descriptor_accumulation = match sensor.reading_type {
+        Some(Some(value)) => {
+            match value {
+                ::nv_redfish::schema::sensor::ReadingType::Temperature => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Humidity => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Power => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::EnergykWh => {
+                    Some(::nv_telemetry_model::Accumulation::Cumulative)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::EnergyJoules => {
+                    Some(::nv_telemetry_model::Accumulation::Cumulative)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::EnergyWh => {
+                    Some(::nv_telemetry_model::Accumulation::Cumulative)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::ChargeAh => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Voltage => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Current => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Frequency => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Pressure => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::PressurekPa => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::PressurePa => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::LiquidLevel => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Rotational => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::AirFlow => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::AirFlowCmm => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::LiquidFlow => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::LiquidFlowLpm => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Barometric => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Altitude => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Percent => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::AbsoluteHumidity => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Heat => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::LinearPosition => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::LinearVelocity => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::LinearAcceleration => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::RotationalPosition => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::RotationalVelocity => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::RotationalAcceleration => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                ::nv_redfish::schema::sensor::ReadingType::Valve => {
+                    Some(::nv_telemetry_model::Accumulation::Instant)
+                }
+                _ => {
+                    issues
+                        .push(
+                            ::nv_telemetry_source::ProjectionIssue::invalid(
+                                "Sensor.ReadingType",
+                                "outside the known value set",
+                            ),
+                        );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let sensor_descriptor_unit = match sensor.reading_units.clone() {
         Some(Some(value)) => {
             if value.is_empty() {
@@ -232,6 +342,10 @@ pub(crate) fn project_sensor(
                 }
             }
         }
+        _ => None,
+    };
+    let sensor_sample_accumulation_start = match sensor.sensor_reset_time {
+        Some(Some(value)) => Some(crate::instant::timestamp(value)?),
         _ => None,
     };
     let sensor_state_value = match sensor.status.as_ref().and_then(|value| value.state) {
@@ -825,6 +939,9 @@ pub(crate) fn project_sensor(
     if let Some(value) = sensor_descriptor_kind {
         builder = builder.kind(value);
     }
+    if let Some(value) = sensor_descriptor_accumulation {
+        builder = builder.accumulation(value);
+    }
     if let Some(value) = sensor_descriptor_unit {
         builder = builder.unit(value);
     }
@@ -837,6 +954,9 @@ pub(crate) fn project_sensor(
         builder = builder.key(key.clone());
         if let Some(value) = sensor_sample_value {
             builder = builder.value(value);
+        }
+        if let Some(value) = sensor_sample_accumulation_start {
+            builder = builder.accumulation_start(value);
         }
         readings.push(builder.build()?);
     }

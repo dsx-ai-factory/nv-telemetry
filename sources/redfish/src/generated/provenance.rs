@@ -343,6 +343,12 @@ pub(crate) const PROVENANCE: &[Extraction] = &[
     Extraction {
         manifest: "sources/redfish/manifests/sensor.textpb",
         projection: "sensor-descriptor",
+        source: "Sensor.ReadingType",
+        target: "nv.telemetry.v1.SignalDescriptor.accumulation",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/sensor.textpb",
+        projection: "sensor-descriptor",
         source: "Sensor.ReadingUnits",
         target: "nv.telemetry.v1.SignalDescriptor.unit",
     },
@@ -375,6 +381,12 @@ pub(crate) const PROVENANCE: &[Extraction] = &[
         projection: "sensor-sample",
         source: "Sensor.Reading",
         target: "nv.telemetry.v1.Reading.value.double_value",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/sensor.textpb",
+        projection: "sensor-sample",
+        source: "Sensor.SensorResetTime",
+        target: "nv.telemetry.v1.Reading.accumulation_start",
     },
     Extraction {
         manifest: "sources/redfish/manifests/sensor.textpb",

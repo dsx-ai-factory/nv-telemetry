@@ -10,22 +10,26 @@
 //! device's event ids: an `EventId` restarts with the device and is unique
 //! only within the sequence one subscription reads, so the scope carries a
 //! [`StreamRun`] minted whenever a stream starts live, and kept while a
-//! later instance resumes it. The provider remembers the SSE id in effect
-//! after each payload and reopens the stream after it, so a reconnect loses
-//! nothing the device retained and ships under the scope it left. A device
-//! that refuses the position — the 400 the mock gives for an id outside its
-//! history — answers with a protocol failure the provider reports, naming
-//! the id, and does not act on: the answer cannot tell a history that aged
-//! out, where the run continues, from a device that restarted its ids,
-//! where it must not, so the position stays and the choice is the
-//! embedder's, which starts a stream afresh or hands a position back.
-//! bmcweb does not refuse: it replays what it has and sends
-//! `EventBufferExceeded` first, which is the gap issue below, within the
-//! same run. The consumer's dedup key — endpoint, scope, `entry_id` — thus
-//! never collapses distinct events. The polled log walk is a separate
-//! source with its own scope; on devices whose events do not name their log
-//! entry, which is most, a consumer that enables both sees each event under
-//! both.
+//! later instance resumes it. The consumer's dedup key — endpoint, scope,
+//! `entry_id` — thus never collapses distinct events.
+//!
+//! The provider remembers the SSE id in effect after each payload and
+//! reopens the stream after it, so a reconnect loses nothing the device
+//! retained and ships under the scope it left. A failed open keeps the
+//! position, unless the device refused it. bmcweb does not refuse: it
+//! replays what it has and sends `EventBufferExceeded` first, which is the
+//! gap issue below, within the same run. A device that refuses — the 400
+//! the mock gives for an id outside its history — cannot say whether its
+//! history aged out, where the run continues, or its ids restarted, where
+//! it must not. The provider takes the safe reading: it drops the position
+//! and opens live within the same attempt, in a new run, the first item an
+//! issue at [`GAP_LOCATOR`] naming the id. A new run where the old one
+//! continued only changes the scope; reusing it after a restart would
+//! collapse distinct events.
+//!
+//! The polled log walk is a separate source with its own scope; on devices
+//! whose events do not name their log entry, which is most, a consumer that
+//! enables both sees each event under both.
 //!
 //! Records arrive inline; one the device only references is recorded as
 //! an issue and never fetched, because the stream is drained outside the
@@ -50,6 +54,8 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 
+use futures_util::future::ready;
+use futures_util::stream::once;
 use futures_util::stream::unfold;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
@@ -77,6 +83,7 @@ use nv_telemetry_source::ProviderDeclaration;
 use nv_telemetry_source::SubscriptionItem;
 use serde_json::Value;
 
+use crate::failure::refuses_position;
 use crate::failure::ClassifyError;
 use crate::projection::project_event_record;
 use crate::provider::assemble_logs;
@@ -191,13 +198,15 @@ impl ResumePosition {
 
 /// Where the stream stands between instances.
 #[derive(Debug, Default)]
-struct Cursor {
-    /// The run the current or last instance read, minted when an instance
-    /// starts live.
-    run: Option<StreamRun>,
-    /// The SSE id in effect after the last payload read, when the device
-    /// sends ids at all.
-    last_event_id: Option<String>,
+enum Cursor {
+    /// No id read: the next instance starts live, in a new run.
+    #[default]
+    Live,
+    /// The next instance resumes here.
+    Resume(ResumePosition),
+    /// The device refused to resume after this id: the stream opens live,
+    /// in a new run, and reports the gap once it does.
+    Refused(String),
 }
 
 /// How the next instance starts.
@@ -208,30 +217,42 @@ struct Start {
 }
 
 impl Cursor {
-    /// Where the next instance starts: after the last id, in the run it
-    /// belongs to, or live in a new run when there is no id to resume from.
-    fn start(&mut self) -> Start {
-        if let (Some(run), Some(after)) = (&self.run, &self.last_event_id) {
-            return Start {
-                run: run.clone(),
-                after: Some(after.clone()),
-            };
+    fn start(&self) -> Start {
+        match self {
+            Self::Resume(position) => Start {
+                run: position.run.clone(),
+                after: Some(position.last_event_id.clone()),
+            },
+            Self::Live | Self::Refused(_) => Start {
+                run: StreamRun::mint(),
+                after: None,
+            },
         }
-        let run = StreamRun::mint();
-        self.run = Some(run.clone());
-        self.last_event_id = None;
-        Start { run, after: None }
     }
 
-    fn advance(&mut self, last_event_id: String) {
-        self.last_event_id = Some(last_event_id);
+    /// The instance reading `run` read a payload with this id.
+    fn advance(&mut self, last_event_id: String, run: &StreamRun) {
+        *self = Self::Resume(ResumePosition {
+            last_event_id,
+            run: run.clone(),
+        });
+    }
+
+    /// An instance opened: the refused id, if any, is its gap to report.
+    fn take_refused(&mut self) -> Option<String> {
+        let Self::Refused(after) = self else {
+            return None;
+        };
+        let after = std::mem::take(after);
+        *self = Self::Live;
+        Some(after)
     }
 
     fn position(&self) -> Option<ResumePosition> {
-        Some(ResumePosition {
-            last_event_id: self.last_event_id.clone()?,
-            run: self.run.clone()?,
-        })
+        match self {
+            Self::Resume(position) => Some(position.clone()),
+            Self::Live | Self::Refused(_) => None,
+        }
     }
 }
 
@@ -258,7 +279,8 @@ impl<T> EventStream<T> {
     pub const REQUEST_CLASS: &'static str = "event-stream";
 
     /// The declared weight of one connect attempt: the service root, the
-    /// event service, and the stream itself are three requests.
+    /// event service, and the stream itself are three requests. A refused
+    /// resume opens the stream a second time.
     pub const COST: u64 = 3;
 
     /// This provider's declaration, single-sourced from the same constants
@@ -295,17 +317,13 @@ impl<T> EventStream<T> {
     /// [`Self::resume_position`] gave an embedder before it restarted.
     #[must_use]
     pub fn with_resume_position(self, position: ResumePosition) -> Self {
-        *lock(&self.cursor) = Cursor {
-            run: Some(position.run),
-            last_event_id: Some(position.last_event_id),
-        };
+        *lock(&self.cursor) = Cursor::Resume(position);
         self
     }
 
     /// Where the next instance resumes, once the device has sent an id;
-    /// `None` before the first id and on a device that sends none. A
-    /// position the device refused stays, for the embedder to keep or
-    /// drop.
+    /// `None` before the first id, on a device that sends none, and after
+    /// the device refused the position.
     #[must_use]
     pub fn resume_position(&self) -> Option<ResumePosition> {
         lock(&self.cursor).position()
@@ -347,23 +365,55 @@ impl<T: RedfishTransport> Acquire for EventStream<T> {
             .server_sent_event_uri
             .as_ref()
             .ok_or_else(|| unsupported("the event service advertises no ServerSentEventUri"))?;
-        let start = lock(&self.cursor).start();
-        let scope = stream_scope(&service.id, &start.run)?;
         // The layer repairs each payload under the SSE id it arrived with;
         // decoding is left to the items, so a payload that does not decode
         // still moves the cursor past it.
-        let events = bmc
-            .stream_events::<Value>(uri, start.after.as_deref())
-            .await
-            .map_err(|error| told_against_resume(start.after.as_deref(), error.classify()))?;
-        Ok(Box::pin(items(Live {
+        let (start, events) = loop {
+            let start = lock(&self.cursor).start();
+            match bmc
+                .stream_events::<Value>(uri, start.after.as_deref())
+                .await
+            {
+                Ok(events) => break (start, events),
+                Err(error) => {
+                    let Some(after) = start.after else {
+                        return Err(error.classify());
+                    };
+                    if !refuses_position(&error) {
+                        return Err(told_against_resume(&after, &error.classify()));
+                    }
+                    // The next turn starts live, so it cannot come back here.
+                    *lock(&self.cursor) = Cursor::Refused(after);
+                }
+            }
+        };
+        let scope = stream_scope(&service.id, &start.run)?;
+        let refused = lock(&self.cursor).take_refused();
+        let items = items(Live {
             events,
             bmc,
             scope,
+            run: start.run,
             cursor: Arc::clone(&self.cursor),
             metric_reports_seen: false,
-        })))
+        });
+        Ok(match refused {
+            Some(after) => Box::pin(once(ready(Ok(refused_gap(&after)))).chain(items)),
+            None => Box::pin(items),
+        })
     }
+}
+
+/// The first item of an instance that opened live after a refused position.
+fn refused_gap(after: &str) -> AcquisitionParts {
+    let issue = ProjectionIssue::invalid(
+        GAP_LOCATOR,
+        format!(
+            "the device refused to resume after event {after}; events since may be missing, \
+             and the polled log fills the gap"
+        ),
+    );
+    AcquisitionParts::new(Vec::new(), vec![issue])
 }
 
 fn unsupported(detail: &'static str) -> AcquisitionFailure {
@@ -372,14 +422,10 @@ fn unsupported(detail: &'static str) -> AcquisitionFailure {
         .with_detail(detail)
 }
 
-/// A failed open, told against the position it resumed from when there
-/// was one: the same class and retryability the answer classified to, its
-/// detail naming the id, so the embedder can tell a refused position from
-/// any other failed connect. The position itself is left as it was.
-fn told_against_resume(after: Option<&str>, failure: AcquisitionFailure) -> AcquisitionFailure {
-    let Some(after) = after else {
-        return failure;
-    };
+/// A failed open other than a refused position, told against the position
+/// it resumed from: the same class and retryability the answer classified
+/// to, its detail naming the id. The position itself is left as it was.
+fn told_against_resume(after: &str, failure: &AcquisitionFailure) -> AcquisitionFailure {
     let mut told = AcquisitionFailure::new(failure.class()).with_detail(format!(
         "open while resuming after event {after} failed: {}",
         failure.detail().unwrap_or("no detail")
@@ -395,6 +441,7 @@ struct Live<T: RedfishTransport> {
     events: BoxTryStream<StreamEvent<Value>, RepairError<LinkError>>,
     bmc: CompatBmc<Link<T>>,
     scope: Subject,
+    run: StreamRun,
     cursor: Arc<Mutex<Cursor>>,
     metric_reports_seen: bool,
 }
@@ -413,7 +460,7 @@ fn items<T: RedfishTransport>(live: Live<T>) -> impl Stream<Item = SubscriptionI
                     data,
                 })) => {
                     if let Some(id) = last_event_id {
-                        lock(&live.cursor).advance(id);
+                        lock(&live.cursor).advance(id, &live.run);
                     }
                     match decode::<EventStreamPayload>(data) {
                         Ok(payload) => payload,
@@ -571,7 +618,7 @@ mod tests {
         assert_eq!(cursor.position(), None, "a run alone is not a position");
 
         // An id read: the next instance resumes after it, in the same run.
-        cursor.advance("41".to_owned());
+        cursor.advance("41".to_owned(), &first.run);
         assert_eq!(
             cursor.position(),
             Some(ResumePosition::new("41", first.run.clone()).expect("a non-empty id"))
@@ -579,37 +626,29 @@ mod tests {
         let second = cursor.start();
         assert_eq!(second.run, first.run);
         assert_eq!(second.after.as_deref(), Some("41"));
-
-        // A run without an id, as after a device that sent none: the next
-        // instance starts live in a new run.
-        cursor.last_event_id = None;
-        let third = cursor.start();
-        assert!(third.after.is_none());
-        assert_ne!(third.run, first.run);
     }
 
     #[test]
     fn a_failed_open_while_resuming_names_the_id_and_keeps_the_answer() {
         // The device's answer stands: class and retryability as classified,
-        // the detail naming the position so the embedder can tell a refused
-        // resume from any other failed connect.
-        let refused = told_against_resume(
-            Some("41"),
-            AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
-                .with_retryable(false)
-                .with_detail("HTTP 400"),
+        // the detail naming the position.
+        let failed = told_against_resume(
+            "41",
+            &AcquisitionFailure::new(AcquisitionFailureClass::Device)
+                .with_retryable(true)
+                .with_detail("HTTP 503"),
         );
-        assert_eq!(refused.class(), AcquisitionFailureClass::Protocol);
-        assert_eq!(refused.retryable(), Some(false));
+        assert_eq!(failed.class(), AcquisitionFailureClass::Device);
+        assert_eq!(failed.retryable(), Some(true));
         assert_eq!(
-            refused.detail(),
-            Some("open while resuming after event 41 failed: HTTP 400")
+            failed.detail(),
+            Some("open while resuming after event 41 failed: HTTP 503")
         );
 
         // A source that left retryability to policy still does.
         let unrefined = told_against_resume(
-            Some("41"),
-            AcquisitionFailure::new(AcquisitionFailureClass::Connectivity),
+            "41",
+            &AcquisitionFailure::new(AcquisitionFailureClass::Connectivity),
         );
         assert_eq!(unrefined.class(), AcquisitionFailureClass::Connectivity);
         assert_eq!(unrefined.retryable(), None);
@@ -617,14 +656,6 @@ mod tests {
             unrefined.detail(),
             Some("open while resuming after event 41 failed: no detail")
         );
-
-        // Without a position, the failure is what it was.
-        let live = told_against_resume(
-            None,
-            AcquisitionFailure::new(AcquisitionFailureClass::Protocol).with_detail("HTTP 400"),
-        );
-        assert_eq!(live.detail(), Some("HTTP 400"));
-        assert_eq!(live.retryable(), None);
     }
 
     #[test]

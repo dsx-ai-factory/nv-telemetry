@@ -427,18 +427,16 @@ impl<T: RedfishTransport> Bmc for Link<T> {
         Err(LinkError::Refused("update upload"))
     }
 
-    nv_redfish::core::if_update_service_deprecated! {
-        async fn http_push_uri_update<U, R>(
-            &self,
-            _: &str,
-            _: nv_redfish::core::HttpPushUriUpdateRequest<U>,
-        ) -> Result<ModificationResponse<R>, LinkError>
-        where
-            U: UploadReader,
-            R: Send + Sync + for<'de> Deserialize<'de>,
-        {
-            Err(LinkError::Refused("update upload"))
-        }
+    async fn http_push_uri_update<U, R>(
+        &self,
+        _: &str,
+        _: nv_redfish::core::HttpPushUriUpdateRequest<U>,
+    ) -> Result<ModificationResponse<R>, LinkError>
+    where
+        U: UploadReader,
+        R: Send + Sync + for<'de> Deserialize<'de>,
+    {
+        Err(LinkError::Refused("update upload"))
     }
 
     async fn stream<E: Sized + for<'de> Deserialize<'de> + Send + 'static>(

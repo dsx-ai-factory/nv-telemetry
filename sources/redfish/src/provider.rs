@@ -30,6 +30,7 @@ use nv_redfish::schema::software_inventory::SoftwareInventory;
 use nv_redfish::schema::update_service::UpdateService;
 use nv_redfish::Bmc;
 use nv_telemetry_model::limits::LOGS_RECORDS_MAX_ITEMS;
+use nv_telemetry_model::Accumulation;
 use nv_telemetry_model::Completeness;
 use nv_telemetry_model::Coverage;
 use nv_telemetry_model::EndpointContext;
@@ -40,6 +41,7 @@ use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::Logs;
 use nv_telemetry_model::Origin;
 use nv_telemetry_model::Payload;
+use nv_telemetry_model::Reading;
 use nv_telemetry_model::Readings;
 use nv_telemetry_model::StateObservation;
 use nv_telemetry_model::States;
@@ -362,9 +364,27 @@ fn assemble_sensor(parts: SensorParts) -> Result<AcquisitionParts, Invalid> {
     // payload builder accepts them or its refusal surfaces as the residual
     // tier — never a reading that vanishes.
     if !parts.signal_descriptors.is_empty() || !parts.readings.is_empty() {
+        // `SensorResetTime` dates peaks and averages too; only a running
+        // total's start is carried.
+        let descriptors = &parts.signal_descriptors;
+        let samples = parts
+            .readings
+            .into_iter()
+            .map(|reading| {
+                let cumulative = descriptors.iter().any(|descriptor| {
+                    descriptor.key() == reading.key()
+                        && descriptor.accumulation() == Some(Accumulation::Cumulative)
+                });
+                if cumulative {
+                    Ok(reading)
+                } else {
+                    without_accumulation_start(reading)
+                }
+            })
+            .collect::<Result<_, Invalid>>()?;
         let readings = Readings::builder()
             .descriptors(parts.signal_descriptors)
-            .samples(parts.readings)
+            .samples(samples)
             .build()?;
         payloads.push((coverage.clone(), Payload::Readings(readings)));
     }
@@ -374,7 +394,25 @@ fn assemble_sensor(parts: SensorParts) -> Result<AcquisitionParts, Invalid> {
             .build()?;
         payloads.push((coverage, Payload::States(states)));
     }
-    Ok(AcquisitionParts::new(payloads, parts.issues))
+    // Kind and accumulation both read `ReadingType`: one unknown value is
+    // one issue.
+    let mut issues = parts.issues;
+    issues.dedup();
+    Ok(AcquisitionParts::new(payloads, issues))
+}
+
+fn without_accumulation_start(reading: Reading) -> Result<Reading, Invalid> {
+    if reading.accumulation_start().is_none() {
+        return Ok(reading);
+    }
+    let rebuilt = Reading::builder()
+        .key(reading.key().clone())
+        .value(*reading.value());
+    match reading.observed_at() {
+        Some(observed_at) => rebuilt.observed_at(*observed_at),
+        None => rebuilt,
+    }
+    .build()
 }
 
 /// GET the chassis document, project it, assemble the batches. The requested

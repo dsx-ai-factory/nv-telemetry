@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
+use nv_telemetry_model::Accumulation;
 use nv_telemetry_model::Invalid;
 use nv_telemetry_model::SignalDescriptor;
 use nv_telemetry_model::SignalKey;
@@ -416,6 +417,7 @@ pub struct ReadingTemplate {
     kind: Option<String>,
     unit: Option<String>,
     range: Option<ValueRange>,
+    accumulation: Option<Accumulation>,
 }
 
 impl ReadingTemplate {
@@ -428,6 +430,7 @@ impl ReadingTemplate {
             kind: None,
             unit: None,
             range: None,
+            accumulation: None,
         }
     }
 
@@ -459,6 +462,14 @@ impl ReadingTemplate {
         self
     }
 
+    /// Sets whether each value is the current one or a running total. A YANG
+    /// `counter64` is [`Accumulation::Cumulative`].
+    #[must_use]
+    pub fn with_accumulation(mut self, accumulation: Accumulation) -> Self {
+        self.accumulation = Some(accumulation);
+        self
+    }
+
     pub(super) fn descriptor(&self, subject: Subject) -> Result<SignalDescriptor, Invalid> {
         let mut key = SignalKey::builder().subject(subject);
 
@@ -478,6 +489,10 @@ impl ReadingTemplate {
 
         if let Some(range) = &self.range {
             descriptor = descriptor.range(range.clone());
+        }
+
+        if let Some(accumulation) = self.accumulation {
+            descriptor = descriptor.accumulation(accumulation);
         }
 
         descriptor.build()

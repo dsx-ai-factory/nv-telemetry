@@ -31,6 +31,7 @@ use nv_telemetry_redfish::RedfishService;
 use nv_telemetry_redfish::ResumePosition;
 use nv_telemetry_redfish::SensorRead;
 use nv_telemetry_redfish::StreamRun;
+use nv_telemetry_redfish::GAP_LOCATOR;
 use nv_telemetry_source::acquire;
 use nv_telemetry_source::Acquire;
 use nv_telemetry_source::Acquired;
@@ -606,38 +607,30 @@ async fn events(server: &Server, resources: &Resources) {
     assert_eq!(moved.run(), position.run());
     close_and_end(server, &mut items).await;
 
-    // An id the device no longer holds is refused with a protocol answer.
-    // The provider reports it as the device gave it, naming the position,
-    // and keeps the position: whether to start afresh is the embedder's
-    // call, and a fresh stream is a new run.
+    // An id the device no longer holds is refused, as a restarted device
+    // refuses it. The provider drops the position and opens live within the
+    // same attempt, in a new run, its first item the gap the refusal left.
     let stale_position = ResumePosition::new(
         "999999999",
         StreamRun::new(run.clone()).expect("the run the scope named fits"),
     )
     .expect("a non-empty id");
     let stale = EventStream::new(endpoint(), server.service()).with_resume_position(stale_position);
-    let refused = stale
+    let mut items = stale
         .perform()
         .await
-        .err()
-        .expect("the mock refuses an id outside its history");
-    assert_eq!(refused.class(), Failure::Protocol);
-    assert_eq!(refused.retryable(), Some(false));
-    assert!(
-        refused.detail().is_some_and(|detail| {
-            detail.starts_with("open while resuming after event 999999999 failed")
-        }),
-        "{refused:?}"
-    );
+        .expect("the refused resume opens live");
     assert_eq!(
-        stale
-            .resume_position()
-            .map(|position| position.last_event_id().to_owned()),
-        Some("999999999".to_owned()),
-        "the position is the embedder's to drop"
+        stale.resume_position(),
+        None,
+        "the refused position is dropped"
     );
-    let fresh = EventStream::new(endpoint(), server.service());
-    let mut items = fresh.perform().await.expect("a fresh stream starts live");
+    let gap = tokio::time::timeout(Duration::from_secs(5), items.next())
+        .await
+        .expect("the gap is the first item")
+        .expect("the stream is open")
+        .expect("an issue, not the stream's end");
+    assert_eq!(gap.issues()[0].path(), GAP_LOCATOR);
     server.grow_log(resources, 1).await;
     let (fresh_run, _) = next_batch(&mut items).await;
     assert_ne!(fresh_run, run, "a fresh start is a new run");

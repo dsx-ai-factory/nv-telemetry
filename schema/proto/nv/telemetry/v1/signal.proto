@@ -87,4 +87,23 @@ message SignalDescriptor {
   }];
 
   optional ValueRange range = 4;
+
+  // Whether a sample is the signal's current value or a running total. Absent
+  // when the source does not say; never UNSPECIFIED.
+  optional Accumulation accumulation = 5 [(nv.telemetry.options.v1.field_invariant) = {reject_unspecified: true}];
+}
+
+// How a signal's samples relate over time. A consumer exports a running total
+// as a counter, which rates and sums correctly across scrapes, and a current
+// value as a gauge.
+enum Accumulation {
+  ACCUMULATION_UNSPECIFIED = 0;
+
+  // The value now, which may rise or fall: a temperature, a power draw.
+  ACCUMULATION_INSTANT = 1;
+
+  // A total the device accumulates, such as energy or error counts. It only
+  // grows, except when the device resets it, which a sample may date with
+  // `Reading.accumulation_start`.
+  ACCUMULATION_CUMULATIVE = 2;
 }
