@@ -11,8 +11,9 @@
 //!
 //! Opening errors are returned by [`Acquire::perform`]. Later stream failures
 //! produce one failed item and end the stream. Dropping the connect future or
-//! stream cancels the subscription. Orchestration owns reconnects; the caller
-//! configures transport security and credentials.
+//! stream cancels the subscription. The collector controls reconnects for streamed
+//! acquisitions; direct stream consumers supply their own reconnect policy. The
+//! caller configures transport security and credentials.
 //!
 //! Mappings accept numeric values, strings, or booleans. Strings keep the spelling
 //! the target sends for the requested encoding, including identityref module names
@@ -23,6 +24,8 @@
 //! and states from the same notification share the same acquisition item.
 //! Standard acquisition APIs report mapped deletes as issues. Use
 //! [`ConfiguredSubscription::subscribe_with_sources`] for structured deletion paths.
+//! Use [`ConfiguredSubscription::subscribe_events`] to also receive synchronization
+//! completion markers for caller-owned readiness and reconciliation.
 //! The provider validates mappings and received values without a YANG schema.
 //! Unsupported request paths can cause the target to reject Subscribe.
 //!
@@ -357,6 +360,7 @@ pub use notification::ObservationIdentity;
 pub use notification::ProjectedNotification;
 pub use notification::SourceBinding;
 pub use notification::SourcePath;
+pub use notification::SubscriptionEvent;
 use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Invalid;
 use nv_telemetry_model::Origin;
@@ -474,13 +478,111 @@ where
         >,
         AcquisitionFailure,
     > {
-        self.subscribe(projection::project_with_sources).await
+        self.subscribe(projection::project_with_sources, || None)
+            .await
     }
 
-    // Both output paths share opening, controls, cancellation and terminal errors.
+    /// Opens a STREAM subscription with notifications and synchronization markers.
+    ///
+    /// Each call opens 1 independent RPC. Notifications include the same source facts
+    /// as [`Self::subscribe_with_sources`]. True synchronization messages produce
+    /// [`SubscriptionEvent::Synchronized`] in received order, including repetitions.
+    /// False synchronization messages produce no event.
+    ///
+    /// Accept or stamp each notification's parts before applying source bindings and
+    /// deletions. Synchronization is a control event, not an acquisition item. The
+    /// caller owns readiness, synchronization deadlines, reconnect policy, and
+    /// reconciliation.
+    ///
+    /// A terminal failure produces 1 error and ends the stream. Dropping the connect
+    /// future or returned stream cancels the RPC. The stream does not borrow `self`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified acquisition failure when the subscription cannot open.
+    ///
+    /// # Examples
+    ///
+    /// Pass `source.subscribe_events()` to this consumer with a callback that accepts
+    /// notifications as shown in the crate's source-binding example. The deadline
+    /// covers opening and initial synchronization; notifications do not restart it.
+    /// Readiness is cleared when the consumer returns or its future is dropped.
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    /// use std::error::Error;
+    /// use std::future::Future;
+    /// use std::pin::Pin;
+    /// use std::time::Duration;
+    /// use futures_util::{Stream, StreamExt};
+    /// use nv_telemetry_gnmi::{ProjectedNotification, SubscriptionEvent};
+    /// use nv_telemetry_source::AcquisitionFailure;
+    ///
+    /// type Events = Pin<Box<dyn Stream<Item = Result<SubscriptionEvent, AcquisitionFailure>> + Send>>;
+    ///
+    /// struct Readiness<'a>(&'a Cell<bool>);
+    ///
+    /// impl Drop for Readiness<'_> {
+    ///     fn drop(&mut self) {
+    ///         self.0.set(false);
+    ///     }
+    /// }
+    ///
+    /// async fn consume(
+    ///     open: impl Future<Output = Result<Events, AcquisitionFailure>>,
+    ///     ready: &Cell<bool>,
+    ///     timeout: Duration,
+    ///     mut accept: impl FnMut(ProjectedNotification) -> Result<(), AcquisitionFailure>,
+    /// ) -> Result<(), Box<dyn Error>> {
+    ///     ready.set(false);
+    ///     let _reset = Readiness(ready);
+    ///
+    ///     let deadline = tokio::time::sleep(timeout);
+    ///     tokio::pin!(deadline);
+    ///
+    ///     let mut events = tokio::select! {
+    ///         result = open => result?,
+    ///         () = &mut deadline => return Err("gNMI synchronization timed out".into()),
+    ///     };
+    ///
+    ///     loop {
+    ///         let event = tokio::select! {
+    ///             event = events.next() => event,
+    ///             () = &mut deadline, if !ready.get() => {
+    ///                 return Err("gNMI synchronization timed out".into());
+    ///             }
+    ///         };
+    ///
+    ///         match event {
+    ///             Some(Ok(SubscriptionEvent::Notification(notification))) => accept(notification)?,
+    ///             Some(Ok(SubscriptionEvent::Synchronized)) => ready.set(true),
+    ///             Some(Err(failure)) => return Err(failure.into()),
+    ///             None => return Ok(()),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn subscribe_events(
+        &self,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<SubscriptionEvent, AcquisitionFailure>> + Send + 'static>>,
+        AcquisitionFailure,
+    > {
+        self.subscribe(
+            |spec, notification| {
+                projection::project_with_sources(spec, notification)
+                    .map(SubscriptionEvent::Notification)
+            },
+            || Some(SubscriptionEvent::Synchronized),
+        )
+        .await
+    }
+
+    // All output paths share opening, control decoding, cancellation, and terminal errors.
     async fn subscribe<P, F>(
         &self,
         project: F,
+        synchronized: fn() -> Option<P>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<P, AcquisitionFailure>> + Send + 'static>>,
         AcquisitionFailure,
@@ -505,35 +607,50 @@ where
         let spec = Arc::clone(&self.spec);
 
         Ok(Box::pin(stream::unfold(
-            Some((response, spec, project)),
+            Some((response, spec, project, synchronized)),
             |state| async move {
-                let (mut response, spec, project) = state?;
+                let (mut response, spec, project, synchronized) = state?;
 
                 loop {
-                    let item = match response.message().await {
-                        Ok(Some(message)) => match message.response {
-                            Some(Response::SyncResponse(_)) => continue,
-                            Some(Response::Update(notification)) => {
-                                let item = project(&spec.projection, notification);
+                    let message = match response.message().await {
+                        Ok(Some(message)) => message,
+                        Err(status) => {
+                            return Some((Err(failure("Subscribe", status.code())), None))
+                        }
+                        Ok(None) => {
+                            let failure = AcquisitionFailure::new(Class::Protocol)
+                                .with_retryable(true)
+                                .with_detail("gNMI STREAM closed without a terminal error");
 
-                                let next = item.is_ok().then_some((response, spec, project));
-
-                                return Some((item, next));
-                            }
-                            #[allow(deprecated)]
-                            Some(Response::Error(error)) => {
-                                Err(legacy_failure("Subscribe", error.code))
-                            }
-                            None => Err(failure("Subscribe", Code::DataLoss)),
-                        },
-                        Err(status) => Err(failure("Subscribe", status.code())),
-                        Ok(None) => Err(AcquisitionFailure::new(Class::Protocol)
-                            .with_retryable(true)
-                            .with_detail("gNMI STREAM closed without a terminal error")),
+                            return Some((Err(failure), None));
+                        }
                     };
 
-                    // Report the failure once; orchestration decides whether to reconnect.
-                    return Some((item, None));
+                    let item = match message.response {
+                        Some(Response::SyncResponse(true)) => {
+                            let Some(event) = synchronized() else {
+                                continue;
+                            };
+
+                            Ok(event)
+                        }
+                        Some(Response::SyncResponse(false)) => continue,
+                        Some(Response::Update(notification)) => {
+                            project(&spec.projection, notification)
+                        }
+                        #[allow(deprecated)]
+                        Some(Response::Error(error)) => {
+                            Err(legacy_failure("Subscribe", error.code))
+                        }
+                        None => Err(failure("Subscribe", Code::DataLoss)),
+                    };
+
+                    // Projection and protocol failures end this instance after 1 error.
+                    let next = item
+                        .is_ok()
+                        .then_some((response, spec, project, synchronized));
+
+                    return Some((item, next));
                 }
             },
         )))
@@ -559,10 +676,13 @@ where
     }
 
     async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
-        self.subscribe(|spec, notification| {
-            projection::project(spec, notification)
-                .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
-        })
+        self.subscribe(
+            |spec, notification| {
+                projection::project(spec, notification)
+                    .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+            },
+            || None,
+        )
         .await
     }
 }
