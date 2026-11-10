@@ -153,6 +153,35 @@
 //! Use [`Mapping::boolean_state`] to collect a boolean state. A subscription may
 //! contain only state mappings.
 //!
+//! To parse native string or ASCII values as numbers, use [`Mapping::numeric_with_text`]
+//! or [`ReadingTemplate::with_text_parsing`]. Choose `Int`, `Uint`, or `Double` for the
+//! result. Integers are parsed without losing precision; `Double` uses `f64` rounding.
+//! Invalid text produces an issue without a reading. Numeric mappings also accept
+//! quoted JSON numbers without enabling native text parsing.
+//!
+//! ```
+//! use nv_telemetry_gnmi::{IdentityValue, Mapping, NumericType, PathElement,
+//!     ReadingTemplate, SubjectTemplate, SubscriptionPath};
+//! use nv_telemetry_model::{SignalDescriptor, SignalKey, Subject};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let path = |names: &[&str]| SubscriptionPath::new(
+//!     names.iter().map(|name| PathElement::new(*name)).collect());
+//!
+//! let subject = Subject::builder().kind("sensor").id("sensor-a").build()?;
+//! let key = SignalKey::builder().subject(subject).facet("count").build()?;
+//! let descriptor = SignalDescriptor::builder().key(key).unit("1").build()?;
+//!
+//! let exact = Mapping::numeric_with_text(path(&["count"]), descriptor, NumericType::Uint);
+//!
+//! let collection = Mapping::collection_reading(path(&["entry", "count"]),
+//!     SubjectTemplate::new("sensor", IdentityValue::path_key(0, "name")),
+//!     ReadingTemplate::new(NumericType::Uint).with_text_parsing()
+//!         .with_facet("count").with_unit("1"));
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [`ConfiguredGet`] collects small snapshots through the existing polling APIs.
 //! One Get call produces one acquisition report, even when the target returns
 //! several notifications. Each notification retains its device timestamp and its

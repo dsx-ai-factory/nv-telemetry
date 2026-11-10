@@ -833,30 +833,357 @@ fn declared_numeric_types_preserve_precision_and_reject_incompatible_values() {
     ];
 
     for (kind, value, expected) in cases {
-        let parts = projection::project(
-            &spec(kind).projection,
-            wire::Notification {
-                update: vec![update(value.clone())],
-                ..Default::default()
-            },
-        )
-        .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
-        .expect("notification projects");
-
-        if let Some(expected) = expected {
-            let Payload::Readings(readings) = &parts.payloads()[0].1 else {
-                panic!("numeric payload")
+        for enabled in [false, true] {
+            let mapping = if enabled {
+                Mapping::numeric_with_text(path(&["leaf"]), descriptor("a"), kind)
+            } else {
+                Mapping::new(path(&["leaf"]), descriptor("a"), kind)
             };
 
-            assert_eq!(*readings.samples()[0].value(), expected, "{value:?}");
-            assert_eq!(readings.descriptors(), &[descriptor("a")]);
-            assert!(parts.issues().is_empty(), "{value:?}");
-        } else {
-            assert!(parts.payloads().is_empty(), "{value:?}");
-            assert_eq!(parts.issues().len(), 1, "{value:?}");
-            assert!(parts.issues()[0].path().contains("[0]"));
+            let spec = SubscriptionSpec::new(vec![path(&["leaf"])], vec![mapping]).unwrap();
+
+            let parts = projection::project(
+                &spec.projection,
+                wire::Notification {
+                    update: vec![update(value.clone())],
+                    ..Default::default()
+                },
+            )
+            .map(|(payloads, issues)| AcquisitionParts::new(payloads, issues))
+            .expect("notification projects");
+
+            if let Some(expected) = expected {
+                let Payload::Readings(readings) = &parts.payloads()[0].1 else {
+                    panic!("numeric payload")
+                };
+
+                assert_eq!(*readings.samples()[0].value(), expected, "{value:?}");
+                assert_eq!(readings.descriptors(), &[descriptor("a")]);
+                assert!(parts.issues().is_empty(), "{value:?}");
+            } else {
+                assert!(parts.payloads().is_empty(), "{value:?}");
+                assert_eq!(parts.issues().len(), 1, "{value:?}");
+                assert!(parts.issues()[0].path().contains("[0]"));
+            }
         }
     }
+}
+
+#[test]
+fn numeric_text_requires_opt_in_and_preserves_the_declared_type() {
+    use NumericType::*;
+    use NumericValue::Int as Signed;
+    use NumericValue::Uint as Unsigned;
+
+    let fractional = NumericValue::double(-1.25).unwrap();
+    let exponent = NumericValue::double(150.0).unwrap();
+    let rounded = NumericValue::double(9_007_199_254_740_992.0).unwrap();
+
+    let cases = [
+        (Int, "-9223372036854775808", Some(Signed(i64::MIN))),
+        (Int, "9223372036854775807", Some(Signed(i64::MAX))),
+        (Int, "+0042", Some(Signed(42))),
+        (Int, "-0", Some(Signed(0))),
+        (Int, "9223372036854775808", None),
+        (Int, "-9223372036854775809", None),
+        (Int, "1.0", None),
+        (Int, "1e2", None),
+        (Uint, "18446744073709551615", Some(Unsigned(u64::MAX))),
+        (
+            Uint,
+            "9007199254740993",
+            Some(Unsigned(9_007_199_254_740_993)),
+        ),
+        (Uint, "+0042", Some(Unsigned(42))),
+        (Uint, "0", Some(Unsigned(0))),
+        (Uint, "18446744073709551616", None),
+        (Uint, "-1", None),
+        (Uint, "-0", None),
+        (Uint, "1.0", None),
+        (Uint, "1e2", None),
+        (Double, "-1.25", Some(fractional)),
+        (Double, "+001.5e2", Some(exponent)),
+        (Double, "9007199254740993", Some(rounded)),
+        (Double, "NaN", None),
+        (Double, "inf", None),
+        (Double, "-inf", None),
+        (Double, "Infinity", None),
+        (Double, "1e999", None),
+    ];
+
+    let invalid = [Int, Uint, Double].into_iter().flat_map(|kind| {
+        [
+            "",
+            " 42",
+            "42 ",
+            "42\n",
+            "42ms",
+            "0x2a",
+            "1_000",
+            "target-secret",
+        ]
+        .into_iter()
+        .map(move |text| (kind, text, None))
+    });
+
+    for (kind, text, expected) in cases.into_iter().chain(invalid) {
+        for (enabled, ascii) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mapping = if enabled {
+                Mapping::numeric_with_text(path(&["leaf"]), descriptor("a"), kind)
+            } else {
+                Mapping::new(path(&["leaf"]), descriptor("a"), kind)
+            };
+
+            let spec = SubscriptionSpec::new(vec![path(&["leaf"])], vec![mapping]).unwrap();
+
+            let value = if ascii {
+                Value::AsciiVal(text.into())
+            } else {
+                Value::StringVal(text.into())
+            };
+
+            let (payloads, issues) = projection::project(
+                &spec.projection,
+                wire::Notification {
+                    update: vec![update(value)],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            if let Some(expected) = expected.filter(|_| enabled) {
+                let Payload::Readings(readings) = &payloads[0].1 else {
+                    panic!("readings")
+                };
+
+                assert_eq!(
+                    *readings.samples()[0].value(),
+                    expected,
+                    "{kind:?}: {text:?}"
+                );
+
+                assert_eq!(readings.descriptors(), &[descriptor("a")]);
+                assert!(issues.is_empty());
+            } else {
+                assert!(payloads.is_empty(), "{kind:?}: {text:?}");
+
+                let detail = if enabled {
+                    format!("text is not a valid {kind:?} value")
+                } else {
+                    "value does not match the declared type or exceeds the model limit".into()
+                };
+
+                assert_eq!(
+                    issues,
+                    vec![nv_telemetry_source::ProjectionIssue::invalid(
+                        "update[0].val",
+                        detail,
+                    )]
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn numeric_text_projects_consistently_through_stream_get_once_and_source_bindings() {
+    let requests = vec![path(&["leaf"]), path(&["entry"]), path(&["bad"])];
+
+    let mappings = vec![
+        Mapping::numeric_with_text(path(&["leaf"]), descriptor("a"), NumericType::Uint),
+        Mapping::numeric_with_text(path(&["bad"]), descriptor("bad"), NumericType::Int),
+        Mapping::collection_reading(
+            path(&["entry", "count"]),
+            SubjectTemplate::new("sensor", IdentityValue::path_key(0, "name")),
+            ReadingTemplate::new(NumericType::Double).with_text_parsing(),
+        ),
+    ];
+
+    let mut collection_path = wire_path(&["entry", "count"]);
+
+    collection_path.elem[0]
+        .key
+        .insert("name".into(), "b".into());
+
+    let notification = snapshot(
+        7_000_000_123,
+        vec![
+            update(Value::StringVal(u64::MAX.to_string())),
+            wire::Update {
+                path: Some(collection_path),
+                ..update(Value::AsciiVal("-2.5e1".into()))
+            },
+            wire::Update {
+                path: Some(wire_path(&["bad"])),
+                ..update(Value::StringVal("target-secret".into()))
+            },
+        ],
+    );
+
+    let mut script = once_script(vec![notification.clone()]);
+
+    script.get_responses = vec![wire::GetResponse {
+        notification: vec![notification],
+        ..Default::default()
+    }];
+
+    let mock = Mock::new(script);
+
+    let source = ConfiguredSubscription::new(
+        endpoint(),
+        mock.clone(),
+        SubscriptionSpec::new(requests.clone(), mappings.clone()).unwrap(),
+    )
+    .unwrap();
+
+    let mut stream = source.perform().await.unwrap();
+
+    let parts = stream.next().await.unwrap().unwrap();
+
+    let mut sourced = source.subscribe_with_sources().await.unwrap();
+
+    let sourced = sourced.next().await.unwrap().unwrap();
+
+    let get = mock
+        .get(GetSpec::new(requests.clone(), mappings.clone()).unwrap())
+        .perform()
+        .await
+        .unwrap();
+
+    let once = mock
+        .once(OnceSpec::new(requests, mappings).unwrap())
+        .perform()
+        .await
+        .unwrap();
+
+    assert_eq!(get, once);
+    assert_eq!(get.payloads(), parts.payloads());
+    assert_eq!(get.issues().len(), 1);
+
+    assert_eq!(
+        get.issues()[0],
+        parts.issues()[0].clone().at_index("notification", 0)
+    );
+
+    assert_eq!(sourced.parts(), &parts);
+    assert_eq!(parts.issues().len(), 1);
+    assert_eq!(sourced.bindings().len(), 2);
+
+    let Payload::Readings(readings) = &parts.payloads()[0].1 else {
+        panic!("readings")
+    };
+
+    let actual: std::collections::BTreeMap<_, _> = readings
+        .samples()
+        .iter()
+        .map(|reading| (reading.key().subject().id(), *reading.value()))
+        .collect();
+
+    assert_eq!(
+        actual,
+        std::collections::BTreeMap::from([
+            ("a", NumericValue::Uint(u64::MAX)),
+            ("b", NumericValue::double(-25.0).unwrap()),
+        ])
+    );
+
+    for binding in sourced.bindings() {
+        let ObservationIdentity::Reading(key) = binding.identity() else {
+            panic!("reading identity")
+        };
+
+        assert!(readings
+            .samples()
+            .iter()
+            .any(|reading| reading.key() == key));
+
+        assert_eq!(
+            binding.source().elements().last().unwrap().name(),
+            if key.subject().id() == "a" {
+                "leaf"
+            } else {
+                "count"
+            }
+        );
+    }
+
+    assert!(readings
+        .samples()
+        .iter()
+        .all(|reading| reading.observed_at() == Some(&Timestamp::new(7, 123).unwrap())));
+}
+
+#[test]
+fn numeric_text_keeps_final_values_and_excludes_collisions_from_source_bindings() {
+    let spec = SubscriptionSpec::new(
+        vec![path(&["entry"])],
+        vec![Mapping::collection_reading(
+            path(&["entry", "count"]),
+            SubjectTemplate::new("sensor", IdentityValue::path_key(0, "name")),
+            ReadingTemplate::new(NumericType::Uint).with_text_parsing(),
+        )],
+    )
+    .unwrap();
+
+    let make = |name: &str, source: &str, value| {
+        let mut path = wire_path(&["entry", "count"]);
+
+        path.elem[0].key.extend([
+            ("name".into(), name.into()),
+            ("source".into(), source.into()),
+        ]);
+
+        wire::Update {
+            path: Some(path),
+            ..update(value)
+        }
+    };
+
+    let notification = snapshot(
+        1,
+        vec![
+            make("stale", "one", Value::StringVal("1".into())),
+            make("stale", "one", Value::AsciiVal("invalid".into())),
+            make("collision", "one", Value::StringVal("2".into())),
+            make("collision", "two", Value::AsciiVal("3".into())),
+            make("good", "one", Value::AsciiVal("4".into())),
+            make("good", "one", Value::StringVal("5".into())),
+            make("good", "two", Value::StringVal("invalid".into())),
+        ],
+    );
+
+    let projected = projection::project_with_sources(&spec.projection, notification).unwrap();
+
+    let Payload::Readings(readings) = &projected.parts().payloads()[0].1 else {
+        panic!("readings")
+    };
+
+    assert_eq!(readings.samples().len(), 1);
+    assert_eq!(readings.samples()[0].key().subject().id(), "good");
+    assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(5));
+    assert_eq!(projected.bindings().len(), 1);
+
+    assert_eq!(
+        projected.bindings()[0].source().elements()[0].keys()["source"],
+        "one"
+    );
+
+    let issues: BTreeSet<_> = projected
+        .parts()
+        .issues()
+        .iter()
+        .map(nv_telemetry_source::ProjectionIssue::path)
+        .collect();
+
+    assert_eq!(
+        issues,
+        BTreeSet::from([
+            "update[1].val",
+            "update[2].path",
+            "update[3].path",
+            "update[6].val",
+        ])
+    );
 }
 
 #[test]

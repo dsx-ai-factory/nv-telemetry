@@ -309,15 +309,52 @@ impl ProjectedObservation {
 fn project_value(
     mapping: &Mapping,
     path: &SubscriptionPath,
-    value: Option<Value>,
+    mut value: Option<Value>,
     observed_at: Timestamp,
     location: &UpdateLocation,
     issues: &mut Vec<ProjectionIssue>,
 ) -> Result<Option<ProjectedObservation>, AcquisitionFailure> {
+    let numeric_text_type = match &mapping.kind {
+        MappingKind::Reading {
+            numeric_type,
+            parse_text: true,
+            ..
+        } => Some(*numeric_type),
+        MappingKind::Collection {
+            target: CollectionTarget::Reading(template),
+            ..
+        } if template.parse_text => Some(template.numeric_type),
+        _ => None,
+    };
+
+    // Convert native text into the declared numeric variant before projection.
+    // Parse integers directly as i64 or u64 to preserve all 64 bits.
+    if let (Some(kind), Some(Value::StringVal(text) | Value::AsciiVal(text))) =
+        (numeric_text_type, value.as_ref())
+    {
+        let parsed = match kind {
+            NumericType::Int => text.parse().ok().map(Value::IntVal),
+            NumericType::Uint => text.parse().ok().map(Value::UintVal),
+            NumericType::Double => text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(Value::DoubleVal),
+        };
+
+        let Some(parsed) = parsed else {
+            issues.push(location.issue("val", &format!("text is not a valid {kind:?} value")));
+            return Ok(None);
+        };
+
+        value = Some(parsed);
+    }
+
     let result = match &mapping.kind {
         MappingKind::Reading {
             descriptor,
             numeric_type,
+            ..
         } => reading(descriptor, *numeric_type, value, observed_at)?
             .map(|sample| ProjectedObservation::Reading(descriptor.clone(), sample)),
         MappingKind::State { target, value_type } => {
