@@ -1715,7 +1715,8 @@ async fn request_options_preserve_modes_order_and_overlaps_across_acquisitions()
     .expect("mixed request options")
     .with_origin("example")
     .with_target("endpoint-a")
-    .with_encoding(Encoding::JsonIetf);
+    .with_encoding(Encoding::JsonIetf)
+    .with_updates_only(true);
 
     let unit = ConfiguredSubscription::new(endpoint(), mock, spec).expect("subscription");
 
@@ -1756,6 +1757,7 @@ async fn request_options_preserve_modes_order_and_overlaps_across_acquisitions()
                 ],
                 mode: wire::subscription_list::Mode::Stream as i32,
                 encoding: wire::Encoding::JsonIetf as i32,
+                updates_only: true,
                 ..Default::default()
             },
         )),
@@ -1763,6 +1765,78 @@ async fn request_options_preserve_modes_order_and_overlaps_across_acquisitions()
     };
 
     assert_eq!(requests.as_slice(), &[expected.clone(), expected]);
+}
+
+#[tokio::test]
+async fn updates_only_defaults_and_overrides_reach_all_stream_apis() {
+    let explicit = SubscriptionSpec::from_requests(
+        vec![SubscriptionRequest::on_change(path(&["leaf"]))],
+        vec![Mapping::new(
+            path(&["leaf"]),
+            descriptor("a"),
+            NumericType::Uint,
+        )],
+    )
+    .expect("explicit subscription mode");
+
+    for base in [spec(NumericType::Uint), explicit] {
+        for enabled in [None, Some(true), Some(false)] {
+            let mut expected = base.request();
+
+            let Some(wire::subscribe_request::Request::Subscribe(list)) = &mut expected.request
+            else {
+                panic!("subscription list")
+            };
+
+            assert!(!list.updates_only);
+            list.updates_only = enabled.unwrap_or(false);
+
+            let configured = match enabled {
+                Some(value) => base
+                    .clone()
+                    .with_updates_only(true)
+                    .with_updates_only(value),
+                None => base.clone(),
+            };
+
+            let mock = Mock::new(Script {
+                responses: vec![
+                    notification(vec![update(Value::UintVal(3))]),
+                    wire::SubscribeResponse {
+                        response: Some(wire::subscribe_response::Response::SyncResponse(true)),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            });
+
+            let source = ConfiguredSubscription::new(endpoint(), mock.clone(), configured).unwrap();
+
+            drop(source.perform().await.unwrap());
+            drop(source.subscribe_with_sources().await.unwrap());
+
+            let mut events = source.subscribe_events().await.unwrap();
+
+            // Requesting updates only does not filter a target's pre-sync notification.
+            let SubscriptionEvent::Notification(notification) =
+                events.next().await.unwrap().unwrap()
+            else {
+                panic!("notification before synchronization")
+            };
+
+            assert_eq!(notification.parts().payloads().len(), 1);
+
+            assert_eq!(
+                events.next().await.unwrap().unwrap(),
+                SubscriptionEvent::Synchronized
+            );
+
+            assert_eq!(
+                mock.requests.lock().unwrap().as_slice(),
+                &[expected.clone(), expected.clone(), expected]
+            );
+        }
+    }
 }
 
 #[test]
