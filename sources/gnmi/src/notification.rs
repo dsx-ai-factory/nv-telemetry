@@ -174,3 +174,22 @@ impl ProjectedNotification {
         (self.parts, self.bindings, self.deletions)
     }
 }
+
+/// A notification or synchronization marker from a STREAM subscription.
+///
+/// Use [`crate::ConfiguredSubscription::subscribe_events`] when the caller needs
+/// to know when the target has finished its initial transfer. Events retain their
+/// received order. Readiness and reconciliation decisions belong to the caller.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionEvent {
+    /// Projected observations, issues, source bindings, and deletion paths.
+    Notification(ProjectedNotification),
+
+    /// The target sent `sync_response=true`, completing its initial transfer.
+    ///
+    /// Repeated true responses each produce an event; false responses are ignored.
+    /// This marker produces no acquisition report or status. It does not establish
+    /// mapping coverage, successful projection of every value, or permission to
+    /// remove retained observations.
+    Synchronized,
+}

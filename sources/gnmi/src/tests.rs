@@ -5230,7 +5230,10 @@ async fn source_notifications_share_controls_terminal_failures_and_projection_er
 
     // The shared loop must end if projection fails, before any later notification.
     let mut failed = source
-        .subscribe::<(), _>(|_, _| Err(AcquisitionFailure::new(Class::Internal)))
+        .subscribe::<(), _>(
+            |_, _| Err(AcquisitionFailure::new(Class::Internal)),
+            || None,
+        )
         .await
         .unwrap();
 
@@ -5327,5 +5330,273 @@ fn source_bindings_deduplicate_within_the_effective_origin() {
                 assert_eq!(readings.samples()[0].value(), &NumericValue::Uint(2));
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn subscription_events_preserve_order_and_existing_notification_outputs() {
+    use wire::subscribe_response::Response;
+
+    let sync = |complete| wire::SubscribeResponse {
+        response: Some(Response::SyncResponse(complete)),
+        ..Default::default()
+    };
+
+    let replaced = wire::SubscribeResponse {
+        response: Some(Response::Update(wire::Notification {
+            timestamp: 7_000_000_123,
+            update: vec![update(Value::UintVal(9))],
+            delete: vec![wire_path(&["leaf"])],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+
+    let mock = Mock::new(Script {
+        responses: vec![
+            sync(false),
+            sync(true),
+            notification(vec![]),
+            notification(vec![update(Value::BoolVal(true))]),
+            replaced,
+            sync(true),
+            sync(true),
+            sync(false),
+        ],
+        ..Default::default()
+    });
+
+    let source = mock.subscription();
+
+    let mut events = source.subscribe_events().await.expect("event stream");
+
+    let mut sourced = source
+        .subscribe_with_sources()
+        .await
+        .expect("source stream");
+
+    let mut standard = source.perform().await.expect("acquisition stream");
+
+    let mut order = Vec::new();
+    let mut counts = Vec::new();
+
+    while let Some(event) = events.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(failure) => {
+                assert_eq!(failure.class(), Class::Protocol);
+                assert_eq!(failure.retryable(), Some(true));
+                assert_eq!(sourced.next().await.unwrap().unwrap_err(), failure);
+                assert_eq!(standard.next().await.unwrap().unwrap_err(), failure);
+                order.push("error");
+                break;
+            }
+        };
+
+        match event {
+            SubscriptionEvent::Synchronized => order.push("sync"),
+            SubscriptionEvent::Notification(notification) => {
+                assert_eq!(sourced.next().await.unwrap().unwrap(), notification);
+                let parts = standard.next().await.unwrap().unwrap();
+
+                assert_eq!(parts.payloads(), notification.parts().payloads());
+
+                if notification.deletions().is_empty() {
+                    assert_eq!(parts.issues(), notification.parts().issues());
+                } else {
+                    assert_eq!(parts.issues().len(), 1);
+                    assert_eq!(parts.issues()[0].path(), "delete[0]");
+                }
+
+                counts.push((
+                    notification.parts().payloads().len(),
+                    notification.parts().issues().len(),
+                ));
+
+                order.push("notification");
+
+                if !notification.bindings().is_empty() {
+                    assert_eq!(notification.observed_at(), Timestamp::new(7, 123).unwrap());
+                    assert_eq!(notification.bindings().len(), 1);
+                    assert_eq!(notification.deletions().len(), 1);
+                    assert!(notification.deletions()[0].covers(notification.bindings()[0].source()));
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        order,
+        [
+            "sync",
+            "notification",
+            "notification",
+            "notification",
+            "sync",
+            "sync",
+            "error"
+        ]
+    );
+
+    assert_eq!(counts, [(0, 0), (0, 1), (1, 0)]);
+
+    assert!(events.next().await.is_none());
+    assert!(sourced.next().await.is_none());
+    assert!(standard.next().await.is_none());
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn subscription_events_classify_opening_and_terminal_errors_before_or_after_sync() {
+    use wire::subscribe_response::Response;
+
+    for (code, class, retryable, opening_error, synced) in [
+        (Code::Unavailable, Class::Connectivity, true, true, false),
+        (Code::Unavailable, Class::Connectivity, true, false, false),
+        (Code::Unavailable, Class::Connectivity, true, false, true),
+        (
+            Code::Unauthenticated,
+            Class::Authentication,
+            false,
+            true,
+            false,
+        ),
+        (Code::DataLoss, Class::Protocol, false, false, true),
+    ] {
+        let responses = synced
+            .then(|| wire::SubscribeResponse {
+                response: Some(Response::SyncResponse(true)),
+                ..Default::default()
+            })
+            .into_iter()
+            .collect();
+
+        let mock = Mock::new(Script {
+            responses,
+            status: Some(code),
+            opening_error,
+            ..Default::default()
+        });
+
+        let source = mock.subscription();
+
+        let failure = match source.subscribe_events().await {
+            Err(failure) => {
+                assert!(opening_error);
+                failure
+            }
+            Ok(mut stream) => {
+                assert!(!opening_error);
+
+                if synced {
+                    assert_eq!(
+                        stream.next().await.unwrap().unwrap(),
+                        SubscriptionEvent::Synchronized
+                    );
+                }
+
+                let failure = stream.next().await.unwrap().unwrap_err();
+
+                assert!(stream.next().await.is_none());
+                failure
+            }
+        };
+
+        assert_eq!(failure.class(), class);
+        assert_eq!(failure.retryable(), Some(retryable));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[allow(deprecated)]
+    let responses = [
+        wire::SubscribeResponse::default(),
+        wire::SubscribeResponse {
+            response: Some(Response::Error(wire::Error {
+                code: Code::DataLoss as u32,
+                message: "target-secret".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+    ];
+
+    for response in responses {
+        let mock = Mock::new(Script {
+            responses: vec![response],
+            ..Default::default()
+        });
+
+        let source = mock.subscription();
+
+        let mut events = source.subscribe_events().await.unwrap();
+        let failure = events.next().await.unwrap().unwrap_err();
+
+        assert_eq!(failure.class(), Class::Protocol);
+        assert!(!format!("{failure:?}").contains("target-secret"));
+        assert!(events.next().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn subscription_events_cancel_pending_open_and_independent_idle_instances() {
+    use wire::subscribe_response::Response;
+
+    let mock = Mock::new(Script {
+        hold_connect: true,
+        ..Default::default()
+    });
+
+    let source = mock.subscription();
+
+    let mut opening = Box::pin(source.subscribe_events());
+
+    assert!(futures_util::poll!(&mut opening).is_pending());
+    drop(opening);
+
+    assert_eq!(mock.dropped.load(Ordering::SeqCst), 1);
+
+    for synced in [false, true] {
+        let responses = synced
+            .then(|| wire::SubscribeResponse {
+                response: Some(Response::SyncResponse(true)),
+                ..Default::default()
+            })
+            .into_iter()
+            .collect();
+
+        let mock = Mock::new(Script {
+            responses,
+            hold_open: true,
+            ..Default::default()
+        });
+
+        let source = mock.subscription();
+
+        let mut first = source.subscribe_events().await.unwrap();
+        let mut second = source.subscribe_events().await.unwrap();
+
+        drop(source);
+
+        if synced {
+            assert_eq!(
+                first.next().await.unwrap().unwrap(),
+                SubscriptionEvent::Synchronized
+            );
+
+            assert_eq!(
+                second.next().await.unwrap().unwrap(),
+                SubscriptionEvent::Synchronized
+            );
+        }
+
+        assert!(futures_util::poll!(first.next()).is_pending());
+        drop(first);
+
+        assert_eq!(mock.dropped.load(Ordering::SeqCst), 1);
+        assert!(futures_util::poll!(second.next()).is_pending());
+        drop(second);
+
+        assert_eq!(mock.dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
     }
 }
