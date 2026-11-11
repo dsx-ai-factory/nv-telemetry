@@ -263,6 +263,76 @@ pub(crate) fn project_event_record(
     } {
         event_record_attributes_entries.push(("context".to_owned(), value));
     }
+    if let Some(value) = match event_record.origin_of_condition.as_ref() {
+        Some(value) => {
+            let value = crate::projection::ReferenceId::reference_id(value).to_string();
+            if value.is_empty() {
+                issues
+                    .push(
+                        ::nv_telemetry_source::ProjectionIssue::invalid(
+                            "EventRecord.OriginOfCondition",
+                            "`string_value`: present but empty",
+                        ),
+                    );
+                None
+            } else if value.len()
+                > ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize
+            {
+                issues
+                    .push(
+                        ::nv_telemetry_source::ProjectionIssue::invalid(
+                            "EventRecord.OriginOfCondition",
+                            format!(
+                                "`string_value`: {} bytes long, over the schema's bound of {}",
+                                value.len(),
+                                ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN
+                            ),
+                        ),
+                    );
+                None
+            } else {
+                Some(::nv_telemetry_model::Value::string(value)?)
+            }
+        }
+        None => None,
+    } {
+        event_record_attributes_entries.push(("origin-of-condition".to_owned(), value));
+    }
+    if let Some(value) = match event_record.log_entry.as_ref() {
+        Some(value) => {
+            let value = crate::projection::ReferenceId::reference_id(value).to_string();
+            if value.is_empty() {
+                issues
+                    .push(
+                        ::nv_telemetry_source::ProjectionIssue::invalid(
+                            "EventRecord.LogEntry",
+                            "`string_value`: present but empty",
+                        ),
+                    );
+                None
+            } else if value.len()
+                > ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN as usize
+            {
+                issues
+                    .push(
+                        ::nv_telemetry_source::ProjectionIssue::invalid(
+                            "EventRecord.LogEntry",
+                            format!(
+                                "`string_value`: {} bytes long, over the schema's bound of {}",
+                                value.len(),
+                                ::nv_telemetry_model::limits::VALUE_STRING_VALUE_MAX_LEN
+                            ),
+                        ),
+                    );
+                None
+            } else {
+                Some(::nv_telemetry_model::Value::string(value)?)
+            }
+        }
+        None => None,
+    } {
+        event_record_attributes_entries.push(("log-entry".to_owned(), value));
+    }
     let mut log_records = Vec::new();
     if event_record_message.is_some() {
         let mut builder = ::nv_telemetry_model::LogRecord::builder();

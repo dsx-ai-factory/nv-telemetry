@@ -7,8 +7,8 @@
 # time.
 #
 # An event is a fact in its own right, as a log entry is, so the manifest
-# declares no subject; `LogRecord.subject` waits for navigation references
-# (`OriginOfCondition`, `LogEntry`) to be projectable. The stream provider
+# declares no subject. Navigation identifiers are attributes; consumers use
+# them to associate resources and correlate log entries. The stream provider
 # takes the records out of each Event's `Events` array; this projects a
 # single record. A record's identity is the device's `EventId`, which
 # restarts with the device and is unique within one stream; the provider's
@@ -79,6 +79,14 @@ projections {
     entries {
       key: "context"
       source_path: "Context"
+    }
+    entries {
+      key: "origin-of-condition"
+      source_path: "OriginOfCondition"
+    }
+    entries {
+      key: "log-entry"
+      source_path: "LogEntry"
     }
   }
 }

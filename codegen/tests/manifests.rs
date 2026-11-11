@@ -247,6 +247,119 @@ fn event_projection(name: &str) -> ProjectionSpec {
     }
 }
 
+/// A log attribute fixture independent of the source's structural fields.
+fn reference_projection(source_type: &str, source_path: &str) -> ProjectionSpec {
+    ProjectionSpec {
+        source_type: source_type.to_owned(),
+        fields: Vec::new(),
+        constants: vec![ConstantSpec {
+            target_field: "message".to_owned(),
+            value: "reference attribute".to_owned(),
+        }],
+        map_assemblies: vec![AssemblySpec {
+            target_field: "attributes".to_owned(),
+            anchor: true,
+            entries: vec![EntrySpec {
+                key: "reference".to_owned(),
+                source_path: source_path.to_owned(),
+                null_policy: ABSENT,
+                value_map: Vec::new(),
+            }],
+        }],
+        ..event_projection("reference")
+    }
+}
+
+#[test]
+fn singular_navigation_identifiers_emit_borrowed_attribute_access() {
+    for property in ["OriginOfCondition", "LogEntry"] {
+        let projection = reference_projection("EventRecord", property);
+
+        passes(manifest(vec![projection.clone()]));
+        let module = emitted_module(vec![projection]);
+
+        assert!(module.contains("crate::projection::ReferenceId::reference_id(value).to_string()"));
+        assert!(module.contains(".as_ref()"));
+        assert!(module.contains(&format!("EventRecord.{property}")));
+        assert!(module.contains("`string_value`: present but empty"));
+        assert!(module.contains("VALUE_STRING_VALUE_MAX_LEN"));
+        assert!(module.contains("None => None"));
+        assert!(!module.contains(".get("));
+    }
+}
+
+#[test]
+fn navigation_identifiers_support_structural_prefixes() {
+    let projection = reference_projection("Chassis", "Links.ContainedBy");
+
+    passes(manifest(vec![projection.clone()]));
+    let module = emitted_module(vec![projection]);
+
+    assert!(module.contains(".links\n        .as_ref()"), "{module}");
+    assert!(module.contains("and_then(|value| value.contained_by.as_ref())"));
+    assert!(module.contains("Chassis.Links.ContainedBy"));
+}
+
+#[test]
+fn navigation_identifiers_reject_unsupported_schema_shapes() {
+    for (source, path) in [
+        ("ServiceRoot", "Links.Sessions"),
+        ("Chassis", "Links.Contains"),
+        ("DriveMetrics", "PredictedMediaLifeLeftPercent"),
+    ] {
+        let projection = reference_projection(source, path);
+
+        let violations = violations_of(&[manifest(vec![projection])]);
+
+        assert!(
+            violations.iter().any(|violation| violation
+                .to_string()
+                .contains("optional nonnullable singular nonexcerpt")),
+            "{source}.{path}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn navigation_identifiers_cannot_be_remapped_or_treat_null_as_invalid() {
+    let mut remapped = reference_projection("EventRecord", "OriginOfCondition");
+    remapped.map_assemblies[0].entries[0].value_map =
+        vec![("/received".to_owned(), "/replacement".to_owned())];
+
+    rejects(manifest(vec![remapped]), "without remapping");
+
+    let mut null_invalid = reference_projection("EventRecord", "OriginOfCondition");
+    null_invalid.map_assemblies[0].entries[0].null_policy = 2;
+
+    rejects(manifest(vec![null_invalid]), "navigation reference");
+}
+
+#[test]
+fn navigation_identifiers_are_limited_to_attribute_assemblies() {
+    let mut wrong_assembly = reference_projection("EventRecord", "OriginOfCondition");
+    wrong_assembly.target_type = "nv.telemetry.v1.StateObservation".to_owned();
+    wrong_assembly.map_assemblies[0].target_field = "value".to_owned();
+
+    rejects(manifest(vec![wrong_assembly]), "navigation reference");
+
+    let mut direct = event_projection("direct-reference");
+    direct.fields.push(field("OriginOfCondition", "entry_id"));
+
+    rejects(manifest(vec![direct]), "OriginOfCondition");
+}
+
+#[test]
+fn navigation_paths_cannot_traverse_referenced_resources() {
+    for path in ["OriginOfCondition.Id", "LogEntry.Message"] {
+        let projection = reference_projection("EventRecord", path);
+
+        rejects(manifest(vec![projection]), path);
+    }
+
+    assert!(INDEX.resolve("EventRecord", "OriginOfCondition").is_none());
+    assert!(INDEX.resolve("EventRecord", "LogEntry").is_none());
+}
+
 fn manifest(projections: Vec<ProjectionSpec>) -> ManifestSpec {
     ManifestSpec {
         path: manifest_path("sources/redfish/manifests/test.textpb"),

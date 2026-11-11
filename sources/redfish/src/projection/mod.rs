@@ -14,6 +14,11 @@
 //!   because the device answered and the answer cannot be represented, which
 //!   is a different fact from silence.
 
+use nv_redfish::core::EntityTypeRef;
+use nv_redfish::core::NavProperty;
+use nv_redfish::core::ODataId;
+use nv_redfish::core::ReferenceLeaf;
+
 pub(crate) use crate::generated::chassis::project_chassis;
 pub(crate) use crate::generated::chassis::ChassisParts;
 pub(crate) use crate::generated::events::project_event_record;
@@ -21,6 +26,24 @@ pub(crate) use crate::generated::firmware::project_software_inventory;
 pub(crate) use crate::generated::logs::project_log_entry;
 pub(crate) use crate::generated::sensor::project_sensor;
 pub(crate) use crate::generated::sensor::SensorParts;
+
+/// Borrows a navigation identifier without loading the referenced resource.
+/// The generated source uses either wrapper depending on enabled resource types.
+pub(crate) trait ReferenceId {
+    fn reference_id(&self) -> &ODataId;
+}
+
+impl ReferenceId for ReferenceLeaf {
+    fn reference_id(&self) -> &ODataId {
+        &self.odata_id
+    }
+}
+
+impl<T: EntityTypeRef> ReferenceId for NavProperty<T> {
+    fn reference_id(&self) -> &ODataId {
+        self.id()
+    }
+}
 
 // The pins below plant what no fixture can: serde_json rejects non-finite
 // literals before projection ever runs, so the decoded shape is built and
