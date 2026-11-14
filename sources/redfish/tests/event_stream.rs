@@ -8,6 +8,7 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -15,6 +16,7 @@ use futures_util::StreamExt as _;
 use nv_redfish_bmc_mock::Bmc;
 use nv_redfish_bmc_mock::Expect;
 use nv_telemetry_model::EndpointContext;
+use nv_telemetry_model::LogRecord;
 use nv_telemetry_model::Payload;
 use nv_telemetry_model::Severity;
 use nv_telemetry_model::Timestamp;
@@ -183,6 +185,200 @@ async fn an_event_payload_is_one_logs_batch_under_the_streams_scope() {
     assert_eq!(end.class(), AcquisitionFailureClass::Protocol);
     assert_eq!(end.retryable(), Some(true));
     assert_eq!(end.detail(), Some("the device closed the event stream"));
+}
+
+#[tokio::test]
+async fn event_references_preserve_identifiers_without_fetching_resources() {
+    let origin = "/redfish/v1/Chassis/1/../1?view=%2f#device";
+    let entry = "/redfish/v1/Systems/1/LogServices/SEL/Entries/2";
+
+    let expanded_entry: Json =
+        serde_json::from_str(include_str!("fixtures/logs/entry-minimal.json")).unwrap();
+
+    let cases = [
+        (None, None, None, None),
+        (Some(Json::Null), Some(Json::Null), None, None),
+        (Some(json!({"@odata.id": origin})), None, Some(origin), None),
+        (None, Some(json!({"@odata.id": entry})), None, Some(entry)),
+        (
+            Some(json!({"@odata.id": origin})),
+            Some(json!({"@odata.id": entry})),
+            Some(origin),
+            Some(entry),
+        ),
+        (
+            Some(json!({"@odata.id": origin, "Name": "expanded resource"})),
+            Some(expanded_entry),
+            Some(origin),
+            Some(entry),
+        ),
+    ];
+
+    for (origin_value, entry_value, expected_origin, expected_entry) in cases {
+        let mut payload = powered_on(7);
+        let record = payload["Events"][0].as_object_mut().unwrap();
+
+        record.remove("OriginOfCondition");
+
+        for (field, value) in [
+            ("OriginOfCondition", origin_value),
+            ("LogEntry", entry_value),
+        ] {
+            if let Some(value) = value {
+                record.insert(field.to_owned(), value);
+            }
+        }
+
+        let mut attributes = BTreeMap::from([
+            (
+                "message-id".to_owned(),
+                Value::string("ResourceEvent.1.3.ResourcePoweredOn").unwrap(),
+            ),
+            ("event-type".to_owned(), Value::string("Alert").unwrap()),
+            ("member-id".to_owned(), Value::string("0").unwrap()),
+        ]);
+
+        for (key, value) in [
+            ("origin-of-condition", expected_origin),
+            ("log-entry", expected_entry),
+        ] {
+            if let Some(value) = value {
+                attributes.insert(key.to_owned(), Value::string(value).unwrap());
+            }
+        }
+
+        let expected = LogRecord::builder()
+            .entry_id("7")
+            .occurred_at(Timestamp::new(1_772_359_500, 0).unwrap())
+            .severity(Severity::Info)
+            .message("The resource /redfish/v1/Systems/1 has powered on.")
+            .attributes(attributes)
+            .build()
+            .unwrap();
+
+        // Discovery and SSE are the only scripted requests; reference GETs would fail.
+        let items = open(&[payload]).await;
+
+        assert_eq!(items.len(), 2);
+
+        let acquired = parts(&items[0]);
+
+        assert!(acquired.issues().is_empty());
+
+        let Payload::Logs(logs) = &acquired.payloads()[0].1 else {
+            panic!("events project into logs");
+        };
+
+        assert_eq!(logs.records(), &[expected]);
+    }
+}
+
+#[tokio::test]
+async fn event_reference_limits_preserve_the_record_and_valid_sibling() {
+    for (field, attribute, sibling_field, sibling_attribute) in [
+        (
+            "OriginOfCondition",
+            "origin-of-condition",
+            "LogEntry",
+            "log-entry",
+        ),
+        (
+            "LogEntry",
+            "log-entry",
+            "OriginOfCondition",
+            "origin-of-condition",
+        ),
+    ] {
+        for (length, expected_detail) in [
+            (0, Some("`string_value`: present but empty")),
+            (4096, None),
+            (
+                4097,
+                Some("`string_value`: 4097 bytes long, over the schema's bound of 4096"),
+            ),
+        ] {
+            let identifier = "x".repeat(length);
+            let mut payload = powered_on(7);
+
+            payload["Events"][0][field] = json!({"@odata.id": identifier});
+            payload["Events"][0][sibling_field] = json!({"@odata.id": "/redfish/v1/resource"});
+
+            let first = powered_on(8)["Events"][0].clone();
+
+            payload["Events"].as_array_mut().unwrap().insert(0, first);
+
+            let items = open(&[payload]).await;
+            let acquired = parts(&items[0]);
+
+            let Payload::Logs(logs) = &acquired.payloads()[0].1 else {
+                panic!("events project into logs");
+            };
+
+            assert_eq!(logs.records().len(), 2);
+
+            let record = logs
+                .records()
+                .iter()
+                .find(|record| record.entry_id() == Some("7"))
+                .unwrap();
+
+            assert_eq!(
+                record.message(),
+                "The resource /redfish/v1/Systems/1 has powered on."
+            );
+
+            let attributes = record.attributes().unwrap();
+
+            assert_eq!(
+                attributes.get(sibling_attribute),
+                Some(&Value::string("/redfish/v1/resource").unwrap())
+            );
+
+            if let Some(detail) = expected_detail {
+                assert_eq!(attributes.get(attribute), None);
+
+                assert_eq!(
+                    acquired.issues(),
+                    &[
+                        ProjectionIssue::invalid(format!("EventRecord.{field}"), detail)
+                            .at_index("Events", 1)
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    attributes.get(attribute),
+                    Some(&Value::string(identifier).unwrap())
+                );
+
+                assert!(acquired.issues().is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_event_references_report_the_payload_and_allow_later_events() {
+    for field in ["OriginOfCondition", "LogEntry"] {
+        for invalid in [json!({}), json!({"@odata.id": 7}), json!("not an object")] {
+            let mut payload = powered_on(7);
+
+            payload["Events"][0][field] = invalid;
+
+            let items = open(&[payload, powered_on(8)]).await;
+
+            assert_eq!(items.len(), 3);
+            assert!(parts(&items[0]).payloads().is_empty());
+            assert_eq!(parts(&items[0]).issues().len(), 1);
+            assert_eq!(parts(&items[0]).issues()[0].path(), PAYLOAD_LOCATOR);
+            assert!(parts(&items[1]).issues().is_empty());
+
+            let Payload::Logs(logs) = &parts(&items[1]).payloads()[0].1 else {
+                panic!("the later event projects into logs");
+            };
+
+            assert_eq!(logs.records()[0].entry_id(), Some("8"));
+        }
+    }
 }
 
 /// `powered_on`, with the record's `MessageSeverity` replaced by the

@@ -220,6 +220,7 @@ pub enum Reason {
     },
     UnknownSourceType(String),
     UnknownSourcePath(String),
+    UnsupportedReference(String),
     UnknownTargetType(String),
     UnvalidatedTarget(String),
     UnsupportedTargetProfile(String),
@@ -381,6 +382,11 @@ impl fmt::Display for Reason {
                 f,
                 "`{path}` resolves to no field in the schema index; it would \
                  extract nothing and report nothing"
+            ),
+            Self::UnsupportedReference(path) => write!(
+                f,
+                "navigation reference `{path}` requires an optional nonnullable singular nonexcerpt \
+                 property in an `attributes` assembly, without remapping and with absent null handling"
             ),
             Self::UnknownTargetType(name) => write!(
                 f,
@@ -1510,6 +1516,27 @@ impl<'a, 'b> Checker<'a, 'b> {
                 // The empty case has the more specific diagnostic above.
                 self.check_static_text("assembly entry key", &entry.key, &key);
             }
+
+            // Navigation identifiers are preserved only as attributes. They do
+            // not participate in ordinary scalar mappings or subject identity.
+            if let Some(reference) = self.index.reference(self.source_type, &entry.source_path) {
+                if assembly.target_field != "attributes"
+                    || reference.shape != crate::projection::index::Shape::Optional
+                    || reference.collection
+                    || reference.excerpt
+                    || reference
+                        .prefix
+                        .iter()
+                        .any(|step| step.nullable || step.collection)
+                    || !entry.value_map.is_empty()
+                    || !matches!(entry.null_policy, NULL_UNSPECIFIED | NULL_ABSENT)
+                {
+                    self.push(Reason::UnsupportedReference(entry.source_path.clone()));
+                }
+
+                continue;
+            }
+
             let resolved =
                 self.check_source(&entry.source_path, entry.null_policy, &entry.value_map);
             if let (Some(resolved), Some(target)) = (

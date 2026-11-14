@@ -173,6 +173,18 @@ pub(crate) const PROVENANCE: &[Extraction] = &[
         target: "nv.telemetry.v1.LogRecord.attributes[\"context\"]",
     },
     Extraction {
+        manifest: "sources/redfish/manifests/events.textpb",
+        projection: "event-record",
+        source: "EventRecord.OriginOfCondition",
+        target: "nv.telemetry.v1.LogRecord.attributes[\"origin-of-condition\"]",
+    },
+    Extraction {
+        manifest: "sources/redfish/manifests/events.textpb",
+        projection: "event-record",
+        source: "EventRecord.LogEntry",
+        target: "nv.telemetry.v1.LogRecord.attributes[\"log-entry\"]",
+    },
+    Extraction {
         manifest: "sources/redfish/manifests/firmware.textpb",
         projection: "firmware-inventory",
         source: "SoftwareInventory.Id",

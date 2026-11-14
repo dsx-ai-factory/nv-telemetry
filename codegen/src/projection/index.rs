@@ -12,14 +12,24 @@
 //! primitive. [`RedfishIndex::steps`] adapts that walk into the emitter's
 //! [`Step`] rows; the leaf view and the segment view are one walk inside
 //! the query, so the two cannot disagree.
+//!
+//! Terminal navigation properties use separate compiled metadata for their
+//! access shape and excerpt annotations. Entity selection and structural
+//! prefixes still use the query.
 
 use std::fmt;
 use std::fs;
 
+use nv_redfish_csdl_compiler::compiler::Compiled;
+use nv_redfish_csdl_compiler::compiler::Config;
+use nv_redfish_csdl_compiler::compiler::NavProperty;
 use nv_redfish_csdl_compiler::compiler::SchemaBundle;
 use nv_redfish_csdl_compiler::compiler::TypeClass;
 use nv_redfish_csdl_compiler::edmx::Edmx;
+use nv_redfish_csdl_compiler::generator::common_rust::InheritedProperties;
+use nv_redfish_csdl_compiler::optimizer;
 use nv_redfish_csdl_compiler::query::SchemaQuery;
+use nv_redfish_csdl_compiler::OneOrCollection;
 
 /// Why the CSDL bundle could not become an index.
 #[derive(Debug)]
@@ -133,6 +143,15 @@ pub enum Shape {
     Nullable,
 }
 
+/// Terminal navigation metadata for identifier-only attribute extraction.
+pub(crate) struct NavigationReference {
+    pub(crate) prefix: Vec<Step>,
+    pub(crate) property: String,
+    pub(crate) shape: Shape,
+    pub(crate) collection: bool,
+    pub(crate) excerpt: bool,
+}
+
 /// The parsed bundle; [`RedfishIndex`] borrows from it.
 pub struct Bundle {
     bundle: SchemaBundle,
@@ -187,24 +206,36 @@ impl Bundle {
         // The compiler's descent is deep enough to overflow a default test
         // stack in debug builds; nv-redfish's own build runs it the same
         // way. Scoped so the query can borrow the bundle.
-        let query = std::thread::scope(|scope| {
+        let (query, references) = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(64 * 1024 * 1024)
                 .spawn_scoped(scope, || {
-                    SchemaQuery::build(&self.bundle)
-                        .map_err(|error| IndexError::Build(format!("{error:?}")))
+                    let query = SchemaQuery::build(&self.bundle)
+                        .map_err(|error| IndexError::Build(format!("{error:?}")))?;
+
+                    // Compile navigation annotations without the query's restrictive
+                    // entity filter, then apply the source generator's optimizer.
+                    let compiled = self
+                        .bundle
+                        .compile_all(Config::default())
+                        .map_err(|error| IndexError::Build(format!("{error:?}")))?;
+
+                    let references = optimizer::optimize(compiled, &optimizer::Config::default());
+
+                    Ok::<_, IndexError>((query, references))
                 })
                 .expect("the compile thread spawns")
                 .join()
                 .expect("the compile thread does not panic")
         })?;
-        Ok(RedfishIndex { query })
+        Ok(RedfishIndex { query, references })
     }
 }
 
 /// Dotted source paths resolve to typed, nullability-aware fields.
 pub struct RedfishIndex<'a> {
     query: SchemaQuery<'a>,
+    references: Compiled<'a>,
 }
 
 impl fmt::Debug for RedfishIndex<'_> {
@@ -241,6 +272,60 @@ impl RedfishIndex<'_> {
                     .map(|member| member.inner().to_string())
                     .collect()
             }),
+        })
+    }
+
+    /// Looks up a terminal navigation property without traversing a reference.
+    /// Structural prefixes and entity selection use the ordinary schema query.
+    pub(crate) fn reference(&self, source_type: &str, path: &str) -> Option<NavigationReference> {
+        let (holder, prefix, property) = if let Some((prefix, property)) = path.rsplit_once('.') {
+            let holder = self.query.steps(source_type, prefix)?.last()?.type_name;
+            let prefix = self.steps(source_type, prefix).ok()?;
+
+            (holder, prefix, property)
+        } else {
+            (self.query.entity(source_type)?, Vec::new(), path)
+        };
+
+        let inherited = InheritedProperties::new(&self.references, holder);
+        let navigation = inherited.navigation_properties();
+
+        let property_metadata = navigation
+            .iter()
+            .find(|(name, _)| name.inner().as_ref() == property)?
+            .1;
+
+        let (required, nullable, collection, excerpt) = match property_metadata {
+            NavProperty::Expandable(value) => (
+                value.redfish.is_required.into_inner(),
+                value.nullable.into_inner(),
+                matches!(value.ptype, OneOrCollection::Collection(_)),
+                value.redfish.excerpt_copy.is_some(),
+            ),
+            NavProperty::Reference {
+                cardinality,
+                redfish,
+                nullable,
+                ..
+            } => (
+                redfish.is_required.into_inner(),
+                nullable.into_inner(),
+                matches!(cardinality, OneOrCollection::Collection(_)),
+                redfish.excerpt_copy.is_some(),
+            ),
+        };
+
+        Some(NavigationReference {
+            prefix,
+            property: property.to_owned(),
+            shape: match (required, nullable) {
+                (false, false) => Shape::Optional,
+                (true, false) => Shape::Bare,
+                (false, true) => Shape::Nullable,
+                (true, true) => Shape::RequiredNullable,
+            },
+            collection,
+            excerpt,
         })
     }
 
@@ -294,6 +379,102 @@ mod tests {
     use super::Bundle;
     use super::Shape;
     use super::TypeClass;
+
+    #[test]
+    fn nullable_navigation_identifiers_are_rejected() {
+        use crate::projection::spec::AssemblySpec;
+        use crate::projection::spec::ConstantSpec;
+        use crate::projection::spec::EntrySpec;
+        use crate::projection::spec::ManifestSpec;
+        use crate::projection::spec::ProjectionSpec;
+
+        let document = super::Edmx::parse(
+            r#"
+            <edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx" Version="4.0">
+              <edmx:DataServices>
+                <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="Resource">
+                  <EntityType Name="Resource" Abstract="true"/>
+                  <EntityType Name="ResourceCollection" Abstract="true"/>
+                </Schema>
+                <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="RedfishExtensions.v1_0_0">
+                  <Term Name="Settings" Type="Settings.Settings"/>
+                  <Term Name="SettingsApplyTime" Type="Settings.PreferredApplyTime"/>
+                </Schema>
+                <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="Settings">
+                  <ComplexType Name="Settings"/>
+                  <ComplexType Name="PreferredApplyTime"/>
+                </Schema>
+                <Schema xmlns="http://docs.oasis-open.org/odata/ns/edm" Namespace="Widget">
+                  <EntityType Name="Widget">
+                    <Property Name="Id" Type="Edm.String" Nullable="false"/>
+                    <NavigationProperty Name="Reference" Type="Widget.Widget" Nullable="true"/>
+                  </EntityType>
+                </Schema>
+              </edmx:DataServices>
+            </edmx:Edmx>
+        "#,
+        )
+        .expect("the fixture parses");
+
+        let bundle = Bundle {
+            bundle: super::SchemaBundle::new(vec![document], Vec::new()),
+            documents: 1,
+        };
+
+        let index = bundle.index().expect("the fixture indexes");
+        let pool = crate::pool().expect("the contract decodes");
+
+        let vocabulary =
+            crate::options::Vocabulary::resolve(&pool).expect("the vocabulary resolves");
+
+        let manifest = ManifestSpec {
+            path: "sources/redfish/manifests/test.textpb".into(),
+            crate_source: "redfish".to_owned(),
+            source: "redfish".to_owned(),
+            backend: 1,
+            index: "nv-redfish-schema/dmtf".to_owned(),
+            subject: None,
+            projections: vec![ProjectionSpec {
+                name: "nullable-reference".to_owned(),
+                source_type: "Widget".to_owned(),
+                target_type: "nv.telemetry.v1.LogRecord".to_owned(),
+                subject: None,
+                iterate: String::new(),
+                versions: 0,
+                fields: Vec::new(),
+                constants: vec![ConstantSpec {
+                    target_field: "message".to_owned(),
+                    value: "reference attribute".to_owned(),
+                }],
+                expansion: None,
+                map_assemblies: vec![AssemblySpec {
+                    target_field: "attributes".to_owned(),
+                    anchor: true,
+                    entries: vec![EntrySpec {
+                        key: "reference".to_owned(),
+                        source_path: "Reference".to_owned(),
+                        null_policy: 1,
+                        value_map: Vec::new(),
+                    }],
+                }],
+            }],
+        };
+
+        let violations = crate::projection::check(&[manifest], &index, &pool, &vocabulary);
+
+        assert_eq!(
+            index
+                .reference("Widget", "Reference")
+                .expect("navigation resolves")
+                .shape,
+            Shape::Nullable,
+        );
+
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0]
+            .to_string()
+            .contains("optional nonnullable singular nonexcerpt"));
+    }
 
     #[test]
     fn the_worked_examples_paths_resolve_with_their_types() {

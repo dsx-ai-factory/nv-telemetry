@@ -849,6 +849,66 @@ impl Emitter<'_> {
         entry: &EntrySpec,
         context: &str,
     ) -> Result<TokenStream, String> {
+        if let Some(reference) = self.index.reference(source_type, &entry.source_path) {
+            let mut expression = quote! { #source_param };
+            let mut optional = false;
+
+            for step in &reference.prefix {
+                let field = place(&source_field_ident(&step.property));
+
+                expression = match (optional, step.shape()) {
+                    (false, Shape::Bare) => quote! { #expression #field },
+                    (false, Shape::Optional) => {
+                        optional = true;
+                        quote! { #expression #field.as_ref() }
+                    }
+                    (true, Shape::Bare) => quote! { #expression.map(|value| &value #field) },
+                    (true, Shape::Optional) => {
+                        quote! { #expression.and_then(|value| value #field.as_ref()) }
+                    }
+                    (_, Shape::Nullable | Shape::RequiredNullable) => {
+                        return Err(format!(
+                            "{context}: nullable reference prefixes are unsupported"
+                        ));
+                    }
+                };
+            }
+
+            let field = place(&source_field_ident(&reference.property));
+
+            let reference = if optional {
+                quote! { #expression.and_then(|value| value #field.as_ref()) }
+            } else {
+                quote! { #expression #field.as_ref() }
+            };
+
+            let string = self
+                .contract
+                .get_message_by_name(VALUE)
+                .and_then(|message| message.get_field_by_name("string_value"))
+                .ok_or_else(|| format!("{context}: contract `{VALUE}.string_value` vanished"))?;
+
+            let mut check = self.text_check(&string);
+            check.non_empty = true;
+
+            let issue_path = format!("{source_type}.{}", entry.source_path);
+            let accept = quote! { Some(::nv_telemetry_model::Value::string(value)?) };
+            let conversion = checked_text(&check, &issue_path, accept);
+            let key = &entry.key;
+
+            return Ok(quote! {
+                if let Some(value) = match #reference {
+                    Some(value) => {
+                        let value = crate::projection::ReferenceId::reference_id(value).to_string();
+                        #conversion
+                    }
+                    None => None,
+                } {
+                    #entries_local.push((#key.to_owned(), value));
+                }
+            });
+        }
+
         let steps = self
             .index
             .steps(source_type, &entry.source_path)

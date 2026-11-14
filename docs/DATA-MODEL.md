@@ -736,13 +736,17 @@ logs batch, its records projected from the payload's `EventRecord`s:
 `occurred_at` is the record's `EventTimestamp`, `entry_id` its `EventId`,
 and the scope is the event service with an id minted for each run of event
 ids the stream reads: minted when a stream starts without a resume position,
-kept across a connection resumed from one. A device's `EventId` restarts with
+kept across a connection resumed from one. The `origin-of-condition` and
+`log-entry` attributes preserve the identifiers from `OriginOfCondition` and
+`LogEntry`, when present. Projection does not fetch either resource or derive a
+subject from its URI. A device's `EventId` restarts with
 the device and is unique only within one such run, so the run id keeps the
 dedup key from collapsing distinct events; it also means the walk's records
 and the stream's are two identities
 for what may be one occurrence, since most devices' events do not name the
 log entry they correspond to. A consumer that wants one record per
-occurrence keeps one source per endpoint or correlates on content. The
+occurrence keeps one source per endpoint or correlates using the linked log entry
+when available, or event content. The
 stream is live delivery, never completeness: an `EventBufferExceeded` record
 says the device dropped events and is an issue at `@gap`, not a record, and
 the polled walk is what fills the gap. A `MetricReport` payload on the same
