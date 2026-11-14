@@ -983,6 +983,7 @@ pub struct SubscriptionSpec {
     pub(super) projection: MappingSpec,
     requests: Vec<gnmi::Subscription>,
     encoding: Encoding,
+    updates_only: bool,
 }
 
 impl SubscriptionSpec {
@@ -1042,6 +1043,7 @@ impl SubscriptionSpec {
             projection,
             requests,
             encoding: Encoding::default(),
+            updates_only: false,
         })
     }
 
@@ -1066,6 +1068,26 @@ impl SubscriptionSpec {
         self
     }
 
+    /// Requests omission of initial state for the whole subscription when enabled.
+    ///
+    /// Defaults to `false`. When `true`, the target is asked to send synchronization
+    /// followed by subsequent updates. Per-path modes, sampling, and heartbeat
+    /// options still apply. Each new stream uses this setting, including after a
+    /// reconnect. Synchronization does not mean current values were received when
+    /// initial state was omitted; callers needing those values must collect a snapshot.
+    ///
+    /// ```
+    /// # use nv_telemetry_gnmi::SubscriptionSpec;
+    /// # fn configure(spec: SubscriptionSpec) -> SubscriptionSpec {
+    /// spec.with_updates_only(true)
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_updates_only(mut self, updates_only: bool) -> Self {
+        self.updates_only = updates_only;
+        self
+    }
+
     pub(super) fn request(&self) -> gnmi::SubscribeRequest {
         gnmi::SubscribeRequest {
             request: Some(gnmi::subscribe_request::Request::Subscribe(
@@ -1076,6 +1098,7 @@ impl SubscriptionSpec {
                         ..Default::default()
                     }),
                     subscription: self.requests.clone(),
+                    updates_only: self.updates_only,
                     mode: gnmi::subscription_list::Mode::Stream.into(),
                     encoding: match self.encoding {
                         Encoding::Json => gnmi::Encoding::Json,
