@@ -807,9 +807,7 @@ pub struct WalkBudget {
 }
 
 impl WalkBudget {
-    /// The budget every walk runs under today. Kinds are unit types, so
-    /// the budget is a constant; a per-service budget is a `Read` carrying
-    /// kind state, when a deployment asks for one.
+    /// The default member and elapsed-time limits used by collection reads.
     pub const DEFAULT: Self = Self::new(1024, Duration::from_secs(30));
 
     #[must_use]
@@ -821,12 +819,12 @@ impl WalkBudget {
     /// service GET, the member in flight, and assembly, so a walk that spends
     /// its time budget stops, ships, and advances the cursor instead of being
     /// cut off wholesale and repeating identically next poll.
-    fn deadline(self) -> Duration {
+    pub(crate) fn deadline(self) -> Duration {
         self.elapsed.saturating_add(WALK_DEADLINE_HEADROOM)
     }
 
     /// Why the walk stops before its next member, if it does.
-    fn exhausted(self, visited: usize, elapsed: Duration) -> Option<Stop> {
+    pub(crate) fn exhausted(self, visited: usize, elapsed: Duration) -> Option<Stop> {
         if visited >= self.members {
             Some(Stop::Members)
         } else if elapsed >= self.elapsed {
@@ -839,13 +837,13 @@ impl WalkBudget {
 
 /// Which budget stopped a walk before its next member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stop {
+pub(crate) enum Stop {
     Members,
     Time,
 }
 
 impl Stop {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Members => "member budget spent",
             Self::Time => "time budget spent",
@@ -860,7 +858,7 @@ impl Stop {
 /// resolves without I/O.
 #[derive(Debug, Deserialize)]
 #[serde(bound(deserialize = "T: EntityTypeRef + for<'dt> Deserialize<'dt>"))]
-struct Page<T: EntityTypeRef> {
+pub(crate) struct Page<T: EntityTypeRef> {
     #[serde(rename = "@odata.id")]
     odata_id: ODataId,
     /// Kept so the transport's cache can revalidate the page with
@@ -868,11 +866,11 @@ struct Page<T: EntityTypeRef> {
     #[serde(rename = "@odata.etag")]
     etag: Option<ODataETag>,
     #[serde(rename = "Members")]
-    members: Vec<NavProperty<T>>,
+    pub(crate) members: Vec<NavProperty<T>>,
     #[serde(rename = "Members@odata.count")]
-    count: Option<u64>,
+    pub(crate) count: Option<u64>,
     #[serde(rename = "Members@odata.nextLink")]
-    next_link: Option<String>,
+    pub(crate) next_link: Option<String>,
 }
 
 /// A page of a log service's entries.
@@ -1937,7 +1935,7 @@ impl Position {
 /// GETs included, when its deadline expires. The timer is
 /// executor-independent. As with any async timeout, a transport must yield;
 /// synchronous decoding cannot be preempted here.
-async fn with_deadline<T>(
+pub(crate) async fn with_deadline<T>(
     elapsed: Duration,
     work: impl Future<Output = Result<T, AcquisitionFailure>>,
 ) -> Result<T, AcquisitionFailure> {

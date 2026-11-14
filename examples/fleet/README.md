@@ -46,8 +46,7 @@ one per projection issue.
 ## Limits
 
 - **Discovery runs once per endpoint.** A sensor or log service that
-  appears later is not read until the daemon restarts. The library has no
-  catalog yet; this discovery is a prototype of one.
+  appears later is not read until the daemon restarts.
 - **gNMI connects lazily.** A switch that is down shows up as failed
   acquisitions, and the subscription reconnects with backoff. TLS uses the
   system's roots, and there is no option to skip certificate verification.
