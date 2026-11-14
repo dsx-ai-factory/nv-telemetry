@@ -29,7 +29,7 @@ buf-version ?= 1.72.0
 # the target is up to date, and silently does nothing.
 .PHONY: all ci fmt bench codegen check-codegen proto-lint \
 	check-proto-format require-buf check-public-deps \
-	rust-install clean test-bmc-mock
+	rust-install clean test-bmc-mock spec
 
 # `--locked` throughout: generated output is byte-compared, and its bytes are
 # decided by prost-build and prettyplease. Manifests state semver ranges, and
@@ -104,6 +104,13 @@ check-public-deps:
 # point BMC_MOCK_ROOT at its target directory.
 test-bmc-mock:
 	cargo test $(cargo-locked) -p nv-telemetry-probe --test e2e_http -- --ignored --nocapture
+
+# Checks every spec in spec/ and draws the traces
+# the tests replay against the code. Run it whenever a spec changes: until
+# the traces are drawn again, `cargo test` fails. Needs Node and a Java newer
+# than 11; nothing else in this Makefile does.
+spec:
+	node tools/spec.mjs
 
 # Instruction counts under Valgrind, so results do not depend on machine
 # load. Needs valgrind and a gungraun-runner matching the gungraun version
