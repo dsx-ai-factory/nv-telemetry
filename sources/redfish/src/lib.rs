@@ -28,10 +28,57 @@
 //! issues, pinned by the corpus under `tests/`. `projection/` re-exports
 //! the generated boundary the provider consumes.
 //!
-//! Reserved for later milestones: catalog stages (`ServiceRoot` walks that
-//! retain sensor links privately), the bulk `TelemetryService` provider,
-//! and session handling.
+//! # Sensor discovery
+//!
+//! [`SensorCatalogRead`] walks advertised chassis and modern Sensors collections
+//! without reading sensor documents. The immutable [`SensorCatalog`] contains
+//! locations, discovery issues, and traversal completeness. The caller admits
+//! discovery work and owns refresh, scheduling, and any status or issue envelopes.
+//! Missing root Chassis navigation is unsupported; an absent optional Sensors
+//! navigation contributes no modern sensors. Chassis and collection faults that
+//! are resource-local retain usable branches in a partial catalog. Service-root,
+//! endpoint, and internal failures return an error.
+//!
+//! Call [`nv_telemetry_source::Acquire::perform`] directly for the artifact.
+//! `nv_telemetry_source::acquire` and `orchestration::PollUnit` currently accept
+//! `AcquisitionParts` and do not consume a `SensorCatalog`.
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use nv_telemetry_model::Completeness;
+//! use nv_telemetry_model::EndpointContext;
+//! use nv_telemetry_redfish::RedfishService;
+//! use nv_telemetry_redfish::RedfishTransport;
+//! use nv_telemetry_redfish::SensorCatalogRead;
+//! use nv_telemetry_redfish::SensorRead;
+//! use nv_telemetry_redfish::WalkBudget;
+//! use nv_telemetry_source::Acquire;
+//!
+//! async fn discover<T: RedfishTransport>(
+//!     endpoint: EndpointContext,
+//!     service: Arc<RedfishService<T>>,
+//! ) -> Result<Vec<SensorRead<T>>, Box<dyn std::error::Error>> {
+//!     let discovery = SensorCatalogRead::new(
+//!         endpoint.clone(), Arc::clone(&service), WalkBudget::DEFAULT,
+//!     )?;
+//!
+//!     let catalog = discovery.perform().await?;
+//!     if catalog.completeness() == Completeness::Partial {
+//!         // This caller requires complete traversal before scheduling reads.
+//!         return Err(format!("partial sensor discovery: {:?}", catalog.issues()).into());
+//!     }
+//!
+//!     Ok(catalog.locations().iter().map(|location| {
+//!         SensorRead::new(endpoint.clone(), location.clone(), Arc::clone(&service))
+//!     }).collect())
+//! }
+//! ```
+//!
+//! Reserved for later milestones: bulk `TelemetryService` acquisition and
+//! session handling.
 
+mod catalog;
 mod failure;
 mod generated;
 mod instant;
@@ -41,6 +88,8 @@ mod stream;
 mod transport;
 mod uri;
 
+pub use catalog::SensorCatalog;
+pub use catalog::SensorCatalogRead;
 pub use failure::TransportFault;
 pub use provider::ChassisKind;
 pub use provider::ChassisRead;
