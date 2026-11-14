@@ -32,6 +32,10 @@
    rather than `cargo fmt`, because the import layout relies on a nightly-only
    rustfmt option that stable rustfmt ignores with a warning instead of an
    error. `make rust-install` fetches the toolchain that step needs.
+
+   A change under `spec/` also needs `make spec`, which checks the specs and
+   draws again the traces the tests replay; until it has run, `cargo test`
+   fails. It needs Node and Java. See [docs/FORMAL.md](docs/FORMAL.md).
 6. **Push to your fork**:
    ```bash
    git push origin feature/your-feature-name

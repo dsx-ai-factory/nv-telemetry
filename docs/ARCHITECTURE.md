@@ -312,6 +312,9 @@ global concurrency
 Each endpoint's stack runs on its own runtime, so a global layer would be a
 gate shared across endpoints rather than a scheduler node above them. The
 collector has none yet: endpoint admission is the only concurrency bound.
+Endpoint admission and the endpoint breaker are over the polls; a stream's
+connect passes the token bucket alone (see *Streamed acquisition
+placement*).
 Until needs carry a priority, the priority queue ranks by acquisition mode:
 stream connects ahead of polls.
 
@@ -1095,13 +1098,21 @@ the second placement, and the choice holds for any stream whose items arrive
 at the device's pace:
 
 - **Connection is dispatched work.** A stream's connect leaf sits in the
-  endpoint subtree with the poll leaves, under the same concurrency limit,
-  breaker, and token bucket, and is charged the provider's declared cost.
-  It is taken ahead of due polls: a stream that waits behind a round of
-  polls misses the events sent before it opens. Reconnects are spaced by
-  the endpoint's rate so that a stream that keeps closing leaves polls
-  half the refill. A failed connect is a status like a failed
-  poll, and an endpoint-scoped one reaches the endpoint breaker.
+  endpoint subtree with the poll leaves, under the same token bucket, and
+  is charged the provider's declared cost. It is taken ahead of due polls:
+  a stream that waits behind a round of polls misses the events sent
+  before it opens. Reconnects are spaced by the endpoint's rate so that a
+  stream that keeps closing leaves polls half the refill. A failed connect
+  is a status like a failed poll.
+- **A connect answers to the bucket alone.** The concurrency limit and the
+  endpoint breaker stand over the polls. A connect holds no slot, so one
+  the device never answers holds no poll back; it is given up at the
+  reconnect policy's deadline and reported as a timeout. A failed connect
+  is no sample for the breaker either: a breaker that connects pass lets
+  one request through to test the endpoint, connects are taken ahead of
+  polls, and with two streams that cannot connect one of them is always
+  due, so the polls would never be tried. A stream that cannot connect is
+  paced by its own ladder.
 - **Reconnection is dispatcher scheduling.** When an instance ends, the leaf
   computes the next due instant from a typed reconnect policy — a delay that
   doubles across instances that delivered nothing, capped, spread per

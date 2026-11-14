@@ -4,7 +4,7 @@
 //! Streamed acquisition under an endpoint's admission.
 //!
 //! A stream is not a poll. Its connect attempt is one admission through the
-//! endpoint's breaker and bucket, like a poll; the stream it opens is then
+//! endpoint's bucket, charged like a poll; the stream it opens is then
 //! drained outside the dispatcher, because a work item completes once while
 //! a stream yields for its lifetime. A [`StreamUnit`] becomes two halves
 //! when the collector seats it. The connect leaf sits in the endpoint's
@@ -16,10 +16,15 @@
 //! them one per item as fast as its consumer takes them, so backpressure
 //! reaches the socket.
 //!
-//! A failed connect is reported through the dispatcher, where the breaker
-//! samples it; a successful one earns no status, as the contract has it. A
-//! failure mid-stream reaches the reports, not the dispatcher, so the
-//! breaker learns of a dead stream only from the next connect attempt.
+//! A failed connect is reported through the dispatcher as a failed poll
+//! is; a successful one earns no status, as the contract has it. A failure
+//! mid-stream reaches the reports, not the dispatcher. Neither is a sample
+//! for the endpoint's breaker, and a connect holds no in-flight slot: the
+//! breaker and the bound are the polls', and a stream that cannot connect
+//! is paced by its own ladder. Were connects to pass the breaker, they
+//! would take its every probe ahead of the polls. A connect attempt the
+//! device does not answer is given up at the policy's deadline, which the
+//! leaf checks when the runtime scans it, and reported as a timeout.
 //! Dropping the reports, as retiring the endpoint does, cancels the stream:
 //! a connect attempt in flight is aborted, so a hung connect cannot hold
 //! the retirement, and one not yet begun makes no request.
@@ -38,6 +43,7 @@ use std::time::Instant;
 
 use futures_util::future::AbortHandle;
 use futures_util::future::Abortable;
+use futures_util::future::Aborted;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use nv_redfish_dispatcher::Completion;
@@ -50,6 +56,8 @@ use nv_telemetry_model::EndpointContext;
 use nv_telemetry_model::Origin;
 use nv_telemetry_model::Timestamp;
 use nv_telemetry_source::Acquire;
+use nv_telemetry_source::AcquisitionFailure;
+use nv_telemetry_source::AcquisitionFailureClass;
 use nv_telemetry_source::SubscriptionItem;
 
 use crate::clock::SharedClock;
@@ -98,12 +106,14 @@ where
 /// a share of the delay fixed by a hash of the endpoint id, so a fleet
 /// that lost a link does not reconnect in lockstep, while a test gets the
 /// same instant every run. An end whose failure said retrying is pointless
-/// stops the stream for good.
+/// stops the stream for good. A connect attempt that has not opened the
+/// stream by `connect_deadline` is given up as a retryable timeout.
 #[derive(Clone, Debug)]
 pub struct ReconnectPolicy {
     first_retry: Duration,
     max_retry: Duration,
     stagger_percent: u8,
+    connect_deadline: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -112,6 +122,7 @@ impl Default for ReconnectPolicy {
             first_retry: Duration::from_secs(2),
             max_retry: Duration::from_mins(1),
             stagger_percent: 25,
+            connect_deadline: Duration::from_secs(30),
         }
     }
 }
@@ -141,6 +152,17 @@ impl ReconnectPolicy {
         self
     }
 
+    /// How long a connect attempt may take to open the stream. Measured on
+    /// the endpoint's clock, which stands still while the consumer has no
+    /// room for a report, and checked when the runtime next scans the
+    /// stream, so an attempt can outlast it by as long as the rate bucket
+    /// is in debt.
+    #[must_use]
+    pub const fn with_connect_deadline(mut self, deadline: Duration) -> Self {
+        self.connect_deadline = deadline;
+        self
+    }
+
     pub(crate) const fn first_retry(&self) -> Duration {
         self.first_retry
     }
@@ -151,6 +173,10 @@ impl ReconnectPolicy {
 
     pub(crate) const fn stagger_percent(&self) -> u8 {
         self.stagger_percent
+    }
+
+    pub(crate) const fn connect_deadline(&self) -> Duration {
+        self.connect_deadline
     }
 
     /// The delay before `endpoint_id`'s next instance. `unproductive` is how
@@ -313,6 +339,7 @@ impl StreamUnit {
             unit: self.unit,
             clock: Arc::clone(clock),
             last_now: None,
+            gives_up_at: None,
             unproductive: 0,
         };
         (leaf, reports)
@@ -354,6 +381,8 @@ pub(crate) struct StreamLeaf {
     unit: Arc<dyn Subscribe>,
     clock: SharedClock,
     last_now: Option<Instant>,
+    /// When the connect attempt in flight is given up.
+    gives_up_at: Option<Instant>,
     /// Instances in a row that delivered nothing, the last one included.
     unproductive: u32,
 }
@@ -415,7 +444,22 @@ impl Scheduler<TelemetryWork> for StreamLeaf {
                     Readiness::not_ready(Some(at))
                 }
             }
-            Phase::Connecting | Phase::Streaming | Phase::Stopped => Readiness::not_ready(None),
+            Phase::Connecting => match self.gives_up_at {
+                // Past the deadline: the attempt is aborted and records a
+                // timeout, and the scan its completion brings schedules
+                // the next one.
+                Some(at) if now >= at => {
+                    let attempt = state.connecting.take();
+                    drop(state);
+                    if let Some(attempt) = attempt {
+                        self.gives_up_at = None;
+                        attempt.abort();
+                    }
+                    Readiness::not_ready(None)
+                }
+                at => Readiness::not_ready(at),
+            },
+            Phase::Streaming | Phase::Stopped => Readiness::not_ready(None),
             Phase::Ended { end, productive } => self.schedule(&mut state, end, productive, now),
         }
     }
@@ -428,6 +472,7 @@ impl Scheduler<TelemetryWork> for StreamLeaf {
         }
         state.phase = Phase::Connecting;
         drop(state);
+        self.gives_up_at = now.checked_add(self.policy.connect_deadline());
         let attempt =
             Arc::clone(&self.unit).connect(Arc::clone(&self.clock), Arc::clone(&self.shared));
         Some(ScheduledWork::new((), attempt))
@@ -453,9 +498,9 @@ impl Drop for StreamLeaf {
 }
 
 /// The connect attempt as dispatcher work: `perform` under the endpoint's
-/// admission. An opened stream goes to the reports and earns no status; a
-/// failed attempt is assembled like a failed poll, so an endpoint-scoped
-/// failure reaches the breaker.
+/// bucket. An opened stream goes to the reports and earns no status; a
+/// failed attempt, or one the leaf gave up at its deadline, is assembled
+/// like a failed poll.
 fn connect_future<A>(unit: Arc<A>, clock: SharedClock, shared: SharedState) -> TelemetryWork
 where
     A: Acquire + Send + Sync + 'static,
@@ -474,12 +519,17 @@ where
         }
         let begun = clock.instant();
         let at = clock.timestamp();
-        let Ok(result) = Abortable::new(unit.perform(), registration).await else {
-            // Aborted by dropping the reports: no report, and the admission
-            // is released.
-            return Ok(Vec::new());
+        let result = match Abortable::new(unit.perform(), registration).await {
+            Ok(result) => {
+                lock(&shared).connecting = None;
+                result
+            }
+            // Aborted by dropping the reports: no report.
+            Err(Aborted) if lock(&shared).phase == Phase::Stopped => return Ok(Vec::new()),
+            // Aborted by the leaf, at the connect deadline.
+            Err(Aborted) => Err(AcquisitionFailure::new(AcquisitionFailureClass::Timeout)
+                .with_detail("the stream did not open within the connect deadline")),
         };
-        lock(&shared).connecting = None;
         match result {
             Ok(items) => {
                 let mut state = lock(&shared);
