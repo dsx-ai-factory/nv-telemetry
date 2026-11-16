@@ -25,6 +25,7 @@ time.workspace = true
 futures-timer.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 nv-redfish-bmc-mock.workspace = true

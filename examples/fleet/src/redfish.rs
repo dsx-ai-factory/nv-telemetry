@@ -4,9 +4,8 @@
 //! A Redfish endpoint: what it has, found by following its links, and the
 //! units that read it.
 //!
-//! The library reads targets it is given and has no catalog yet, so
-//! discovery is the embedder's: it runs once, and a sensor that appears on a
-//! live BMC later is not read.
+//! Discovery in this example runs once per endpoint. A sensor that appears
+//! on a live BMC later is not read until the daemon restarts.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
