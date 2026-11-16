@@ -9,23 +9,34 @@
 //! batch. The batch is scoped to the event service and to one run of the
 //! device's event ids: an `EventId` restarts with the device and is unique
 //! only within the sequence one subscription reads, so the scope carries a
-//! [`StreamRun`] minted whenever a stream starts live, and kept while a
-//! later instance resumes it. The consumer's dedup key — endpoint, scope,
-//! `entry_id` — thus never collapses distinct events.
+//! [`StreamRun`] minted whenever a stream starts live or the device reports
+//! a gap, and kept while a later instance resumes it. The consumer's dedup
+//! key — endpoint, scope, `entry_id` — thus does not collapse distinct
+//! events, within the two limits below.
 //!
 //! The provider remembers the SSE id in effect after each payload and
 //! reopens the stream after it, so a reconnect loses nothing the device
 //! retained and ships under the scope it left. A failed open keeps the
-//! position, unless the device refused it. bmcweb does not refuse: it
-//! replays what it has and sends `EventBufferExceeded` first, which is the
-//! gap issue below, within the same run. A device that refuses — the 400
-//! the mock gives for an id outside its history — cannot say whether its
-//! history aged out, where the run continues, or its ids restarted, where
-//! it must not. The provider takes the safe reading: it drops the position
-//! and opens live within the same attempt, in a new run, the first item an
-//! issue at [`GAP_LOCATOR`] naming the id. A new run where the old one
-//! continued only changes the scope; reusing it after a restart would
-//! collapse distinct events.
+//! position, unless the device refused it. A device that no longer holds
+//! the position cannot say whether its history aged out, where the run
+//! continues, or its ids restarted, where it must not, so the provider takes
+//! the safe reading of either answer it gives: a new run. A device that
+//! refuses — the 400 the mock gives for an id outside its history — has the
+//! position dropped and the stream opened live within the same attempt, the
+//! first item an issue at [`GAP_LOCATOR`] naming the id. bmcweb does not
+//! refuse: it sends `EventBufferExceeded` and goes on with ids that count
+//! from one again after a restart, and that record, the gap issue below,
+//! starts the new run. A new run where the old one continued only changes
+//! the scope; reusing it after a restart would collapse distinct events.
+//!
+//! Two limits remain on a device that restarts its ids without marking
+//! them, as bmcweb does. After a restart, once it has issued the resumed id
+//! again, it resumes after it without a sign: the events before that id
+//! never reach the stream, and no gap is reported. And a position older
+//! than the last one read, which only [`EventStream::with_resume_position`]
+//! can supply, then resumes inside the ids its run has already shipped,
+//! where the key does collapse distinct events. A device that marks its ids
+//! with their run, as the mock does, refuses both.
 //!
 //! The polled log walk is a separate source with its own scope; on devices
 //! whose events do not name their log entry, which is most, a consumer that
@@ -37,8 +48,9 @@
 //!
 //! The stream is live delivery, not completeness. An `EventBufferExceeded`
 //! record says the device dropped events before this stream caught up: it
-//! is an issue at [`GAP_LOCATOR`], never a record, and the polled walk fills
-//! the gap. A `MetricReport` payload is not this provider's data; the first
+//! is an issue at [`GAP_LOCATOR`], never a record, its payload and those
+//! after it ship under a new run, and the polled walk fills the gap. A
+//! `MetricReport` payload is not this provider's data; the first
 //! one on a stream is an issue at [`METRIC_REPORT_LOCATOR`] and the rest
 //! yield nothing. A payload that does not decode, even after the platform's
 //! repairs, is an issue at [`PAYLOAD_LOCATOR`] and the stream reads on: the
@@ -109,7 +121,8 @@ pub const PAYLOAD_LOCATOR: &str = "@payload";
 const SCOPE_KIND: &str = "event-service";
 
 /// One run of a device's event ids, as the batches' scope names it: minted
-/// when an instance starts live, continued by the instances that resume it.
+/// when an instance starts live or the device reports a gap, continued by
+/// the instances that resume it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamRun(String);
 
@@ -161,7 +174,7 @@ impl std::error::Error for EmptyEventId {}
 /// Where a stream resumes: the SSE id in effect after the last payload
 /// read, and the run it belongs to, so the instance that resumes ships
 /// under the scope of the one it continues. An embedder that keeps this
-/// across its own restart hands it back through
+/// across its own restart hands the last one it read back through
 /// [`EventStream::with_resume_position`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumePosition {
@@ -315,6 +328,11 @@ impl<T> EventStream<T> {
 
     /// Starts the first instance at `position` instead of live: what
     /// [`Self::resume_position`] gave an embedder before it restarted.
+    ///
+    /// The position must be the last one read. A device that restarts its
+    /// ids without marking them, as bmcweb does, accepts an older one once
+    /// it has issued that id again, and the stream then ships new events
+    /// under ids its run has already used.
     #[must_use]
     pub fn with_resume_position(self, position: ResumePosition) -> Self {
         *lock(&self.cursor) = Cursor::Resume(position);
@@ -446,37 +464,92 @@ struct Live<T: RedfishTransport> {
     metric_reports_seen: bool,
 }
 
+impl<T: RedfishTransport> Live<T> {
+    /// One payload as an item, or nothing for a metric report after the
+    /// first.
+    async fn item(&mut self, data: Value) -> Option<SubscriptionItem> {
+        let issue = match decode::<EventStreamPayload>(data) {
+            Ok(EventStreamPayload::Event(event)) => return Some(self.event(&event).await),
+            Ok(EventStreamPayload::MetricReport(_)) => {
+                if self.metric_reports_seen {
+                    return None;
+                }
+                self.metric_reports_seen = true;
+                ProjectionIssue::invalid(
+                    METRIC_REPORT_LOCATOR,
+                    "the stream carries metric reports, which this provider does not ship",
+                )
+            }
+            // The path only: serde's message quotes device values.
+            Err(error) => ProjectionIssue::invalid(
+                PAYLOAD_LOCATOR,
+                format!("a payload did not decode at `{}`", error.path()),
+            ),
+        };
+        Some(Ok(AcquisitionParts::new(Vec::new(), vec![issue])))
+    }
+
+    /// One `Event`'s records as a logs batch under the run's scope. A record
+    /// the device did not inline is an issue against its index, never a
+    /// request. A record that reports dropped events is the gap, and starts
+    /// the run its payload and those after it ship under.
+    async fn event(&mut self, event: &Event) -> SubscriptionItem {
+        let mut records = Vec::new();
+        let mut issues = Vec::new();
+        for (index, member) in event.events.iter().enumerate() {
+            if matches!(member, NavProperty::Reference(_)) {
+                issues.push(ProjectionIssue::invalid(
+                    format!("Events[{index}]"),
+                    "record not inline; a stream fetches nothing",
+                ));
+                continue;
+            }
+            // The wrapper's one accessor for an inline record takes the
+            // transport and, for an inline record, never uses it.
+            let record = member.get(&self.bmc).await.map_err(|_| {
+                AcquisitionFailure::new(AcquisitionFailureClass::Internal)
+                    .with_retryable(false)
+                    .with_detail(
+                        "projection bug: an inline event record reported a transport failure",
+                    )
+            })?;
+            if reports_dropped_events(&record) {
+                issues.push(ProjectionIssue::invalid(
+                    GAP_LOCATOR,
+                    "the device dropped events before this stream caught up; the polled log fills the gap",
+                ));
+                self.run = StreamRun::mint();
+                self.scope = stream_scope(self.scope.id(), &self.run)?;
+                continue;
+            }
+            let parts = project_event_record(&record, &member.id().to_string())
+                .map_err(|error| internal_bug(&error))?;
+            records.extend(parts.log_records);
+            issues.extend(
+                parts
+                    .issues
+                    .into_iter()
+                    .map(|issue| issue.at_index("Events", index)),
+            );
+        }
+        assemble_logs(records, issues, self.scope.clone()).map_err(|error| internal_bug(&error))
+    }
+}
+
 /// The payloads as items: one per `Event`, one for the first
 /// `MetricReport`, one per payload that does not decode, and one terminal
 /// failure that ends the stream. Every payload's id, decoded or not, moves
-/// the cursor before the item is built.
+/// the cursor before its item is yielded, in the run the payload left the
+/// stream in.
 fn items<T: RedfishTransport>(live: Live<T>) -> impl Stream<Item = SubscriptionItem> + Send {
     unfold(Some(live), |live| async move {
         let mut live = live?;
         loop {
-            let payload = match live.events.next().await {
-                Some(Ok(StreamEvent {
-                    last_event_id,
-                    data,
-                })) => {
-                    if let Some(id) = last_event_id {
-                        lock(&live.cursor).advance(id, &live.run);
-                    }
-                    match decode::<EventStreamPayload>(data) {
-                        Ok(payload) => payload,
-                        // The path only: serde's message quotes device values.
-                        Err(error) => {
-                            let issue = ProjectionIssue::invalid(
-                                PAYLOAD_LOCATOR,
-                                format!("a payload did not decode at `{}`", error.path()),
-                            );
-                            return Some((
-                                Ok(AcquisitionParts::new(Vec::new(), vec![issue])),
-                                Some(live),
-                            ));
-                        }
-                    }
-                }
+            let StreamEvent {
+                last_event_id,
+                data,
+            } = match live.events.next().await {
+                Some(Ok(event)) => event,
                 Some(Err(error)) => return Some((Err(error.classify()), None)),
                 None => {
                     let closed = AcquisitionFailure::new(AcquisitionFailureClass::Protocol)
@@ -485,78 +558,17 @@ fn items<T: RedfishTransport>(live: Live<T>) -> impl Stream<Item = SubscriptionI
                     return Some((Err(closed), None));
                 }
             };
-            match payload {
-                EventStreamPayload::Event(event) => {
-                    return Some(match project_event(&event, &live.bmc, &live.scope).await {
-                        Ok(parts) => (Ok(parts), Some(live)),
-                        Err(failure) => (Err(failure), None),
-                    });
-                }
-                EventStreamPayload::MetricReport(_) => {
-                    if live.metric_reports_seen {
-                        continue;
-                    }
-                    live.metric_reports_seen = true;
-                    let issue = ProjectionIssue::invalid(
-                        METRIC_REPORT_LOCATOR,
-                        "the stream carries metric reports, which this provider does not ship",
-                    );
-                    return Some((
-                        Ok(AcquisitionParts::new(Vec::new(), vec![issue])),
-                        Some(live),
-                    ));
-                }
+            let item = live.item(data).await;
+            if let Some(id) = last_event_id {
+                lock(&live.cursor).advance(id, &live.run);
+            }
+            match item {
+                Some(Ok(parts)) => return Some((Ok(parts), Some(live))),
+                Some(Err(failure)) => return Some((Err(failure), None)),
+                None => {}
             }
         }
     })
-}
-
-/// One `Event`'s records as a logs batch under `scope`. A record the device
-/// did not inline is an issue against its index, never a request.
-async fn project_event<B>(
-    event: &Event,
-    bmc: &B,
-    scope: &Subject,
-) -> Result<AcquisitionParts, AcquisitionFailure>
-where
-    B: Bmc,
-    B::Error: ClassifyError,
-{
-    let mut records = Vec::new();
-    let mut issues = Vec::new();
-    for (index, member) in event.events.iter().enumerate() {
-        if matches!(member, NavProperty::Reference(_)) {
-            issues.push(ProjectionIssue::invalid(
-                format!("Events[{index}]"),
-                "record not inline; a stream fetches nothing",
-            ));
-            continue;
-        }
-        // The wrapper's one accessor for an inline record takes the
-        // transport and, for an inline record, never uses it.
-        let record = member.get(bmc).await.map_err(|_| {
-            AcquisitionFailure::new(AcquisitionFailureClass::Internal)
-                .with_retryable(false)
-                .with_detail("projection bug: an inline event record reported a transport failure")
-        })?;
-        if reports_dropped_events(&record) {
-            issues.push(ProjectionIssue::invalid(
-                GAP_LOCATOR,
-                "the device dropped events before this stream caught up; the polled log fills the gap",
-            ));
-            continue;
-        }
-        let parts = project_event_record(&record, &member.id().to_string())
-            .map_err(|error| internal_bug(&error))?;
-        records.extend(parts.log_records);
-        issues.extend(
-            parts
-                .issues
-                .into_iter()
-                .map(|issue| issue.at_index("Events", index)),
-        );
-    }
-    assemble_logs(records, issues, scope.clone()).map_err(|error| internal_bug(&error))
 }
 
 /// The registry message a device sends when its event buffer overflowed:

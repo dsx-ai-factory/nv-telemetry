@@ -73,6 +73,9 @@ const STREAM_PROVIDER: &str = "fixture.events";
 const STREAM_CLASS: &str = "fixture-subscribe";
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(8);
+/// Longer than any delay here: the runtime keeps the earliest instant it
+/// was told, so a shorter deadline would outlive its attempt as a hint.
+const CONNECT_DEADLINE: Duration = Duration::from_mins(1);
 
 type StreamRuntime = Runtime<AcquisitionReport, EndpointFault, SubtreeMeta>;
 type Connect = Result<Vec<SubscriptionItem>, AcquisitionFailure>;
@@ -252,6 +255,7 @@ fn policy() -> ReconnectPolicy {
         .with_first_retry(FIRST_RETRY)
         .with_max_retry(MAX_RETRY)
         .with_stagger_percent(0)
+        .with_connect_deadline(CONNECT_DEADLINE)
 }
 
 #[derive(Clone)]
@@ -299,7 +303,8 @@ fn states_parts() -> AcquisitionParts {
 fn runtime(subtree: EndpointSubtree, manual: &ManualClock) -> StreamRuntime {
     Runtime::new(
         RuntimeConfig {
-            global_max_in_flight: std::num::NonZeroUsize::MIN,
+            // As the collector has it: the subtree alone bounds what runs.
+            global_max_in_flight: std::num::NonZeroUsize::MAX,
             clock: ClockConfig::Manual(manual.clone()),
         },
         subtree,
@@ -538,23 +543,99 @@ fn failed_connects_are_reported_through_the_dispatcher_and_back_off() {
 }
 
 #[test]
-fn a_connectivity_failure_on_connect_indicts_the_endpoint() {
-    let Rig {
-        mut runtime,
-        reports: _reports,
-        manual,
-    } = rig(vec![Err(AcquisitionFailure::new(
-        AcquisitionFailureClass::Connectivity,
-    ))]);
+fn failed_connects_leave_the_breaker_to_the_polls() {
+    let manual = ManualClock::new();
+    let clock = TestClock::shared(&manual);
+    let unreachable = || {
+        Err(AcquisitionFailure::new(
+            AcquisitionFailureClass::Connectivity,
+        ))
+    };
+    let unit = FixtureSubscription::scripted(endpoint(), (0..6).map(|_| unreachable()).collect());
+    let stream = StreamUnit::new(planned_stream(endpoint(), STREAM_PROVIDER), unit, policy());
+    let Seated {
+        subtree,
+        streams: _reports,
+        ..
+    } = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        clock.instant(),
+        vec![planned_poll(endpoint())],
+        vec![stream],
+    )
+    .expect("a poll and a stream on one endpoint form a subtree");
+    let mut runtime = runtime(subtree, &manual);
+    let start = manual.now();
+    let cadence = Duration::from_secs(30);
 
-    // Endpoint-scoped: the breaker samples it as a fault, and the stream is
-    // still asked again, connectivity being retried by default.
-    let fault = work_outcome(&mut runtime).expect_err("connectivity indicts the endpoint");
-    assert_eq!(fault.status().outcome(), Outcome::Failed);
-    assert_eq!(
-        fault.status().failure_class(),
-        Some(FailureClass::Connectivity)
+    // Six connects fail to reach the endpoint before the poll's second
+    // tick. Each is an endpoint's fault and is retried, yet none is a
+    // sample for the breaker, which would be open by then: the poll runs
+    // on its cadence.
+    let mut faults = 0;
+    let mut polled = Vec::new();
+    while manual.now() <= start + cadence {
+        match drive(&mut runtime).expect("a connect or a poll is always due again") {
+            RuntimeOutput::Work { result: Ok(_), .. } => polled.push(manual.now() - start),
+            RuntimeOutput::Work {
+                result: Err(fault), ..
+            } => {
+                assert_eq!(
+                    fault.status().failure_class(),
+                    Some(FailureClass::Connectivity)
+                );
+                faults += 1;
+            }
+            RuntimeOutput::SleepUntil(at) => manual.advance_to(at),
+            RuntimeOutput::Shutdown | RuntimeOutput::Runtime(_) => {
+                panic!("neither work nor a hint")
+            }
+        }
+    }
+    assert_eq!(faults, 6);
+    assert_eq!(polled, [Duration::ZERO, cadence]);
+}
+
+#[test]
+fn a_connect_the_device_never_answers_holds_no_poll_and_is_given_up() {
+    let manual = ManualClock::new();
+    let clock = TestClock::shared(&manual);
+    // The gate stays shut: no connect attempt is ever answered.
+    let unit = FixtureSubscription::held(endpoint(), Arc::new(Gate::default()), Vec::new());
+    let deadline = Duration::from_secs(5);
+    let stream = StreamUnit::new(
+        planned_stream(endpoint(), STREAM_PROVIDER),
+        unit,
+        policy().with_connect_deadline(deadline),
     );
+    let Seated {
+        subtree,
+        streams: _reports,
+        ..
+    } = endpoint_subtree(
+        &EndpointPolicy::default(),
+        &clock,
+        clock.instant(),
+        vec![planned_poll(endpoint())],
+        vec![stream],
+    )
+    .expect("a poll and a stream on one endpoint form a subtree");
+    let mut runtime = runtime(subtree, &manual);
+
+    // The connect is taken first and hangs. It holds no in-flight slot, so
+    // the poll runs beside it, with the default bound of one.
+    let polled = work_outcome(&mut runtime).expect("the poll succeeds");
+    assert_eq!(polled.len(), 1);
+    assert_eq!(polled[0].status().request_class(), POLL_CLASS);
+
+    // At the deadline the attempt is given up: a retryable timeout, and
+    // the next attempt after the first retry.
+    assert_eq!(sleep_deadline(&mut runtime), manual.now() + deadline);
+    manual.advance(deadline);
+    let fault = work_outcome(&mut runtime).expect_err("a timeout is the endpoint's fault");
+    assert_eq!(fault.status().failure_class(), Some(FailureClass::Timeout));
+    assert_eq!(fault.status().retryable(), Some(true));
     assert_eq!(sleep_deadline(&mut runtime), manual.now() + FIRST_RETRY);
 }
 
@@ -636,15 +717,19 @@ fn dropping_the_reports_while_an_attempt_runs_opens_nothing() {
     let Rig {
         mut runtime,
         reports,
-        ..
+        manual,
     } = rig_with(FixtureSubscription::held(
         endpoint(),
         Arc::clone(&gate),
         vec![Ok(vec![Ok(states_parts())])],
     ));
 
-    // The attempt is taken and waits at the gate; the runtime parks on it.
-    assert!(drive(&mut runtime).is_none(), "the attempt is in flight");
+    // The attempt is taken and waits at the gate; the runtime sleeps to
+    // its deadline.
+    assert_eq!(
+        sleep_deadline(&mut runtime),
+        manual.now() + CONNECT_DEADLINE
+    );
     drop(reports);
     gate.open();
     // The attempt completes: the stream it opened is dropped unread, no
@@ -866,14 +951,15 @@ fn a_stream_unit_is_checked_against_its_plan() {
     };
     assert!(matches!(error, RecipeError::NoUnits));
 
-    // A reconnect policy that would spin, never fire, or spread beyond the
-    // delay is refused.
+    // A reconnect policy that would spin, never fire, spread beyond the
+    // delay, or give every connect up at once is refused.
     for unusable in [
         ReconnectPolicy::default().with_first_retry(Duration::ZERO),
         ReconnectPolicy::default()
             .with_first_retry(Duration::from_secs(10))
             .with_max_retry(Duration::from_secs(1)),
         ReconnectPolicy::default().with_stagger_percent(101),
+        ReconnectPolicy::default().with_connect_deadline(Duration::ZERO),
     ] {
         let stream = StreamUnit::new(
             planned_stream(endpoint(), STREAM_PROVIDER),

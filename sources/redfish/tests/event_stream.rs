@@ -629,6 +629,48 @@ async fn a_reconnect_resumes_after_the_last_id_in_the_same_run() {
 }
 
 #[tokio::test]
+async fn a_gap_answering_a_resume_starts_a_new_run() {
+    // A restarted bmcweb does not find the id the stream resumes after: it
+    // sends `EventBufferExceeded` and goes on, its ids counting from one
+    // again. The gap starts a new run, so its event 2 does not take the key
+    // of the event 2 read before the restart.
+    let bmc = Arc::new(Bmc::<nv_redfish_bmc_mock::Error>::default());
+    expect_connect(
+        &bmc,
+        None,
+        vec![(Some("1"), powered_on(1)), (Some("2"), powered_on(2))],
+    );
+    expect_connect(
+        &bmc,
+        Some("2"),
+        vec![(Some("1"), buffer_exceeded(1)), (Some("2"), powered_on(2))],
+    );
+    let stream = EventStream::new(endpoint(), scripted(&bmc));
+    let first: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream opens")
+        .collect()
+        .await;
+    let second: Vec<SubscriptionItem> = stream
+        .perform()
+        .await
+        .expect("the stream resumes")
+        .collect()
+        .await;
+
+    let run = run_of(&second[1]);
+    assert_ne!(run, run_of(&first[1]), "a new run after the gap");
+    let position = stream.resume_position().expect("the device sent ids");
+    assert_eq!(position.last_event_id(), "2");
+    assert_eq!(
+        position.run().as_str(),
+        run,
+        "the next instance resumes the new run"
+    );
+}
+
+#[tokio::test]
 async fn an_instance_without_ids_leaves_nothing_to_resume_from() {
     // A device that sends no ids: each instance starts live, and each is
     // its own run, since nothing says how their event ids relate.

@@ -2,3 +2,6 @@
 
 # Local dependency overrides (e.g. sibling nv-redfish checkout).
 /.cargo/
+
+# Model checker output (see docs/FORMAL.md).
+/_apalache-out/

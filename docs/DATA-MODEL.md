@@ -705,13 +705,17 @@ once, and moves the cursor on, and an unstamped entry is placed like any
 other. The member and time budget then caps how many *new* entries one poll
 carries, and a burst larger than the budget loses its oldest entries from
 view, not its newest. Most devices list oldest first; the walk reads the order
-off numbered entry ids, and when a log grows yet the end taken for newest
-holds only the cursor's member, it checks the other end and, if that end is
-stamped after the cursor, flips the order and walks again, once re-shipping
-what it had anchored behind. A device that ignores or refuses `$skip` is read
+off numbered entry ids and does not doubt it. Where the ids say nothing, and a
+log grows yet the end taken for newest holds only the cursor's member, it
+checks the other end and, if that end is stamped after the cursor, flips the
+order and walks again, once re-shipping what it had anchored behind. Stamps
+settle the order only there, because a device whose clock stepped back stamps
+its newest entries before its oldest. A device that ignores or refuses `$skip` is read
 from its first page instead, and when that reading reaches the member budget
 before the last page the walk has seen the collection's first members rather
-than its newest; the truncation issue says which. A log cleared and refilled
+than its newest; the truncation issue says which. A log listed newest first
+is read from its head, and pages the budget leaves unread there are older
+than the cursor's member once the walk has met it: no truncation. A log cleared and refilled
 reuses its ids: meeting the cursor's id under another stamp discards the
 cursor and ships the whole log once, while a refill landing the same id on the
 same second is invisible. A cursor whose member has left the log is never met,
@@ -720,7 +724,8 @@ cursor's second onward, and that answer places by stamp where the walk places
 by position: an entry written later but stamped earlier is not in it. A
 service clock reading earlier than the cursor's stamp, or an empty answer,
 sends that poll to the head; an entry stamped behind the cursor by a clock the
-service does not report stays out of view while the filter is honored. The
+service does not report, or by one that reads ahead of the cursor again by the
+poll, stays out of view while the filter is honored. The
 cursor is not persisted, so a restart replays
 one window. Records that share an `occurred_at` — devices stamp to the second,
 and a burst lands many on one instant — carry no order but `entry_id`, which
@@ -735,8 +740,9 @@ Redfish event stream provider ships each server-sent `Event` payload as one
 logs batch, its records projected from the payload's `EventRecord`s:
 `occurred_at` is the record's `EventTimestamp`, `entry_id` its `EventId`,
 and the scope is the event service with an id minted for each run of event
-ids the stream reads: minted when a stream starts without a resume position,
-kept across a connection resumed from one. The `origin-of-condition` and
+ids the stream reads: minted when a stream starts without a resume position
+or the device reports dropped events, kept across a connection resumed from
+one. The `origin-of-condition` and
 `log-entry` attributes preserve the identifiers from `OriginOfCondition` and
 `LogEntry`, when present. Projection does not fetch either resource or derive a
 subject from its URI. A device's `EventId` restarts with
@@ -749,7 +755,15 @@ occurrence keeps one source per endpoint or correlates using the linked log entr
 when available, or event content. The
 stream is live delivery, never completeness: an `EventBufferExceeded` record
 says the device dropped events and is an issue at `@gap`, not a record, and
-the polled walk is what fills the gap. A `MetricReport` payload on the same
+the polled walk is what fills the gap. The records after it ship under a new
+run id: a device that no longer holds the stream's position may have
+restarted its ids, and it does not say. Two limits remain on a device that
+restarts its ids without marking them, as bmcweb does. Once it has issued
+the resumed id again it resumes without a sign, so the events before that id
+never reach the stream and no gap is reported. And a resume position older
+than the last one read, handed back after an embedder restart, then lands
+inside ids the run already shipped, where the dedup key does collapse
+distinct events. A `MetricReport` payload on the same
 stream is not this provider's data; the first one is said at
 `@metric-report` and the rest yield nothing.
 

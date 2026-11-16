@@ -4,11 +4,14 @@
 //! The standard endpoint subtree: planned polls and streams in, one
 //! dispatcher-ready scheduler out.
 //!
-//! The milestone-1 slice of the architecture's admission stack — endpoint
-//! admission over the endpoint breaker over the rate bucket over the unit
-//! leaves. Stream connects are taken before polls, so a stream opens as
-//! soon as the bucket admits anything, not behind a round of polls, and
-//! reconnects are spaced so that they leave polls half the refill. Connects
+//! The milestone-1 slice of the architecture's admission stack — the rate
+//! bucket over the unit leaves, and endpoint admission over the endpoint
+//! breaker over the polls. Stream connects are taken before polls, so a
+//! stream opens as soon as the bucket admits anything, not behind a round
+//! of polls, and reconnects are spaced so that they leave polls half the
+//! refill. A connect pays the bucket and nothing else: it holds no
+//! in-flight slot and does not pass the breaker, so a stream that cannot
+//! connect, or whose connect hangs, never holds a poll back. Connects
 //! take turns among themselves, as polls do, whatever their request
 //! classes. Request-class lanes and the request-class breaker are
 //! deliberately absent until class-level policy exists. The collector seats each subtree on
@@ -26,6 +29,7 @@ use nv_redfish_dispatcher::schedulers::CircuitBreaker;
 use nv_redfish_dispatcher::schedulers::CircuitBreakerConfig;
 use nv_redfish_dispatcher::schedulers::FixedCost;
 use nv_redfish_dispatcher::schedulers::PeriodicLeaf;
+use nv_redfish_dispatcher::schedulers::RoundRobin;
 use nv_redfish_dispatcher::schedulers::StrictPriority;
 use nv_redfish_dispatcher::schedulers::TokenBucket;
 use nv_redfish_dispatcher::schedulers::TokenBucketConfig;
@@ -46,7 +50,9 @@ use crate::stream::ReconnectPolicy;
 use crate::stream::StreamReports;
 use crate::stream::StreamUnit;
 
-/// When the endpoint breaker opens and how it recovers.
+/// When the endpoint breaker opens and how it recovers. It samples polls
+/// and gates polls; a stream's connect attempts back off on their own
+/// [`ReconnectPolicy`].
 #[derive(Clone, Debug)]
 pub struct BreakerPolicy {
     failure_threshold: f32,
@@ -169,9 +175,10 @@ impl Default for EndpointPolicy {
 }
 
 impl EndpointPolicy {
-    /// How many requests may be in flight against the endpoint at once.
-    /// One is the default: a stalled device queues behind itself instead
-    /// of eating fleet-wide capacity.
+    /// How many polls may be in flight against the endpoint at once. One
+    /// is the default: a stalled device queues behind itself instead of
+    /// eating fleet-wide capacity. A stream's connect attempt is not
+    /// counted; each stream has at most one in flight.
     #[must_use]
     pub fn with_max_in_flight(mut self, max_in_flight: NonZeroU32) -> Self {
         self.max_in_flight = max_in_flight;
@@ -199,12 +206,15 @@ type UnitMeta = WithCost<()>;
 /// The meta an endpoint subtree hands its runtime.
 pub(crate) type SubtreeMeta = WithPriority<UnitMeta>;
 
-/// One unit leaf, polled or streamed.
+/// One stream's connect leaf, or the endpoint's polls under their
+/// admission.
 type Unit = Box<dyn Scheduler<TelemetryWork, Meta = UnitMeta>>;
 
-/// Stream connects over polls; connects take turns among themselves, and
-/// so do polls.
+/// Stream connects over polls; connects take turns among themselves.
 type Units = StrictPriority<TelemetryWork, Unit>;
+
+/// The endpoint's polls, taking turns.
+type Polls = RoundRobin<TelemetryWork, UnitMeta>;
 
 /// Priority of stream connects. A stream that waits behind polls misses
 /// the events sent before it opens.
@@ -230,12 +240,10 @@ fn reconnect_floor(rate: &RatePolicy, connects_cost: u64) -> Duration {
         .saturating_mul(u32::try_from(refills).unwrap_or(u32::MAX))
 }
 
-/// The standard endpoint subtree: endpoint admission over the endpoint
-/// breaker over the rate bucket over the unit leaves.
-pub(crate) type EndpointSubtree = BoundedConcurrency<
-    TelemetryWork,
-    CircuitBreaker<TelemetryWork, TokenBucket<TelemetryWork, Units>>,
->;
+/// The standard endpoint subtree: the rate bucket over the stream connects
+/// and, behind them, endpoint admission over the endpoint breaker over
+/// the polls.
+pub(crate) type EndpointSubtree = TokenBucket<TelemetryWork, Units>;
 
 /// One endpoint's subtree, ready for its runtime, and the reports of the
 /// streams seated in it.
@@ -373,7 +381,8 @@ fn validate(policy: &EndpointPolicy) -> Result<(), RecipeError> {
     Ok(())
 }
 
-/// Refuses reconnect delays that would spin, never fire, or overflow.
+/// Refuses reconnect delays that would spin, never fire, or overflow, and a
+/// connect deadline that would give up at once or never.
 fn validate_reconnect(policy: &ReconnectPolicy) -> Result<(), RecipeError> {
     if policy.first_retry().is_zero() {
         return Err(RecipeError::InvalidPolicy(
@@ -393,6 +402,11 @@ fn validate_reconnect(policy: &ReconnectPolicy) -> Result<(), RecipeError> {
     if policy.stagger_percent() > 100 {
         return Err(RecipeError::InvalidPolicy(
             "reconnect stagger must be at most 100 percent",
+        ));
+    }
+    if policy.connect_deadline().is_zero() || policy.connect_deadline() > MAX_POLICY_INTERVAL {
+        return Err(RecipeError::InvalidPolicy(
+            "connect deadline must be positive and at most a year",
         ));
     }
     Ok(())
@@ -438,8 +452,9 @@ impl std::fmt::Debug for PollUnit {
 /// bound to its unit and stamping on `clock`. Leaf epochs and the bucket
 /// epoch are `now`, on the timeline of the runtime that will drive the
 /// subtree. Stream connects are taken before polls; within each, units of
-/// different request classes share a round-robin ring. Per-class lanes and
-/// the class breaker remain deliberately absent.
+/// different request classes share a round-robin ring. The in-flight bound
+/// and the breaker stand over the polls alone. Per-class lanes and the
+/// class breaker remain deliberately absent.
 ///
 /// # Errors
 ///
@@ -466,7 +481,7 @@ pub(crate) fn endpoint_subtree(
     let polled = !units.is_empty();
     validate(policy)?;
 
-    let mut by_priority: Units = StrictPriority::new();
+    let mut polls = Polls::new();
     for unit in units {
         let planned = &unit.planned;
         if planned.endpoint().endpoint_id() != subtree_endpoint {
@@ -491,7 +506,15 @@ pub(crate) fn endpoint_subtree(
         let work = unit.work;
         let clock = Arc::clone(clock);
         let leaf = PeriodicLeaf::new(now, planned.cadence(), move || work(&clock));
-        by_priority.add_child(Box::new(FixedCost::new(cost, leaf)), POLL_PRIORITY);
+        polls.add_child(FixedCost::new(cost, leaf));
+    }
+    let mut by_priority: Units = StrictPriority::new();
+    if polled {
+        let admitted = BoundedConcurrency::new(
+            policy.max_in_flight,
+            CircuitBreaker::new(breaker_config(&policy.breaker), polls),
+        );
+        by_priority.add_child(Box::new(admitted), POLL_PRIORITY);
     }
     let mut reports = Vec::with_capacity(streams.len());
     let connects_cost = streams.iter().fold(0_u64, |cost, stream| {
@@ -531,13 +554,7 @@ pub(crate) fn endpoint_subtree(
         reports.push(stream_reports);
     }
 
-    let subtree = BoundedConcurrency::new(
-        policy.max_in_flight,
-        CircuitBreaker::new(
-            breaker_config(&policy.breaker),
-            TokenBucket::new(now, bucket_config(&policy.rate), by_priority),
-        ),
-    );
+    let subtree = TokenBucket::new(now, bucket_config(&policy.rate), by_priority);
     Ok(Seated {
         endpoint,
         subtree,

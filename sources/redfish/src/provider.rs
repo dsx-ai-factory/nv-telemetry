@@ -945,14 +945,44 @@ impl Order {
 #[derive(Clone, Copy, Debug)]
 enum OrderChoice {
     /// From the ids when they number the entries; else what the cursor
-    /// remembers, which a probe may have established and which then
-    /// outranks the ids; else oldest first.
+    /// remembers, which a probe may have established; else oldest first.
     Detect {
         remembered: Option<Order>,
         probed: bool,
     },
     /// A probe just showed the other end is the newer one.
     Force(Order),
+}
+
+/// What settled the order a window is read in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderSource {
+    /// The member ids, which stamps do not overrule.
+    Ids,
+    /// A probe of the other end, now or as the cursor remembers.
+    Probe,
+    /// What the cursor remembers unprobed, or the oldest-first default.
+    Memory,
+}
+
+impl OrderSource {
+    /// The order `first` is read in under `preference`, and what settled it.
+    fn settle(preference: OrderChoice, first: &EntryPage) -> (Order, Self) {
+        match (preference, Order::hinted_by(first)) {
+            (OrderChoice::Force(order), _)
+            | (
+                OrderChoice::Detect {
+                    remembered: Some(order),
+                    probed: true,
+                },
+                None,
+            ) => (order, Self::Probe),
+            (OrderChoice::Detect { .. }, Some(order)) => (order, Self::Ids),
+            (OrderChoice::Detect { remembered, .. }, None) => {
+                (remembered.unwrap_or(Order::OldestFirst), Self::Memory)
+            }
+        }
+    }
 }
 
 /// The pages a walk read, in collection order, the first of them starting
@@ -967,8 +997,7 @@ struct EntryWindow {
     offset: usize,
     total: usize,
     order: Order,
-    /// The order was established by a probe rather than read or assumed.
-    probed: bool,
+    source: OrderSource,
     incomplete: Option<&'static str>,
     /// `offset` is where the cursor's member was expected, not what the
     /// budget left: the members before it are presumed shipped, and a walk
@@ -1176,19 +1205,7 @@ where
     B::Error: ClassifyError,
 {
     let filtered = matches!(start, Start::Filtered(_));
-    let (order, probed) = match preference {
-        OrderChoice::Force(order)
-        | OrderChoice::Detect {
-            remembered: Some(order),
-            probed: true,
-        } => (order, true),
-        OrderChoice::Detect { remembered, .. } => (
-            Order::hinted_by(&first)
-                .or(remembered)
-                .unwrap_or(Order::OldestFirst),
-            false,
-        ),
-    };
+    let (order, source) = OrderSource::settle(preference, &first);
     let first_page = Arc::clone(&first);
     let mut cursor_jump = false;
     let window = |pages: Vec<Arc<EntryPage>>,
@@ -1203,7 +1220,7 @@ where
             offset,
             total: count.max(offset + read),
             order,
-            probed,
+            source,
             incomplete,
             cursor_jump,
             filtered,
@@ -1431,8 +1448,11 @@ fn clock_behind(service: &LogService, position: Option<&Position>) -> bool {
 /// the other end, and only if it is stamped after the one taken for newest
 /// flips the order and walks again — once re-shipping what the first walk
 /// anchored behind. An insertion elsewhere in an oldest-first log fails that
-/// check and flips nothing. An order a probe established outranks the ids
-/// from then on.
+/// check and flips nothing. An order a probe established is remembered
+/// while the ids say nothing. Ids that number the entries are never doubted:
+/// the check reads stamps, and a device whose clock stepped back stamps its
+/// newest entries before its oldest, which would turn a rightly read log
+/// round, ship it again, and anchor the cursor on its oldest entry.
 ///
 /// Where the next walk starts depends on what the device offers. A device
 /// whose service root advertises `ProtocolFeaturesSupported.FilterQuery` is
@@ -1453,11 +1473,12 @@ fn clock_behind(service: &LogService, position: Option<&Position>) -> bool {
 /// the cursor's own member at least, so an empty answer means the log was
 /// cleared, refilled at earlier stamps, or the device answered nothing to a
 /// filter it did not parse. An entry stamped behind the cursor by a clock the
-/// service does not report stays out of view while the filter is honored. A
-/// filtered answer wider than the cursor's member yet walked to it first has
-/// the order checked as a head walk stalled on growth would, and one larger
-/// than the budget is entered at its tail with `$skip` as the collection
-/// would be.
+/// service does not report, or by one that stepped back and reads ahead of
+/// the cursor again by the poll, stays out of view while the filter is
+/// honored. A filtered answer wider than the cursor's member yet walked to
+/// it first has the order checked as a head walk stalled on growth would,
+/// where the ids say nothing, and one larger than the budget is entered at
+/// its tail with `$skip` as the collection would be.
 /// Otherwise the count the collection held when the position was stored is
 /// where an oldest-first paged log is entered: `$skip` to that index less
 /// one, the cursor's member if nothing rotated, so an idle poll reads the
@@ -1646,7 +1667,10 @@ where
                 !visit.reached_cursor && !visit.refilled && total > 0 && total == position.count;
             stalled_growth || rotated
         };
-        if doubted {
+        // Ids that number the entries are not doubted. The probe below
+        // compares stamps, and a device whose clock stepped back stamps
+        // its newest entries before its oldest.
+        if doubted && visit.window.source != OrderSource::Ids {
             let reference = visit.newest_stamp.or(position.at);
             if newer_at_other_end(bmc, &visit.window, reference).await? {
                 let forced = OrderChoice::Force(visit.window.order.flipped());
@@ -1695,16 +1719,23 @@ where
 
 /// The issue for members a walk left unread: pages the window never
 /// reached, members a tail jump skipped, or members the budget cut — unless
-/// the cursor was met, when everything before it had shipped already. Time
-/// running out is the story whatever the pages did; pages stopping short
-/// says more than a member budget that would have been spent on them anyway.
+/// the cursor was met, when everything before it had shipped already. Pages
+/// never reached in a collection listed oldest first are the exception:
+/// they hold its newest members, and are reported whatever the walk met.
+/// Time running out is the story whatever the pages did; pages stopping
+/// short says more than a member budget that would have been spent on them
+/// anyway.
 fn truncation(
     window: &EntryWindow,
     visited: usize,
     reached_cursor: bool,
     stopped: Option<Stop>,
 ) -> Option<ProjectionIssue> {
-    let truncated = window.incomplete.is_some()
+    let unread_pages = window.incomplete.is_some();
+    // Listed newest first, the pages left unread are older than the
+    // cursor's member once the walk has met it.
+    let behind_the_cursor = window.order == Order::NewestFirst && reached_cursor;
+    let truncated = (unread_pages && !behind_the_cursor)
         || (!reached_cursor && (window.offset > 0 || visited < window.members_read()));
     truncated.then(|| {
         let reason = match (stopped, window.incomplete) {
@@ -1920,12 +1951,12 @@ impl Position {
                 member,
                 at,
                 order: window.order,
-                probed: window.probed,
+                probed: window.source == OrderSource::Probe,
                 count,
             }),
             None => previous.map(|position| Self {
                 order: window.order,
-                probed: window.probed,
+                probed: window.source == OrderSource::Probe,
                 count,
                 ..position.clone()
             }),
@@ -2568,6 +2599,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_newest_first_log_past_the_budget_is_cut_only_short_of_the_cursor() {
+        // Two members a page, newest first, under a budget of three: the
+        // pages are read up to the budget before any member is visited.
+        let budget = WalkBudget::new(3, Duration::from_secs(10));
+        let skip2 = format!("{ENTRIES}?$skip=2");
+        let skip4 = format!("{ENTRIES}?$skip=4");
+        let bmc = MockBmc::default();
+        let cursor = super::LogCursor::default();
+        prime(
+            &bmc,
+            &[
+                (ENTRIES.to_owned(), page_of(&["3", "2"], 3, Some(&skip2))),
+                (skip2.clone(), page_of(&["1"], 3, None)),
+                entry(3),
+                entry(2),
+                entry(1),
+            ],
+        );
+        assert_eq!(
+            walk_with(&bmc, &cursor, budget).await,
+            (vec![1, 2, 3], vec![])
+        );
+
+        // Two more. The pages stop short of the last, but the walk meets
+        // the cursor's member in those it read: what it left unread is
+        // older, and nothing is cut.
+        let head = || (ENTRIES.to_owned(), page_of(&["5", "4"], 5, Some(&skip2)));
+        let second = || (skip2.clone(), page_of(&["3", "2"], 5, Some(&skip4)));
+        prime(&bmc, &[head(), second(), entry(5), entry(4), entry(3)]);
+        assert_eq!(walk_with(&bmc, &cursor, budget).await, (vec![4, 5], vec![]));
+        prime(&bmc, &[head(), second(), entry(5)]);
+        assert_eq!(walk_with(&bmc, &cursor, budget).await, (vec![], vec![]));
+
+        // Three more spend the budget before the cursor's member: what lies
+        // between may be new, and the walk says so.
+        prime(
+            &bmc,
+            &[
+                (ENTRIES.to_owned(), page_of(&["8", "7"], 8, Some(&skip2))),
+                (skip2, page_of(&["6", "5"], 8, Some(&skip4))),
+                entry(8),
+                entry(7),
+                entry(6),
+            ],
+        );
+        assert_eq!(
+            walk_with(&bmc, &cursor, budget).await,
+            (
+                vec![6, 7, 8],
+                vec![truncated(3, 8, super::PAGES_PAST_BUDGET)]
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn a_wrong_order_guess_is_caught_by_probing_the_other_end() {
         // Ids without digits give no hint, so the first walk assumes oldest
         // first on a device that lists newest first.
@@ -2615,7 +2701,10 @@ mod tests {
         assert_eq!(shipped(&bmc, &cursor).await, ["d", "c", "b"]);
         let after = position(&cursor).await;
         assert_eq!(after.order, super::Order::NewestFirst);
-        assert!(after.probed, "a probed order outranks the ids from now on");
+        assert!(
+            after.probed,
+            "a probed order is remembered while the ids are silent"
+        );
         assert_eq!(after.member.to_string(), format!("{ENTRIES}/d"));
 
         // Read the right way round from now on: the head is the cursor.
@@ -2743,11 +2832,10 @@ mod tests {
             &bmc,
             &[
                 (ENTRIES.to_owned(), page(0..2, 6, Some(&skip2))),
+                // The count grew while the tail showed nothing new. The ids
+                // number the entries, so the order stands unprobed.
                 (skip4, page(4..5, 6, None)),
                 entry(4),
-                // The count grew while the tail showed nothing new, so the
-                // head is probed and found older: the order stands.
-                entry(0),
             ],
         );
         let (ids, issues) = walk_with(&bmc, &cursor, budget).await;
@@ -3316,7 +3404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_service_whose_clock_stepped_back_is_walked_from_its_head_that_poll() {
+    async fn a_service_whose_clock_stepped_back_is_walked_from_its_head_and_not_turned_round() {
         const SERVICE: &str = "/redfish/v1/Systems/1/LogServices/SEL";
         let bmc = MockBmc::default();
         let cursor = super::LogCursor::default();
@@ -3349,7 +3437,11 @@ mod tests {
         assert_eq!(acquire_service(&bmc, &cursor).await, 1);
 
         // The clock ahead of the cursor again, the filter resumes from the
-        // cursor's stepped-back stamp.
+        // cursor's stepped-back stamp, and the device answers the older
+        // entries too: they are stamped after it. The answer is wider than
+        // the cursor's member, which casts doubt on the order, and the
+        // older end is the later stamped. The ids number the entries, so
+        // the order stands: nothing is probed and nothing ships again.
         prime(
             &bmc,
             &[
@@ -3357,14 +3449,27 @@ mod tests {
                     SERVICE.to_owned(),
                     service_with_clock("2026-03-01T10:01:00Z"),
                 ),
-                (
-                    filtered_uri("2026-03-01T09:59:30Z"),
-                    page_of(&["2"], 1, None),
-                ),
+                (filtered_uri("2026-03-01T09:59:30Z"), page(0..3, 3, None)),
                 entry_at(2, "2026-03-01T09:59:30Z"),
             ],
         );
         assert_eq!(acquire_service(&bmc, &cursor).await, 0);
+        assert_eq!(position(&cursor).await.order, super::Order::OldestFirst);
+
+        // And the next entry ships.
+        prime(
+            &bmc,
+            &[
+                (
+                    SERVICE.to_owned(),
+                    service_with_clock("2026-03-01T10:01:10Z"),
+                ),
+                (filtered_uri("2026-03-01T09:59:30Z"), page(0..4, 4, None)),
+                entry_at(3, "2026-03-01T10:01:05Z"),
+                entry_at(2, "2026-03-01T09:59:30Z"),
+            ],
+        );
+        assert_eq!(acquire_service(&bmc, &cursor).await, 1);
     }
 
     #[test]
