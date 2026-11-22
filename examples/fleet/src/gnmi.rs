@@ -4,7 +4,11 @@
 //! A gNMI endpoint: one Subscribe call for its streamed leaves, one Get
 //! poll per configured snapshot.
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
+use std::time::Duration;
 
 use nv_telemetry_gnmi::ConfiguredGet;
 use nv_telemetry_gnmi::ConfiguredSubscription;
@@ -21,6 +25,8 @@ use nv_telemetry_gnmi::SubjectTemplate;
 use nv_telemetry_gnmi::SubscriptionPath;
 use nv_telemetry_gnmi::SubscriptionRequest;
 use nv_telemetry_gnmi::SubscriptionSpec;
+use nv_telemetry_model::EndpointContext;
+use nv_telemetry_model::Origin;
 use nv_telemetry_model::SignalDescriptor;
 use nv_telemetry_model::SignalKey;
 use nv_telemetry_model::Subject;
@@ -31,6 +37,10 @@ use nv_telemetry_orchestration::PollNeed;
 use nv_telemetry_orchestration::PollUnit;
 use nv_telemetry_orchestration::StreamNeed;
 use nv_telemetry_orchestration::StreamUnit;
+use nv_telemetry_source::Acquire;
+use nv_telemetry_source::AcquisitionFailure;
+use nv_telemetry_source::AcquisitionFailureClass;
+use nv_telemetry_source::AcquisitionParts;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
@@ -48,7 +58,34 @@ use crate::config::Mode;
 use crate::config::ValueType;
 use crate::endpoint_context;
 
+const GET_DEADLINE: Duration = Duration::from_secs(30);
+
 type Transport = InterceptedService<Channel, Credentials>;
+
+/// Bounds the complete Get acquisition, including the wait for final gRPC status.
+struct GetWithDeadline(ConfiguredGet<Transport>);
+
+impl Acquire for GetWithDeadline {
+    type Output = AcquisitionParts;
+
+    fn endpoint(&self) -> &EndpointContext {
+        self.0.endpoint()
+    }
+
+    fn origin(&self) -> &Origin {
+        self.0.origin()
+    }
+
+    async fn perform(&self) -> Result<Self::Output, AcquisitionFailure> {
+        tokio::time::timeout(GET_DEADLINE, self.0.perform())
+            .await
+            .map_err(|_| {
+                AcquisitionFailure::new(AcquisitionFailureClass::Timeout)
+                    .with_retryable(true)
+                    .with_detail("gNMI Get acquisition deadline exceeded")
+            })?
+    }
+}
 
 /// The `username` and `password` metadata every call carries, when the
 /// endpoint has credentials.
@@ -136,7 +173,11 @@ pub(crate) fn units(config: &GnmiEndpoint, defaults: &Defaults) -> Result<Endpoi
         }
         let unit = ConfiguredGet::new(endpoint.clone(), transport.clone(), spec)
             .map_err(|error| format!("get `{}`: {error}", get.name))?;
-        polls.push(PollUnit::new(planned.clone(), Arc::new(unit)));
+
+        polls.push(PollUnit::new(
+            planned.clone(),
+            Arc::new(GetWithDeadline(unit)),
+        ));
     }
     Ok(EndpointUnits::new(policy.endpoint())
         .with_polls(polls)

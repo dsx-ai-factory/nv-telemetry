@@ -51,6 +51,11 @@ one per projection issue.
 - **gNMI connects lazily.** A switch that is down shows up as failed
   acquisitions, and the subscription reconnects with backoff. TLS uses the
   system's roots, and there is no option to skip certificate verification.
+- **gNMI Get polls have a 30-second deadline.** The deadline covers the
+  complete acquisition, including the wait for final gRPC status. An
+  expired Get reports a retryable timeout and frees its poll slot. During
+  shutdown, in-flight Get polls finish or time out before the endpoint
+  retires.
 - **The rate policy limits each endpoint.** At the library default (burst
   4, 1/s), an endpoint with many sensors reads them more slowly than their
   interval asks. The example file raises it.
@@ -68,5 +73,5 @@ $M/target/debug/bmc-mock --port 18267 --state-backend internal \
 ```
 
 The mock accepts any password, for example `FLEET_BMC_PASSWORD=dummy`.
-There is no gNMI mock, so `switch-a` reports connectivity failures and
-keeps retrying.
+With only the BMC mocks running, `switch-a` reports connectivity failures
+and keeps retrying.
