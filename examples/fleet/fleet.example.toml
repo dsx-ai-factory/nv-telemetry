@@ -45,6 +45,7 @@ id = "switch-a"
 address = "http://127.0.0.1:9339"
 username = "admin"
 password_env = "FLEET_SWITCH_PASSWORD"
+# Sets the encoding for Get and Subscribe. The default is "json".
 encoding = "json_ietf"
 labels = { rack = "r1" }
 
