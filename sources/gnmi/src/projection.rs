@@ -17,7 +17,6 @@ use nv_telemetry_model::Payload;
 use nv_telemetry_model::Reading;
 use nv_telemetry_model::Readings;
 use nv_telemetry_model::SignalDescriptor;
-use nv_telemetry_model::SignalKey;
 use nv_telemetry_model::StateObservation;
 use nv_telemetry_model::States;
 use nv_telemetry_model::Timestamp;
@@ -407,6 +406,7 @@ fn project_value(
     Ok(result)
 }
 
+/// Splits candidates that are unique and ordered by observation identity.
 fn split_payloads(
     candidates: impl Iterator<Item = ProjectedObservation>,
 ) -> Result<Vec<(Coverage, Payload)>, AcquisitionFailure> {
@@ -416,7 +416,7 @@ fn split_payloads(
     let states_limit = limits::STATES_OBSERVATIONS_MAX_ITEMS as usize;
 
     let mut payloads = Vec::new();
-    let mut descriptors = BTreeMap::new();
+    let mut descriptors = Vec::new();
     let mut samples = Vec::new();
     let mut states = Vec::new();
 
@@ -424,7 +424,7 @@ fn split_payloads(
     for candidate in candidates {
         match candidate {
             ProjectedObservation::Reading(descriptor, sample) => {
-                descriptors.insert(descriptor.key().clone(), descriptor);
+                descriptors.push(descriptor);
                 samples.push(sample);
 
                 if samples.len() == readings_limit {
@@ -445,6 +445,8 @@ fn split_payloads(
     }
 
     if !samples.is_empty() {
+        // The payload retains the descriptor vector's allocation.
+        descriptors.shrink_to_fit();
         payloads.push(payload(descriptors, samples)?);
     }
 
@@ -522,11 +524,11 @@ fn source_context(
 }
 
 fn payload(
-    descriptors: BTreeMap<SignalKey, SignalDescriptor>,
+    descriptors: Vec<SignalDescriptor>,
     samples: Vec<Reading>,
 ) -> Result<(Coverage, Payload), AcquisitionFailure> {
     let readings = Readings::builder()
-        .descriptors(descriptors.into_values().collect())
+        .descriptors(descriptors)
         .samples(samples)
         .build()
         .map_err(|error| model_error(&error))?;
