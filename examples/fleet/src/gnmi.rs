@@ -144,13 +144,11 @@ pub(crate) fn units(config: &GnmiEndpoint, defaults: &Defaults) -> Result<Endpoi
             policy.reconnect(),
         ));
     }
+
     let mut polls = Vec::new();
-    for planned in plan.polls() {
-        let get = config
-            .get
-            .iter()
-            .find(|get| get.name == planned.target())
-            .expect("every planned Get is a configured one");
+
+    // The plan returns one poll per need and preserves need order.
+    for (planned, get) in plan.polls().iter().zip(&config.get) {
         let leaves = get
             .leaves
             .iter()
@@ -351,4 +349,50 @@ fn parse_path(text: &str) -> Result<ParsedPath, String> {
         path: SubscriptionPath::new(elements),
         wildcard,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_invalid_leaf_in_later_get_with_same_name() {
+        let config: GnmiEndpoint = toml::from_str(
+            r#"
+id = "switch-a"
+address = "http://127.0.0.1:9339"
+
+[[get]]
+name = "system"
+interval = "10s"
+
+[[get.leaves]]
+path = "system/state/hostname"
+subject = "system"
+subject_id = "switch-a"
+facet = "hostname"
+type = "string"
+
+[[get]]
+name = "system"
+interval = "20s"
+
+[[get.leaves]]
+path = "system/state/domain-name"
+subject = "system"
+facet = "domain-name"
+type = "string"
+"#,
+        )
+        .expect("the endpoint configuration must parse");
+
+        let result = units(&config, &Defaults::default());
+
+        let error = result.expect_err("the second Get leaf requires a subject_id");
+
+        assert_eq!(
+            error,
+            "get `system`: `system/state/domain-name`: a path without `[key=*]` needs a subject_id"
+        );
+    }
 }
