@@ -87,6 +87,47 @@ async fn shutdown_reports_get_timeout_before_retiring_endpoint() {
     .await;
 }
 
+#[tokio::test]
+async fn rejects_invalid_leaf_in_later_get_with_same_name() {
+    let config: GnmiEndpoint = toml::from_str(
+        r#"
+id = "switch-a"
+address = "http://127.0.0.1:9339"
+
+[[get]]
+name = "system"
+interval = "10s"
+
+[[get.leaves]]
+path = "system/state/hostname"
+subject = "system"
+subject_id = "switch-a"
+facet = "hostname"
+type = "string"
+
+[[get]]
+name = "system"
+interval = "20s"
+
+[[get.leaves]]
+path = "system/state/domain-name"
+subject = "system"
+facet = "domain-name"
+type = "string"
+"#,
+    )
+    .expect("the endpoint configuration must parse");
+
+    let result = units(&config, &Defaults::default());
+
+    let error = result.expect_err("the second Get leaf requires a subject_id");
+
+    assert_eq!(
+        error,
+        "get `system`: `system/state/domain-name`: a path without `[key=*]` needs a subject_id"
+    );
+}
+
 async fn collect(subscribe: bool) -> (TcpListener, Collector, Reports) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
