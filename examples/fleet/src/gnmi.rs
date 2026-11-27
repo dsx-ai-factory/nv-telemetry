@@ -133,9 +133,17 @@ pub(crate) fn units(config: &GnmiEndpoint, defaults: &Defaults) -> Result<Endpoi
     .map_err(|error| format!("plan: {error}"))?;
 
     let policy = config.policy.over(&defaults.policy);
+
+    let encoding = match config.encoding {
+        Encoding::Json => GnmiEncoding::Json,
+        Encoding::JsonIetf => GnmiEncoding::JsonIetf,
+    };
+
     let mut streams = Vec::new();
+
     for planned in plan.streams() {
-        let spec = subscription(config)?;
+        let spec = subscription(config, encoding)?;
+
         let unit = ConfiguredSubscription::new(endpoint.clone(), transport.clone(), spec)
             .map_err(|error| format!("subscription: {error}"))?;
         streams.push(StreamUnit::new(
@@ -161,8 +169,11 @@ pub(crate) fn units(config: &GnmiEndpoint, defaults: &Defaults) -> Result<Endpoi
             .map(|(path, leaf)| mapping(path, leaf))
             .collect::<Result<_, _>>()
             .map_err(|error| format!("get `{}`: {error}", get.name))?;
+
         let mut spec = GetSpec::new(paths, mappings)
-            .map_err(|error| format!("get `{}`: {error:?}", get.name))?;
+            .map_err(|error| format!("get `{}`: {error:?}", get.name))?
+            .with_encoding(encoding);
+
         if let Some(origin) = &config.origin {
             spec = spec.with_origin(origin);
         }
@@ -209,7 +220,7 @@ fn transport(config: &GnmiEndpoint) -> Result<Transport, String> {
     ))
 }
 
-fn subscription(config: &GnmiEndpoint) -> Result<SubscriptionSpec, String> {
+fn subscription(config: &GnmiEndpoint, encoding: GnmiEncoding) -> Result<SubscriptionSpec, String> {
     let mut requests = Vec::new();
     let mut mappings = Vec::new();
     for leaf in &config.subscribe {
@@ -233,10 +244,8 @@ fn subscription(config: &GnmiEndpoint) -> Result<SubscriptionSpec, String> {
     }
     let mut spec = SubscriptionSpec::from_requests(requests, mappings)
         .map_err(|error| format!("subscription: {error:?}"))?
-        .with_encoding(match config.encoding {
-            Encoding::Json => GnmiEncoding::Json,
-            Encoding::JsonIetf => GnmiEncoding::JsonIetf,
-        });
+        .with_encoding(encoding);
+
     if let Some(origin) = &config.origin {
         spec = spec.with_origin(origin);
     }
